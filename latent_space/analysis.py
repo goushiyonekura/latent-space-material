@@ -163,6 +163,101 @@ class Analyzer:
         diff = self.f_mat[:, :, None, :] - self.f_mat[:, None, :, :]
         self.S = np.exp(-(diff ** 2).sum(axis=-1) / (2.0 * self.sigma_F ** 2))
 
+    # ------------------------------------------------------------------ hires extension
+    def build_solo_bank(self, sources: Sequence[np.ndarray], hop_seconds: float = 0.1) -> None:
+        """Per-source solo features on a position grid over the whole source (for jump candidates)."""
+        self.solo_hop = max(1, int(round(hop_seconds * self.fs)))
+        self.solo_pos: List[np.ndarray] = []
+        self.solo_f: List[np.ndarray] = []      # normalized features (P_i, d_phi)
+        self.solo_E: List[np.ndarray] = []
+        hann = np.hanning(self.W).astype(np.float32)
+        ar = np.arange(self.W, dtype=np.int64)
+        for i, x in enumerate(sources):
+            L = x.shape[0]
+            pos = np.arange(0, L, self.solo_hop, dtype=np.int64)
+            rows = []
+            Es = []
+            chunk = 512
+            for p0 in range(0, len(pos), chunk):
+                st = pos[p0:p0 + chunk]
+                idx = (st[:, None] + ar[None, :]) % L
+                Xt = x[idx] * np.float32(self.b[i])                      # (n, W, C)
+                E = (Xt.astype(np.float64) ** 2).mean(axis=(1, 2))
+                Xf = np.fft.rfft(Xt * hann[None, :, None], axis=1)       # (n, F, C)
+                P = (np.abs(Xf) ** 2).sum(axis=2)
+                Pb = np.stack([P[:, f0:f1].sum(axis=1) for (f0, f1) in self.band_bins], axis=1)
+                ratios = Pb / (Pb.sum(axis=1, keepdims=True) + self.eps)
+                ratios[E < self.silence_energy] = 0.0
+                rows.append(np.concatenate([np.log1p(E / self.E_ref)[:, None], ratios], axis=1))
+                Es.append(E)
+            raw = np.concatenate(rows, axis=0)
+            flux = np.zeros(len(raw))
+            if len(raw) > 1:
+                d = raw[1:, 1:] - raw[:-1, 1:]
+                flux[1:] = (np.maximum(d, 0.0) ** 2).sum(axis=1)
+            raw = np.concatenate([raw, flux[:, None]], axis=1)
+            self.solo_pos.append(pos)
+            self.solo_f.append((raw - self.norm_mean) / self.norm_std)
+            self.solo_E.append(np.concatenate(Es))
+
+    def grams_at_positions(self, sources: Sequence[np.ndarray], starts: np.ndarray, positions: np.ndarray):
+        """Window Gram matrices for explicit per-track source positions (positions: (n, M) source
+        frames of the window start for each track).  Exact for the summed PCM of those windows."""
+        n = len(starts)
+        M, W, C = self.M, self.W, self.C
+        hann = np.hanning(W).astype(np.float32)
+        ar = np.arange(W, dtype=np.int64)
+        Xt = np.empty((n, M, W, C), dtype=np.float32)
+        for i, x in enumerate(sources):
+            idx = (positions[:, i][:, None] + ar[None, :]) % x.shape[0]
+            Xt[:, i] = x[idx] * np.float32(self.b[i])
+        flat = Xt.reshape(n, M, W * C)
+        G0 = np.matmul(flat, flat.transpose(0, 2, 1)) / float(W * C)
+        Xf = np.fft.rfft(Xt * hann[None, None, :, None], axis=2)
+        Gb = np.zeros((n, self.nb, M, M), dtype=np.float64)
+        for bi, (f0, f1) in enumerate(self.band_bins):
+            Xb = Xf[:, :, f0:f1, :].reshape(n, M, -1)
+            Gb[:, bi] = np.matmul(Xb, np.conj(Xb).transpose(0, 2, 1)).real
+        return G0, Gb
+
+    def composition_from_grams(self, gains: np.ndarray, G0: np.ndarray, Gb: np.ndarray, S_rows: np.ndarray):
+        """Composition state from explicit Grams (rows consecutive) and material similarity rows."""
+        a = np.asarray(gains, dtype=np.float64)
+        E_y = np.maximum(np.einsum("jm,jmk,jk->j", a, G0, a), 0.0)
+        diag = np.einsum("jmm->jm", G0)
+        e = a * a * diag
+        Pb = np.maximum(np.einsum("jm,jbmk,jk->jb", a, Gb, a), 0.0)
+        ratios = Pb / (Pb.sum(axis=1, keepdims=True) + self.eps)
+        silent = E_y < self.silence_energy
+        ratios[silent] = 0.0
+        flux = np.zeros(len(E_y))
+        if len(E_y) > 1:
+            d = ratios[1:] - ratios[:-1]
+            flux[1:] = (np.maximum(d, 0.0) ** 2).sum(axis=1)
+        phi_raw = np.concatenate([np.log1p(E_y / self.E_ref)[:, None], ratios, flux[:, None]], axis=1)
+        phi = (phi_raw - self.norm_mean) / self.norm_std
+        c = e / (e.sum(axis=1, keepdims=True) + self.eps)
+        R = S_rows * c[:, :, None] * c[:, None, :]
+        Rup = R[:, self.iu[0], self.iu[1]]
+        xi = np.concatenate([phi, c, Rup], axis=1)
+        return xi, {"phi": phi, "phi_raw": phi_raw, "c": c, "R": R, "silent": silent, "E": E_y, "e": e}
+
+    def material_features_at(self, positions: np.ndarray):
+        """Normalized solo features f (n, M, d_phi) at explicit positions (nearest solo-bank row)
+        and the similarity S (n, M, M) and log-energy change chi (n, M)."""
+        n = positions.shape[0]
+        f = np.zeros((n, self.M, self.d_phi))
+        for i in range(self.M):
+            k = np.clip(np.round(positions[:, i] / float(self.solo_hop)).astype(np.int64), 0, len(self.solo_pos[i]) - 1)
+            f[:, i, :] = self.solo_f[i][k]
+        diff = f[:, :, None, :] - f[:, None, :, :]
+        S = np.exp(-(diff ** 2).sum(axis=-1) / (2.0 * self.sigma_F ** 2))
+        raw_logE = f[:, :, 0] * self.norm_std[0] + self.norm_mean[0]
+        chi = np.zeros((n, self.M))
+        if n > 1:
+            chi[1:] = np.tanh(raw_logE[1:] - raw_logE[:-1])
+        return f, S, chi
+
     # ------------------------------------------------------------------ public API
     def composition(self, gains: np.ndarray, idx: np.ndarray):
         """gains (J', M) at consecutive grid indices idx -> (xi (J', d_xi), parts)."""
@@ -253,7 +348,7 @@ class Analyzer:
             e = []
             for i, (x, b, cv) in enumerate(zip(sources, base_gains, curves)):
                 g = cv.values(frames)
-                v = float(b) * g[:, None] * x[frames % x.shape[0]].astype(np.float64)
+                v = float(b) * g[:, None] * x[cv.positions(frames, x.shape[0])].astype(np.float64)
                 e.append(float((v ** 2).mean()))
             e_rows.append(e)
         phi_raw = np.array(rows_phi)

@@ -308,9 +308,21 @@ def check_segment(seg: Segment, fs: float, lim: MotionLimits) -> List[str]:
 
 
 @dataclass
+class Clip:
+    """Playback-position map piece (hires extension, user-authorised): from output frame
+    `out_start` the source plays from source frame `src_start` (advancing 1:1, modulo length)."""
+    out_start: int
+    src_start: int
+
+    def to_dict(self) -> dict:
+        return {"out_start": int(self.out_start), "src_start": int(self.src_start)}
+
+
+@dataclass
 class TrackCurve:
     segments: List[Segment] = field(default_factory=list)
     bumps: List[Bump] = field(default_factory=list)
+    clips: List[Clip] = field(default_factory=list)      # empty = continuous clock (position = output frame)
 
     @property
     def start(self) -> int:
@@ -397,7 +409,56 @@ class TrackCurve:
         return 0
 
     def add_bump(self, bump: "Bump") -> "TrackCurve":
-        return TrackCurve(self.segments, self.bumps + [bump])
+        return TrackCurve(self.segments, self.bumps + [bump], self.clips)
+
+    def positions(self, frames: np.ndarray, length: int) -> np.ndarray:
+        """Source position (frame index into the source, modulo its length) for output frames."""
+        frames = np.asarray(frames, dtype=np.int64)
+        if not self.clips:
+            return frames % length
+        starts = np.array([c.out_start for c in self.clips], dtype=np.int64)
+        idx = np.searchsorted(starts, frames, side="right") - 1
+        pos = np.where(idx >= 0, frames, frames)  # placeholder
+        out = np.empty(frames.shape, dtype=np.int64)
+        for k, c in enumerate(self.clips):
+            m = idx == k
+            if m.any():
+                out[m] = (c.src_start + (frames[m] - c.out_start)) % length
+        m = idx < 0
+        if m.any():
+            out[m] = frames[m] % length
+        return out
+
+    def check_hires(self, fs: float, lim: MotionLimits, cap_intervals: Optional[List[Tuple[int, int, float]]] = None) -> List[str]:
+        """Hires checks (user-authorised profile): gain bounds, value continuity at joints, Q5/HOLD
+        kinds only, goal caps; the slow-motion rules are waived by authorisation."""
+        v: List[str] = []
+        segs = self.segments
+        if not segs:
+            return ["no_segments"]
+        tol = lim.bound_tol
+        for k, seg in enumerate(segs):
+            if seg.kind not in ("Q5", "HOLD"):
+                v.append(f"seg{k}:unknown_kind:{seg.kind}")
+            if seg.end <= seg.start:
+                v.append(f"seg{k}:empty_segment")
+            for x, nm in ((seg.a, "start_gain"), (seg.b, "end_gain")):
+                if not (-tol <= x <= 1.0 + tol) or not math.isfinite(x):
+                    v.append(f"seg{k}:{nm}_out_of_range:{x}")
+            if seg.kind == "HOLD" and seg.a != seg.b:
+                v.append(f"seg{k}:hold_not_constant")
+            if k > 0:
+                prev = segs[k - 1]
+                if prev.end != seg.start:
+                    v.append(f"seg{k}:not_contiguous")
+                if abs(prev.b - seg.a) > tol:
+                    v.append(f"seg{k}:value_discontinuity:{prev.b}->{seg.a}")
+        if cap_intervals:
+            for (a0, a1, cap) in cap_intervals:
+                fr = np.arange(a0, a1, max(1, int(fs // 100)), dtype=np.int64)
+                if len(fr) and float(self.values(fr).max()) > cap + tol:
+                    v.append(f"cap_exceeded:{a0}")
+        return v
 
     def base_boundaries(self) -> List[int]:
         return [self.segments[0].start] + [sg.end for sg in self.segments]
@@ -534,13 +595,16 @@ class TrackCurve:
         out = [s.to_dict() for s in self.segments]
         if self.bumps:
             out.append({"type": "BUMPS", "bumps": [b.to_dict() for b in self.bumps]})
+        if self.clips:
+            out.append({"type": "CLIPS", "clips": [c.to_dict() for c in self.clips]})
         return out
 
     @classmethod
     def from_list(cls, lst: List[dict]) -> "TrackCurve":
-        segs = [Segment.from_dict(d) for d in lst if d.get("type") != "BUMPS"]
+        segs = [Segment.from_dict(d) for d in lst if d.get("type") not in ("BUMPS", "CLIPS")]
         bumps = [Bump.from_dict(b) for d in lst if d.get("type") == "BUMPS" for b in d["bumps"]]
-        return cls(segs, bumps)
+        clips = [Clip(int(c["out_start"]), int(c["src_start"])) for d in lst if d.get("type") == "CLIPS" for c in d["clips"]]
+        return cls(segs, bumps, clips)
 
     def motion_energy(self, fs: float, lim: MotionLimits) -> float:
         """Sum over segments of frames * mean[(g1/Vmax)^2 + (g2/Amax)^2]  (for E_motion).

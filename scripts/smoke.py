@@ -352,6 +352,25 @@ def check_C(modes, fx, hard):
         ok("unknown config key is rejected", False)
     except ValueError as e:
         ok("unknown config key is rejected", "candidate_pool" in str(e))
+    # hires extension (user-authorised): switches, position jumps, master chain; exact goal on the raw render
+    hcfg = json.load(open(os.path.join(DEV, f"full_{modes[0]}.json")))
+    hcfg["hires"] = {"enabled": True}
+    hcfg["render"] = {"master": {"enabled": True}}
+    hpath = os.path.join(DEV, "hires.json")
+    json.dump(hcfg, open(hpath, "w"))
+    jh = Job(load_config(hpath, modes[0]), os.path.join(DEV, "out", f"hires_{modes[0]}"), config_path=hpath, mode_override=modes[0])
+    t0 = time.time()
+    rh = jh.run()
+    th = json.load(open(os.path.join(jh.output_dir, "state_trace.json")))
+    hc = th.get("hard_checks", {})
+    ok(f"{modes[0]} hires: legal output with switches and position jumps",
+       rh["status"] in ("BEST_EFFORT", "VALID_APPROXIMATION") and hc.get("all_passed") and hc.get("position_jumps", 0) > 0
+       and hc.get("switches", 0) > 0, f"{rh['status']} jumps={hc.get('position_jumps')} switches={hc.get('switches')} {time.time() - t0:.0f}s")
+    ok(f"{modes[0]} hires: exact goal on the raw render before the master chain",
+       hc.get("exact_goals_rendered") and hc.get("goal_hold_max_abs_deviation") == 0.0 and "master_chain" in hc)
+    curves_h = [TrackCurve.from_list(lst) for lst in th["curve_segments_per_track"]]
+    ok(f"{modes[0]} hires: position maps restored from the trace", any(len(cv.clips) > 0 for cv in curves_h[1:]))
+    REPORT["C"]["hires"] = {"status": rh["status"], "jumps": hc.get("position_jumps"), "switches": hc.get("switches")}
     # poor-approximation fixture: must still output BEST_EFFORT/VALID within bounded time
     mode = modes[0]
     job, cfg = job_for(hard, mode, "hard")

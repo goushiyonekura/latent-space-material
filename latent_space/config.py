@@ -152,7 +152,29 @@ DEFAULTS: Dict[str, Any] = {
         "bump_short_fraction": 0.5,       # second bump covers this fraction of the lookahead
     },
     "render": {"format": "WAV_FLOAT32", "processing_precision": "float64", "block_frames": 8192,
-               "csv_step_seconds": 0.05},
+               "csv_step_seconds": 0.05,
+               # output dynamics (user-authorised for the hires extension; disabled by default):
+               "master": {"enabled": False, "compressor": {"enabled": True, "threshold_dbfs": -20.0, "ratio": 3.0,
+                                                           "attack_ms": 10.0, "release_ms": 250.0, "knee_db": 6.0},
+                          "normalize_peak_dbfs": -1.0,
+                          "limiter": {"enabled": True, "ceiling_dbfs": -1.0, "lookahead_ms": 5.0, "release_ms": 80.0}}},
+    # high-resolution extension (user-authorised 2026-09-16): steep switches, playback-position jumps /
+    # splicing, output dynamics.  Opt-in; the baseline pipeline is untouched when disabled.
+    "hires": {
+        "enabled": False,
+        "commit_seconds": 0.5,            # commit / history step
+        "lookahead_seconds": 4.0,         # window improved against the frozen reference
+        "ramp_seconds": 0.25,             # gain ramp (Q5) for level changes; exempt from the slow-motion rules
+        "switch_seconds": 0.05,           # crossfade at playback-position splices
+        "position_jumps": True,           # materials may jump to another position of their own source
+        "jump_candidates": 2,             # positions per track examined per step (from the solo bank)
+        "min_clip_seconds": 2.0,          # minimum time between jumps of one track
+        "level_step": 0.12,               # coordinate-search step on end levels
+        "max_sweeps": 3,
+        "n_reference_proposals": 2,
+        "goal_rise_seconds": 12.0,        # smooth goal rise at the end of CONTRACT (convergence gesture)
+        "w_relation": 0.25, "w_smooth": 0.0,
+    },
     "numerics": {"gain_bound_tolerance": 1e-9, "motion_relative_margin": 1e-6,
                  "db_rate_subintervals": 128},
     "calibration_status": "UNVERIFIED",
@@ -160,7 +182,8 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
-PROFILE_SCALE = {"baseline": 1.0, "responsive_x2_UNVERIFIED": 2.0}
+PROFILE_SCALE = {"baseline": 1.0, "responsive_x2_UNVERIFIED": 2.0, "responsive_x4_UNVERIFIED": 4.0,
+                 "responsive_x8_UNVERIFIED": 8.0}
 
 
 def apply_motion_profile(motion: Dict[str, Any]) -> Dict[str, Any]:

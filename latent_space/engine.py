@@ -35,6 +35,8 @@ from .config import MODE_IDS, SPEC_VERSION
 from .curves import Bump, MotionLimits, TrackCurve
 from .form import FormInfeasible, FormPlan
 from .history import History
+from .hires import HiresState, run_unit_hires
+from .master import master_chain
 from .modes import IncompleteImplementation, make_mode
 from .objective import Objective
 from .render import goal_hold_reference, render_equation_1
@@ -151,6 +153,12 @@ class Job:
         self.objective = Objective(cfg, self.lim, self.fs)
         self.history = History(self.M, self.analyzer.d_xi, cfg)
         self.mode = make_mode(self.mode_name, cfg, self.analyzer, self.fs, self.rng, self.objective)
+        self.hires = bool(cfg["hires"]["enabled"])
+        if self.hires:
+            t1 = time.time()
+            self.analyzer.build_solo_bank(self.sources, float(cfg["analysis"]["hop_seconds"]))
+            self.solo_bank_seconds = time.time() - t1
+            self.hires_state = HiresState(self.M, 0)
         w_ms = self.analyzer.W / self.fs * 1000.0
         loops = {self.track_names[k]: self.total_frames / float(x.shape[0]) for k, x in enumerate(self.sources)}
         self.source_loop_counts = loops
@@ -577,20 +585,31 @@ class Job:
             unit_curves: List[List[TrackCurve]] = []
             for u in self.form.units:
                 unit = self.unit_context(u)
-                chosen = self.run_unit(unit)
+                chosen = run_unit_hires(self, unit, self.hires_state) if self.hires else self.run_unit(unit)
                 unit_curves.append(chosen.candidate.curves)
-            full_curves = [TrackCurve([seg for uc in unit_curves for seg in uc[i].segments],
-                                      [b for uc in unit_curves for b in uc[i].bumps]) for i in range(self.M)]
-            hard_checks = self.hard_checks(full_curves)
+            if self.hires:
+                full_curves = [TrackCurve(list(self.hires_state.segments[i]), [], list(self.hires_state.clips[i]))
+                               for i in range(self.M)]
+            else:
+                full_curves = [TrackCurve([seg for uc in unit_curves for seg in uc[i].segments],
+                                          [b for uc in unit_curves for b in uc[i].bumps]) for i in range(self.M)]
+            hard_checks = self.hard_checks_hires(full_curves) if self.hires else self.hard_checks(full_curves)
             if not hard_checks["all_passed"]:
                 raise HardConstraintFailure("final curve failed hard checks: " + "; ".join(hard_checks["violations"][:10]))
+            xf = int(round(float(self.cfg["hires"]["switch_seconds"]) * self.fs)) if self.hires else 0
             y = render_equation_1(self.sources, self.base_gains, full_curves, self.total_frames,
-                                  int(self.cfg["render"]["block_frames"]))
+                                  int(self.cfg["render"]["block_frames"]), splice_crossfade_frames=xf)
             if not np.all(np.isfinite(y)):
                 raise HardConstraintFailure("rendered output contains non-finite samples")
             hard_checks.update(self.rendered_checks(y, full_curves))
             if not hard_checks["all_passed"]:
                 raise HardConstraintFailure("rendered output failed goal-hold verification")
+            mcfg = self.cfg["render"].get("master", {})
+            if mcfg.get("enabled", False):
+                y, minfo = master_chain(y, self.fs, mcfg)
+                hard_checks["master_chain"] = minfo
+                hard_checks["master_note"] = ("goal-hold exactness verified on the raw eq. (1) render; output dynamics "
+                                              "applied afterwards (user-authorised)")
             status = "VALID_APPROXIMATION" if all(r["tolerance_met"] for r in self.unit_reports) else "BEST_EFFORT"
         except IncompleteImplementation as e:
             status, error = "INCOMPLETE_IMPLEMENTATION", str(e)
@@ -668,6 +687,44 @@ class Job:
                 "bumps_total": int(sum(len(cv.bumps) for cv in curves)),
                 "violations": viol, "all_passed": len(viol) == 0}
 
+    def hard_checks_hires(self, curves: List[TrackCurve]) -> Dict[str, Any]:
+        """Hires profile: bounds, continuity, coverage, goal caps and exact goal holds; the slow-motion
+        rules are waived by user authorisation (recorded)."""
+        viol: List[str] = []
+        ge = self.cfg["form"]["goal_exposure"]
+        caps0 = []
+        if ge["policy"] != "free":
+            for p in self.form.phases:
+                if p.name in ("INTRO", "OPEN") and p.end > p.start:
+                    caps0.append((p.start, p.end, float(ge["intro_max"] if p.name == "INTRO" else ge["open_max"])))
+        frames = np.arange(self.total_frames, dtype=np.int64)
+        goal_ok = True
+        max_g, min_g = -np.inf, np.inf
+        n_switch = 0
+        n_jumps = 0
+        for i, cv in enumerate(curves):
+            viol += [f"track{i}:{m}" for m in cv.check_hires(self.fs, self.lim, caps0 if i == 0 else None)]
+            if cv.start != 0 or cv.end != self.total_frames:
+                viol.append(f"track{i}:does_not_cover_piece:{cv.start}-{cv.end}")
+            g = cv.values(frames)
+            max_g, min_g = max(max_g, float(g.max())), min(min_g, float(g.min()))
+            if not np.all(np.isfinite(g)) or g.max() > 1 + self.lim.bound_tol or g.min() < -self.lim.bound_tol:
+                viol.append(f"track{i}:sampled_gain_out_of_bounds")
+            for p in self.form.phases:
+                if p.name == "GOAL_HOLD":
+                    want = 1.0 if i == 0 else 0.0
+                    seg = g[p.start:p.end]
+                    if seg.size and not np.all(seg == want):
+                        goal_ok = False
+                        viol.append(f"track{i}:goal_hold_not_exact_in_phase@{p.start}")
+            n_switch += sum(1 for sg in cv.segments if sg.label == "SWITCH")
+            n_jumps += len(cv.clips)
+        return {"profile": "hires (steep switches, position jumps; slow-motion rules waived by user authorisation)",
+                "gain_bounds": min_g >= -self.lim.bound_tol and max_g <= 1 + self.lim.bound_tol,
+                "gain_range_observed": [min_g, max_g], "continuity_and_motion_limits": not any("discontinu" in v for v in viol),
+                "slow_motion_rules": "waived", "exact_goals": goal_ok, "switches": n_switch, "position_jumps": n_jumps,
+                "violations": viol, "all_passed": len(viol) == 0}
+
     def rendered_checks(self, y: np.ndarray, curves: List[TrackCurve]) -> Dict[str, Any]:
         max_dev = 0.0
         ok = True
@@ -740,7 +797,9 @@ class Job:
                                  "rule": "argmin of the joint objective; only improvements accepted",
                                  "tolerance_applies_to": cfg["search"]["tolerance_applies_to"]},
             "goal_exposure_policy": cfg["form"]["goal_exposure"],
-            "realization_policy": cfg["realization"],
+            "realization_policy": (cfg["hires"] if cfg["hires"]["enabled"] else cfg["realization"]),
+            "hires_enabled": bool(cfg["hires"]["enabled"]),
+            "master_chain_config": cfg["render"].get("master"),
             "motion_profile": {"profile": cfg["motion"].get("profile", "baseline"),
                                "scale_k": cfg["motion"].get("profile_scale_k", 1.0)},
             "numerical_environment": {"python": sys.version, "numpy": np.__version__, "platform": platform.platform(),

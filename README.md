@@ -95,3 +95,23 @@ trace の曲線から再レンダリングすると `result.wav` とビット一
 ```bash
 python3 scripts/smoke.py
 ```
+
+## 高精細版（hires 拡張、2026-09-16 に利用者が許可）
+
+仕様 v1.1 の枠を超える三つの操作を、**opt-in** で追加した（既定では無効。`hires.enabled=false`／`render.master.enabled=false` なら従来どおり）。
+
+| 許可された操作 | 実装 |
+|---|---|
+| 急峻なスイッチ | 各確定区間（0.5 s）で素材の終了レベルを座標探索で決め、0.25 s の Q5 ランプで到達。運動上限（速度・加速度・ジャーク・低速規則）は適用しない（`hard_checks.slow_motion_rules = "waived"`）。値の連続性・0〜1・ゴール保持の厳密性は維持 |
+| 再生位置の変更・切り貼り | 各素材は自分の音源内の別位置へジャンプできる（`CLIPS` 位置マップ、継ぎ目は 50 ms のクロスフェード）。候補位置は音源全体のソロ特徴バンクから、凍結参照の帯域プロファイルに近い位置＋探索用の乱数位置。最小クリップ長 2 s。ゴールは連続時計のまま |
+| リミッター／コンプレッサー／ノーマライズ | 式(1)の生レンダリングでゴール一致を検証したあと、`latent_space/master.py`（RMS コンプレッサー → ピーク正規化 −1 dBFS → 先読みリミッター）を適用。適用量は trace の `hard_checks.master_chain` に記録 |
+
+実現は `latent_space/hires.py`：窓（4 s）ごとに方式の参照を凍結し、位置ジャンプ候補（トラックごと）とレベルの組合せを、その位置での実 PCM から計算した窓 Gram（合算 PCM に対して厳密）で評価して最良を採用、先頭 0.5 s を確定して履歴へ返す。方式が見る素材特徴も実際に鳴っている位置のものに更新する。
+
+周期：`scripts/sweep_period.py` が各方式について OPEN+CONTRACT ＝ 120／180／240 s を実行し、固定参照残差（全グリッド平均）が最小の周期を採用して `project.hires.<mode>.json` と `output_hires/<mode>/` を書く。
+
+```bash
+python3 -m latent_space generate --config project.hires.diffusion.json --mode diffusion --output output_hires/diffusion
+```
+
+**元に戻すには**：`project.json`（従来設定）で生成すればよい。高精細版は設定のみの切替で、従来パイプラインのコードは変更していない。
