@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.mp3
+inputs/
+dev/
+output/*/result.wav

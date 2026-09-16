@@ -1,0 +1,51 @@
+{
+  "spec_version": "1.1",
+  "mode": "diffusion",
+  "seed": 48291,
+  "materials": [
+    "inputs/material_cello_001.wav",
+    "inputs/material_prism_001.wav",
+    "inputs/material_scri_001.wav",
+    "inputs/material_stringquartet_001.wav"
+  ],
+  "goal": "inputs/material_GOAL_001.wav",
+  "base_level": {
+    "policy": "shared_static_peak_bound",
+    "sample_peak_cap": 0.85
+  },
+  "form": {
+    "cycles": 2,
+    "timing_policy": "adaptive",
+    "intro_seconds": 12,
+    "open_seconds": 20,
+    "contract_seconds": 30,
+    "goal_hold_seconds": 5,
+    "reopen_seconds": 30
+  },
+  "analysis": {
+    "window_frames": 2048,
+    "hop_seconds": 0.1,
+    "spectral_bands": 8
+  },
+  "search": {
+    "candidate_bank_target": 24,
+    "max_total_candidates_per_cycle": 128,
+    "max_search_rounds": 6,
+    "normalized_mode_tolerance": 0.1,
+    "minimum_improvement": 0.0001,
+    "patience_rounds": 2,
+    "targets_per_round": 4
+  },
+  "history": {
+    "enabled": true,
+    "update_rate": 0.1,
+    "recent_event_capacity": 16,
+    "parent_capacity": 8
+  },
+  "render": {
+    "format": "WAV_FLOAT32",
+    "processing_precision": "float64",
+    "block_frames": 8192
+  },
+  "calibration_status": "UNVERIFIED"
+}

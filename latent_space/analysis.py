@@ -1,0 +1,282 @@
+"""Acoustic-composition analysis (spec §4).
+
+For every analysis window (fixed grid over the whole piece) we precompute, for the actual
+looped PCM of every track (scaled by its base gain b_i):
+  G0[j]    : (M,M) time-domain Gram matrix   mean_{n,c} x_i x_k          (unwindowed)
+  Gb[j,b]  : (M,M) band Gram matrices        Re sum_{f in band b, c} X_i conj(X_k)  (Hann FFT)
+Because eq. (1) is linear and the gain of a track is held at its window-centre value inside an
+analysis window (window_frames / fs seconds, e.g. 46 ms at 44.1 kHz, 93 ms at 22.05 kHz), the
+energy / band powers of the *actual summed PCM* under a gain vector a are the exact quadratic
+forms a^T G a — no per-candidate FFT is needed and cross terms are included.  The window-centre
+gain hold is the approximation of the proxy; float32 working arrays add ordinary rounding; the
+feature reduction (energy, 8 bands, contribution proxies, pair relations) is a modelling choice,
+not a Gram-form error.  The engine re-analyses the rendered output of the chosen candidate on the
+same windows (composition_from_render) and records proxy / target / rendered distances separately.
+Analysis windows never extend past the end of the piece (no boundary-condition mismatch between
+the looped proxy and the finite rendered file).
+
+Composition state (eq. 17):  xi = [phi_norm (2+bands) | c (M) | upper(R) (M(M-1)/2)]
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+
+
+class Analyzer:
+    def __init__(self, sources: Sequence[np.ndarray], base_gains: Sequence[float], fs: int,
+                 total_frames: int, cfg: dict):
+        a = cfg["analysis"]
+        obj = cfg["objective"]
+        self.fs = int(fs)
+        self.M = len(sources)
+        self.C = int(sources[0].shape[1])
+        self.W = int(a["window_frames"])
+        self.hop = max(1, int(round(float(a["hop_seconds"]) * fs)))
+        self.nb = int(a["spectral_bands"])
+        self.silence_energy = float(a["silence_energy"])
+        self.eps = float(a["feature_epsilon"])
+        self.std_floor = float(a["feature_std_floor"])
+        self.sigma_F = float(a.get("sigma_F", cfg["mode_defaults"]["transformer"].get("sigma_F", 1.0)))
+        self.w_phi = float(obj["w_phi"])
+        self.w_c = float(obj["w_c"])
+        self.w_R = float(obj["w_R"])
+        self.b = np.asarray(base_gains, dtype=np.float64)
+        self.d_phi = 2 + self.nb
+        self.iu = np.triu_indices(self.M, 1)
+        self.n_pairs = len(self.iu[0])
+        self.d_xi = self.d_phi + self.M + self.n_pairs
+        self.total_frames = int(total_frames)
+        self.source_lengths = [int(x.shape[0]) for x in sources]
+        # bands: fixed intervals over [0, Nyquist]
+        F = self.W // 2 + 1
+        bin_hz = fs / float(self.W)
+        edges = list(a["band_edges_hz"])[: self.nb]
+        while len(edges) < self.nb:
+            edges.append(edges[-1] * 2.0)
+        bins = [min(F - 1, int(round(e / bin_hz))) for e in edges] + [F]
+        for k in range(1, len(bins)):
+            if bins[k] <= bins[k - 1]:
+                bins[k] = bins[k - 1] + 1
+        bins = [min(b_, F) for b_ in bins]
+        self.band_bins: List[Tuple[int, int]] = [(bins[k], bins[k + 1]) for k in range(self.nb)]
+        self.band_edges_hz = [bb[0] * bin_hz for bb in self.band_bins] + [fs / 2.0]
+        # analysis grid: window [centre - W/2, centre + W/2)
+        half = self.W // 2
+        # windows [c - W/2, c - W/2 + W) must lie entirely inside the rendered piece
+        last_center = self.total_frames - (self.W - half)
+        self.centers = np.arange(half, max(half + 1, last_center + 1), self.hop, dtype=np.int64)
+        self.starts = self.centers - half
+        self.J = int(len(self.centers))
+        self.G0 = np.zeros((self.J, self.M, self.M), dtype=np.float64)
+        self.Gb = np.zeros((self.J, self.nb, self.M, self.M), dtype=np.float64)
+        self._compute_grams(sources)
+        self._calibrate()
+        self._material_features()
+        e0 = np.zeros(self.M)
+        e0[0] = 1.0
+        self.xi_goal_all, self.goal_parts_all = self.composition(
+            np.broadcast_to(e0, (self.J, self.M)).copy(), np.arange(self.J))
+
+    # ------------------------------------------------------------------ precomputation
+    def _compute_grams(self, sources: Sequence[np.ndarray]) -> None:
+        M, W, C = self.M, self.W, self.C
+        hann = np.hanning(W).astype(np.float32)
+        chunk = 96
+        ar = np.arange(W, dtype=np.int64)
+        for j0 in range(0, self.J, chunk):
+            st = self.starts[j0:j0 + chunk]
+            n = len(st)
+            Xt = np.empty((n, M, W, C), dtype=np.float32)
+            for i, x in enumerate(sources):
+                idx = (st[:, None] + ar[None, :]) % x.shape[0]
+                Xt[:, i] = x[idx] * np.float32(self.b[i])
+            flat = Xt.reshape(n, M, W * C)
+            self.G0[j0:j0 + n] = np.matmul(flat, flat.transpose(0, 2, 1)) / float(W * C)
+            Xf = np.fft.rfft(Xt * hann[None, None, :, None], axis=2)  # (n, M, F, C) complex
+            for bi, (f0, f1) in enumerate(self.band_bins):
+                Xb = Xf[:, :, f0:f1, :].reshape(n, M, -1)
+                G = np.matmul(Xb, np.conj(Xb).transpose(0, 2, 1)).real
+                self.Gb[j0:j0 + n, bi] = G
+        self.Gb = np.maximum(self.Gb, 0.0) if False else self.Gb  # keep raw (symmetric PSD)
+
+    def _phi_raw(self, gains: np.ndarray, idx: np.ndarray):
+        a = np.asarray(gains, dtype=np.float64)
+        G0 = self.G0[idx]
+        Gb = self.Gb[idx]
+        E_y = np.einsum("jm,jmk,jk->j", a, G0, a)
+        E_y = np.maximum(E_y, 0.0)
+        diag = np.einsum("jmm->jm", G0)
+        e = a * a * diag
+        Pb = np.einsum("jm,jbmk,jk->jb", a, Gb, a)
+        Pb = np.maximum(Pb, 0.0)
+        Ptot = Pb.sum(axis=1, keepdims=True)
+        ratios = Pb / (Ptot + self.eps)
+        silent = E_y < self.silence_energy
+        ratios[silent] = 0.0
+        flux = np.zeros(len(E_y))
+        if len(E_y) > 1:
+            d = ratios[1:] - ratios[:-1]
+            flux[1:] = (np.maximum(d, 0.0) ** 2).sum(axis=1)
+        logE = np.log1p(E_y / self.E_ref)
+        phi_raw = np.concatenate([logE[:, None], ratios, flux[:, None]], axis=1)
+        return phi_raw, e, E_y, silent
+
+    def _calibrate(self) -> None:
+        diag = np.einsum("jmm->jm", self.G0)  # (J, M) energies of each track alone
+        meds = []
+        for i in range(self.M):
+            v = diag[:, i]
+            v = v[v >= self.silence_energy]
+            meds.append(float(np.median(v)) if len(v) else self.silence_energy)
+        self.E_ref = max(float(np.mean(meds)), self.silence_energy)
+        idx = np.arange(self.J)
+        samples = []
+        for i in range(self.M):
+            g = np.zeros((self.J, self.M))
+            g[:, i] = 1.0
+            samples.append(self._phi_raw(g, idx)[0])
+        anchor = np.full((self.J, self.M), 0.4)
+        anchor[:, 0] = 0.1
+        samples.append(self._phi_raw(anchor, idx)[0])
+        samples.append(self._phi_raw(np.ones((self.J, self.M)), idx)[0])
+        allp = np.concatenate(samples, axis=0)
+        self.norm_mean = allp.mean(axis=0)
+        self.norm_std = np.maximum(allp.std(axis=0), self.std_floor)
+
+    def _material_features(self) -> None:
+        idx = np.arange(self.J)
+        diag = np.einsum("jmm->jm", self.G0)
+        f_raw = np.zeros((self.J, self.M, self.d_phi))
+        for i in range(self.M):
+            g = np.zeros((self.J, self.M))
+            g[:, i] = 1.0
+            f_raw[:, i, :] = self._phi_raw(g, idx)[0]
+        self.f_raw = f_raw
+        self.f_mat = (f_raw - self.norm_mean) / self.norm_std
+        self.silent_mat = diag < self.silence_energy
+        logE = f_raw[:, :, 0]
+        chi = np.zeros((self.J, self.M))
+        chi[1:] = np.tanh(logE[1:] - logE[:-1])
+        self.chi = chi
+        diff = self.f_mat[:, :, None, :] - self.f_mat[:, None, :, :]
+        self.S = np.exp(-(diff ** 2).sum(axis=-1) / (2.0 * self.sigma_F ** 2))
+
+    # ------------------------------------------------------------------ public API
+    def composition(self, gains: np.ndarray, idx: np.ndarray):
+        """gains (J', M) at consecutive grid indices idx -> (xi (J', d_xi), parts)."""
+        idx = np.asarray(idx)
+        phi_raw, e, E_y, silent = self._phi_raw(gains, idx)
+        phi = (phi_raw - self.norm_mean) / self.norm_std
+        c = e / (e.sum(axis=1, keepdims=True) + self.eps)
+        S = self.S[idx]
+        R = S * c[:, :, None] * c[:, None, :]
+        Rup = R[:, self.iu[0], self.iu[1]]
+        xi = np.concatenate([phi, c, Rup], axis=1)
+        parts = {"phi": phi, "phi_raw": phi_raw, "c": c, "R": R, "silent": silent, "E": E_y, "e": e}
+        return xi, parts
+
+    def split(self, xi: np.ndarray):
+        return (xi[..., : self.d_phi], xi[..., self.d_phi: self.d_phi + self.M], xi[..., self.d_phi + self.M:])
+
+    def dist2(self, xi_a: np.ndarray, xi_b: np.ndarray) -> np.ndarray:
+        """Eq. (22) per row."""
+        d = xi_a - xi_b
+        dp, dc, dr = self.split(d)
+        out = self.w_phi * (dp ** 2).mean(axis=-1) + self.w_c * (dc ** 2).mean(axis=-1)
+        if self.n_pairs > 0:
+            out = out + self.w_R * (dr ** 2).mean(axis=-1)
+        return out
+
+    def weight_vector(self) -> np.ndarray:
+        """Diagonal W such that dist2 = d^T W d."""
+        w = np.concatenate([np.full(self.d_phi, self.w_phi / self.d_phi),
+                            np.full(self.M, self.w_c / self.M),
+                            np.full(self.n_pairs, self.w_R / max(1, self.n_pairs))])
+        return w
+
+    def grid_indices(self, start: int, end: int) -> np.ndarray:
+        return np.where((self.centers >= start) & (self.centers < end))[0]
+
+    def phi_from_pcm(self, y: np.ndarray, idx: np.ndarray) -> np.ndarray:
+        """True mixture features of rendered PCM y (frames, C) at grid indices idx (for verification)."""
+        hann = np.hanning(self.W)
+        rows = []
+        prev = None
+        for j in idx:
+            s = int(self.starts[j])
+            seg = y[s: s + self.W].astype(np.float64)
+            if seg.shape[0] < self.W:
+                seg = np.pad(seg, ((0, self.W - seg.shape[0]), (0, 0)))
+            E = float((seg ** 2).mean())
+            X = np.fft.rfft(seg * hann[:, None], axis=0)
+            P = (np.abs(X) ** 2).sum(axis=1)
+            Pb = np.array([P[f0:f1].sum() for (f0, f1) in self.band_bins])
+            ratios = Pb / (Pb.sum() + self.eps)
+            if E < self.silence_energy:
+                ratios = np.zeros(self.nb)
+            flux = 0.0 if prev is None else float((np.maximum(ratios - prev, 0.0) ** 2).sum())
+            prev = ratios
+            rows.append(np.concatenate([[np.log1p(E / self.E_ref)], ratios, [flux]]))
+        raw = np.array(rows)
+        return (raw - self.norm_mean) / self.norm_std
+
+    def composition_from_render(self, y: np.ndarray, sources: Sequence[np.ndarray], base_gains: Sequence[float],
+                                curves, idx: np.ndarray):
+        """True composition state of the rendered PCM y on *consecutive* grid rows idx: mixture
+        features from y itself (time-varying gains), per-track contributions from the exact
+        component signals b_i g_i(n) x_i[n mod L_i] (the sources and the official curves are known,
+        no source separation), relations from the same S.  Flux is computed along the given
+        consecutive sequence (its first row has flux 0, like any sequence start)."""
+        idx = np.asarray(idx)
+        hann = np.hanning(self.W)
+        rows_phi = []
+        e_rows = []
+        prev = None
+        for j in idx:
+            s0 = int(self.starts[j])
+            frames = np.arange(s0, s0 + self.W, dtype=np.int64)
+            seg = y[s0: s0 + self.W].astype(np.float64)
+            if seg.shape[0] < self.W:
+                seg = np.pad(seg, ((0, self.W - seg.shape[0]), (0, 0)))
+            E = float((seg ** 2).mean())
+            X = np.fft.rfft(seg * hann[:, None], axis=0)
+            P = (np.abs(X) ** 2).sum(axis=1)
+            Pb = np.array([P[f0:f1].sum() for (f0, f1) in self.band_bins])
+            ratios = Pb / (Pb.sum() + self.eps)
+            if E < self.silence_energy:
+                ratios = np.zeros(self.nb)
+            flux = 0.0 if prev is None else float((np.maximum(ratios - prev, 0.0) ** 2).sum())
+            prev = ratios
+            rows_phi.append(np.concatenate([[np.log1p(E / self.E_ref)], ratios, [flux]]))
+            e = []
+            for i, (x, b, cv) in enumerate(zip(sources, base_gains, curves)):
+                g = cv.values(frames)
+                v = float(b) * g[:, None] * x[frames % x.shape[0]].astype(np.float64)
+                e.append(float((v ** 2).mean()))
+            e_rows.append(e)
+        phi_raw = np.array(rows_phi)
+        phi = (phi_raw - self.norm_mean) / self.norm_std
+        e = np.array(e_rows)
+        c = e / (e.sum(axis=1, keepdims=True) + self.eps)
+        S = self.S[idx]
+        R = S * c[:, :, None] * c[:, None, :]
+        Rup = R[:, self.iu[0], self.iu[1]]
+        xi = np.concatenate([phi, c, Rup], axis=1)
+        return xi, {"phi": phi, "phi_raw": phi_raw, "c": c, "R": R, "e": e}
+
+    def to_trace(self) -> dict:
+        return {
+            "window_frames": self.W, "window_seconds": self.W / self.fs,
+            "hop_frames": self.hop, "hop_seconds": self.hop / self.fs,
+            "grid_points": self.J, "band_edges_hz": [float(x) for x in self.band_edges_hz],
+            "band_bins": [list(map(int, bb)) for bb in self.band_bins],
+            "E_ref": self.E_ref, "feature_norm_mean": self.norm_mean.tolist(),
+            "feature_norm_std": self.norm_std.tolist(), "sigma_F": self.sigma_F,
+            "d_phi": self.d_phi, "d_xi": self.d_xi, "n_pairs": self.n_pairs,
+            "distance_weights": {"w_phi": self.w_phi, "w_c": self.w_c, "w_R": self.w_R},
+            "window_gain_hold_note": f"gains held at window-centre value inside each {self.W / self.fs * 1000:.1f} ms "
+                                     "analysis window; mixture quadratic forms are exact for the summed PCM under "
+                                     "that hold; windows never cross the end of the rendered piece",
+        }
