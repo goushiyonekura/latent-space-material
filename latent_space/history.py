@@ -14,7 +14,12 @@ class History:
         self.M = int(M)
         self.d_xi = int(d_xi)
         self.rho = float(h["update_rate"])
+        self.tau_H = float(h.get("time_constant_seconds", 60.0))     # audit C7: memory time constant (s)
         self.cov_reg = float(h["cov_regularization"])
+        self.dc_cov = np.zeros((self.M, self.M))                        # EMA of composition-change covariance
+        self.commits = 0
+        self.committed_seconds = 0.0
+        self.recent_xi: List[np.ndarray] = []                          # short list of committed rows (bounded)
         self.event_capacity = int(h["recent_event_capacity"])
         self.parent_capacity = int(h["parent_capacity"])
         self.h_c = np.zeros(self.M)
@@ -46,7 +51,74 @@ class History:
         ev = self.events if n is None else self.events[-n:]
         return list(ev)
 
-    # ------------------------------------------------------------------ update
+    # ------------------------------------------------------------------ commit-level update (audit C6/C7)
+    def rho_dt(self, dt_seconds: float) -> float:
+        """EMA rate for a committed block of dt seconds: rho = 1 - exp(-dt / tau_H)."""
+        return float(1.0 - np.exp(-max(0.0, float(dt_seconds)) / max(1e-9, self.tau_H)))
+
+    def observe_committed(self, unit, rows: np.ndarray, xi_rows: np.ndarray, parts_rows: Dict[str, np.ndarray],
+                          dt_seconds: float, new_events: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Enter the *committed* composition of one block into the long-term summaries
+        (h_c, M_H, xi_mean, change covariance) with the time-constant rate, append the completed
+        events (time-ordered, bounded) and keep a short list of recent committed rows.
+        GOAL_HOLD rows are excluded from the motion summaries (spec §6.2)."""
+        fm = unit.free_mask[rows]
+        rho = self.rho_dt(dt_seconds)
+        log: Dict[str, Any] = {"unit": unit.index, "rows": int(len(rows)), "free_rows": int(fm.sum()),
+                               "dt_seconds": float(dt_seconds), "rho": rho}
+        if fm.any():
+            c = parts_rows["c"][fm]
+            xi = xi_rows[fm]
+            c_bar = c.mean(axis=0)
+            dc = c - c_bar
+            Mc = dc.T @ dc / float(len(c))
+            self.h_c = (1.0 - rho) * self.h_c + rho * c_bar
+            self.M_H = (1.0 - rho) * self.M_H + rho * Mc
+            self.xi_mean = (1.0 - rho) * self.xi_mean + rho * xi.mean(axis=0)
+            if len(c) > 1:
+                d_c = np.diff(c, axis=0)
+                cov = d_c.T @ d_c / float(len(d_c))
+                self.dc_cov = (1.0 - rho) * self.dc_cov + rho * cov
+                w, V = np.linalg.eigh(self.dc_cov)
+                v = V[:, -1]
+                if v @ (c[-1] - c[0]) < 0:
+                    v = -v
+                self.change_direction = v
+                self.change_directions.append(v.copy())
+                self.change_directions = self.change_directions[-self.event_capacity:]
+            self.transitions.append({"unit": unit.index, "c_first": c[0].tolist(), "c_last": c[-1].tolist(),
+                                     "c_mean": c_bar.tolist()})
+            self.transitions = self.transitions[-self.event_capacity:]
+            self.recent_xi.append(xi.copy())
+            self.recent_xi = self.recent_xi[-self.event_capacity:]
+            self.n_updates += 1
+            log["c_bar"] = c_bar.tolist()
+        key = lambda e: (int(e["end_frame"]), int(e["start_frame"]), int(e["track"]))  # noqa: E731
+        self.events = sorted(self.events + list(new_events), key=key)[-self.event_capacity:]
+        self.commits += 1
+        self.committed_seconds += float(dt_seconds)
+        self.update_log.append(log)
+        return log
+
+    def update_unit_archive(self, unit, chosen_candidate, comparison_blocks: Dict[str, np.ndarray], fs: int) -> None:
+        """Unit-level archive (comparison grid for E_hist, motion summary, hold time)."""
+        cand = chosen_candidate
+        peaks = [int(np.argmax(cand.gains[:, i])) for i in range(self.M)]
+        self.motion_summaries.append({
+            "unit": unit.index,
+            "moves_per_track": [len(cv.moves()) for cv in cand.curves],
+            "bumps_per_track": [len(cv.bumps) for cv in cand.curves],
+            "mean_amplitude_per_track": [float(np.mean([s.delta for s in cv.moves()])) if cv.moves() else 0.0
+                                         for cv in cand.curves],
+            "peak_order": [int(t) for t in np.argsort(peaks)],
+        })
+        self.motion_summaries = self.motion_summaries[-self.event_capacity:]
+        self.hold_seconds_total += float(unit.hold_mask.sum()) * unit.analyzer.hop / fs
+        self.comparison_archive.append({"unit": unit.index, "blocks": comparison_blocks})
+        self.comparison_archive = self.comparison_archive[-self.event_capacity:]
+        self.units_completed += 1
+
+    # ------------------------------------------------------------------ legacy unit-level update
     def update(self, unit, chosen_candidate, comparison_blocks: Dict[str, np.ndarray],
                fs: int) -> Dict[str, Any]:
         """Eq. (25)-(26) from the non-hold windows of the realized composition, plus events."""
@@ -125,6 +197,8 @@ class History:
                     if k not in ("xi_start", "xi_end")}
         return {
             "n_updates": self.n_updates, "units_completed": self.units_completed,
+            "commits": self.commits, "committed_seconds": self.committed_seconds, "tau_H_seconds": self.tau_H,
+            "dc_cov": self.dc_cov.tolist(),
             "h_c": self.h_c.tolist(), "M_H": self.M_H.tolist(), "corr_M_H": self.corr().tolist(),
             "xi_mean": self.xi_mean.tolist(), "change_direction": self.change_direction.tolist(),
             "events": [_ev(e) for e in self.events], "transitions": self.transitions,

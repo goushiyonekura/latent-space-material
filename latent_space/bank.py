@@ -41,7 +41,6 @@ class Bank:
         self.tol = lim.bound_tol
         self.dmin = lim.minimum_move_amplitude
         s = cfg["search"]
-        self.K_cap = int(s["max_moves_per_track"])
         self.attempts = int(s["bank_generation_attempts"])
         self.t0 = unit.start
         self.t1 = unit.goal_arrival if unit.goal_arrival is not None else unit.end
@@ -49,6 +48,11 @@ class Bank:
         self.has_goal = unit.goal_arrival is not None
         self.D = (self.t1 - self.t0) / float(self.fs)
         self.hold_max = min(20.0, 0.5 * self.D)
+        # audit B2: the move count follows from the available time and the shortest legal move,
+        # never from a fixed per-cycle maximum; the configured value is only a floor of the cap
+        b_min = move_bounds(0.0, max(lim.minimum_move_amplitude, 0.05), lim)
+        t_shortest = b_min[0] if b_min is not None else 2.0
+        self.K_cap = max(int(s["max_moves_per_track"]), int(self.D / max(1e-6, t_shortest)) + 2)
         # goal exposure policy
         ge = dict(cfg["form"].get("goal_exposure", {}))
         self.goal_policy = str(ge.get("policy", "contract_only"))
@@ -69,6 +73,7 @@ class Bank:
         self.n_failed = 0
         self.next_id = 0
         self.notes: List[str] = []
+        self.rel_stats: Dict[str, int] = {"attempted": 0, "applied": 0, "infeasible_boundary": 0, "infeasible_other": 0}
 
     # ------------------------------------------------------------------ helpers
     def goal_value(self, i: int) -> float:
@@ -109,7 +114,9 @@ class Bank:
 
     # ------------------------------------------------------------------ generic bounded segment
     def _segment_plan(self, v0: float, t_start: int, t_end: int, v_end: Optional[float],
-                      cap: float = 1.0, allow_initial_hold: bool = True) -> Optional[List[Point]]:
+                      cap: float = 1.0, allow_initial_hold: bool = True,
+                      first_dir_required: Optional[int] = None,
+                      last_dir_required: Optional[int] = None) -> Optional[List[Point]]:
         """Waypoints (frame, value, label) on [t_start, t_end] starting at v0 (zero velocity),
         ending exactly at v_end at t_end (or a free level when v_end is None), all levels in
         [0, cap].  Moves alternate direction; zero holds are allowed at level 0.  Number of
@@ -123,9 +130,13 @@ class Bank:
                 return None
             return [(t_start, v0, "ZERO_HOLD"), (t_end, v0, "")]
         first_dirs = self._first_dirs(v0, cap)
+        if first_dir_required is not None:
+            first_dirs = [d for d in first_dirs if d == first_dir_required]
         if not first_dirs:
             return None
         ld = self._last_dir(v_end, cap)
+        if ld is None and last_dir_required is not None:
+            ld = int(last_dir_required)
         hold_max = min(self.hold_max, 0.5 * D)
         for _ in range(80):
             levels = [v0]
@@ -143,7 +154,7 @@ class Bank:
                 # can we finish now with one legal move to v_end?
                 if v_end is not None:
                     dv = v_end - prev
-                    if dv * d > 0 and abs(dv) >= self.dmin:
+                    if dv * d > 0 and abs(dv) >= self.dmin and (ld is None or d == ld):
                         bnd = move_bounds(prev, v_end, self.lim)
                         rem = D - total
                         if bnd is not None and bnd[0] * (1 + _MARGIN) <= rem <= bnd[1] * (1 - _MARGIN):
@@ -260,12 +271,12 @@ class Bank:
         return pts if self._plan_moves_legal(pts) else None
 
     # ------------------------------------------------------------------ per-track plans
-    def random_track_plan(self, i: int) -> Optional[List[Point]]:
+    def random_track_plan(self, i: int, allow_initial_hold: bool = True) -> Optional[List[Point]]:
         if i == 0 and self.goal_constrained:
             return self._goal_track_plan()
         v0 = float(self.unit.start_gains[i])
         vG = self.goal_value(i) if self.has_goal else None
-        pts = self._segment_plan(v0, self.t0, self.t1, vG)
+        pts = self._segment_plan(v0, self.t0, self.t1, vG, allow_initial_hold=allow_initial_hold)
         if pts is None:
             return None
         return self._finish_plan(pts, vG)
@@ -374,15 +385,7 @@ class Bank:
         return pts
 
     # ------------------------------------------------------------------ derived (joint) plans
-    def derived_track_plan(self, j: int, base: List[Point], relation: str) -> Optional[List[Point]]:
-        """Track j with the same move/hold timing as `base` (sync = same directions,
-        counter = opposite), levels drawn inside the legal amplitude range per duration."""
-        if j == 0 and self.goal_constrained:
-            return None
-        rng = self.rng
-        v0 = float(self.unit.start_gains[j])
-        vG = self.goal_value(j) if self.has_goal else None
-        sgn = 1 if relation == "sync" else -1
+    def _parse_base(self, base: List[Point]):
         segs = []
         for (f0, a, lab), (f1, b, _) in zip(base[:-1], base[1:]):
             if f0 >= self.t1:
@@ -391,26 +394,54 @@ class Bank:
                 segs.append(("HOLD", f0, min(f1, self.t1), 0))
             else:
                 segs.append(("MOVE", f0, f1, 1 if b > a else -1))
-        moves = [s for s in segs if s[0] == "MOVE"]
+        return segs
+
+    def derived_track_plan(self, j: int, base: List[Point], relation: str) -> Optional[List[Point]]:
+        """Track j related to `base`.  'sync': same move/hold timing and directions over the whole
+        unit (falls back to a local interior relation when the boundary makes it infeasible);
+        'counter': opposite direction on one interior interval of the base (audit C3: start-from-0
+        and end-at-0 moves cannot be reversed, so the relation is local, never whole-span)."""
+        self.rel_stats["attempted"] += 1
+        if j == 0 and self.goal_constrained:
+            self.rel_stats["infeasible_boundary"] += 1
+            return None
+        out = None
+        if relation == "sync":
+            out = self._full_sync_plan(j, base)
+            if out is None:
+                out = self._local_relation_plan(j, base, +1)
+        else:
+            out = self._local_relation_plan(j, base, -1)
+        if out is not None:
+            self.rel_stats["applied"] += 1
+        return out
+
+    def _full_sync_plan(self, j: int, base: List[Point]) -> Optional[List[Point]]:
+        rng = self.rng
+        v0 = float(self.unit.start_gains[j])
+        vG = self.goal_value(j) if self.has_goal else None
+        segs = self._parse_base(base)
+        moves = [sg for sg in segs if sg[0] == "MOVE"]
         if not moves:
             return None
         first_dirs = self._first_dirs(v0)
-        if sgn * moves[0][3] not in first_dirs:
+        if moves[0][3] not in first_dirs:
+            self.rel_stats["infeasible_boundary"] += 1
             return None
         ld = self._last_dir(vG)
-        if ld is not None and sgn * moves[-1][3] != ld:
+        if ld is not None and moves[-1][3] != ld:
+            self.rel_stats["infeasible_boundary"] += 1
             return None
         pts: List[Point] = []
         level = v0
         n_moves = len(moves)
         mi = 0
-        for k, (kind, f0, f1, d) in enumerate(segs):
+        for (kind, f0, f1, d) in segs:
             if kind == "HOLD":
                 if level > self.tol:
                     return None
                 pts.append((f0, level, "ZERO_HOLD"))
                 continue
-            d = sgn * d
             T = (f1 - f0) / float(self.fs)
             is_last = mi == n_moves - 1
             if is_last and vG is not None:
@@ -426,11 +457,19 @@ class Bank:
                     return None
                 dlo, dhi = rg
                 if mi == n_moves - 2 and vG is not None:
-                    if ld > 0:
-                        dhi = min(dhi, (vG - self.dmin - level) * d)
+                    # audit C2: bound the *next gain* first, then convert to an amplitude range
+                    next_lo, next_hi = 0.0, 1.0
+                    if ld is not None and ld > 0:      # final move rises to the goal value
+                        next_hi = min(next_hi, vG - self.dmin)
+                    else:                              # final move descends to the goal value
+                        next_lo = max(next_lo, vG + self.dmin)
+                    if d > 0:
+                        dlo = max(dlo, next_lo - level)
+                        dhi = min(dhi, next_hi - level)
                     else:
-                        dhi = min(dhi, (vG + self.dmin - level) * d)
-                    if dhi < dlo:
+                        dlo = max(dlo, level - next_hi)
+                        dhi = min(dhi, level - next_lo)
+                    if dlo > dhi:
                         return None
                 delta = float(rng.uniform(dlo, dhi))
                 new_level = float(min(1.0, max(0.0, level + d * delta)))
@@ -438,7 +477,49 @@ class Bank:
             level = new_level
             mi += 1
         pts.append((self.t1, level, ""))
-        return self._finish_plan(pts, vG)
+        out = self._finish_plan(pts, vG)
+        if out is not None and not self._plan_moves_legal(out):
+            return None
+        return out
+
+    def _local_relation_plan(self, j: int, base: List[Point], sgn: int) -> Optional[List[Point]]:
+        """Relation on one interior move of the base (same direction sgn=+1, opposite sgn=-1);
+        before and after it track j moves independently and legally."""
+        rng = self.rng
+        v0 = float(self.unit.start_gains[j])
+        vG = self.goal_value(j) if self.has_goal else None
+        moves = [sg for sg in self._parse_base(base) if sg[0] == "MOVE"]
+        interior = moves[1:-1] if vG is not None else moves[1:]
+        if not interior:
+            self.rel_stats["infeasible_boundary"] += 1
+            return None
+        for _ in range(6):
+            _k, f0, f1, d_b = interior[int(rng.integers(len(interior)))]
+            d_j = sgn * d_b
+            T = (f1 - f0) / float(self.fs)
+            v_e = float(rng.uniform(0.0, 1.0 - self.dmin)) if d_j > 0 else float(rng.uniform(self.dmin, 1.0))
+            rg = feasible_delta_range(T, self.lim, v_e, d_j)
+            if rg is None:
+                continue
+            delta = float(rng.uniform(rg[0], rg[1]))
+            v_x = float(min(1.0, max(0.0, v_e + d_j * delta)))
+            pre = self._segment_plan(v0, self.t0, f0, v_e, allow_initial_hold=True,
+                                     last_dir_required=(-d_j if v_e > self.tol else None))
+            if pre is None:
+                continue
+            post = self._segment_plan(v_x, f1, self.t1, vG, allow_initial_hold=(v_x <= self.tol),
+                                      first_dir_required=-d_j)
+            if post is None:
+                continue
+            pts = pre[:-1] + [(f0, v_e, "MOVE")] + post
+            pts[-1] = (self.t1, pts[-1][1], "")
+            if not self._plan_moves_legal(pts):
+                continue
+            out = self._finish_plan(pts, vG)
+            if out is not None:
+                return out
+        self.rel_stats["infeasible_other"] += 1
+        return None
 
     # ------------------------------------------------------------------ mutation
     def perturb_levels(self, pts: List[Point], i: int) -> Optional[List[Point]]:
@@ -558,9 +639,13 @@ class Bank:
                     if derived is not None:
                         break
                 plans[b] = derived
+            # audit E3: from silence, at least two materials start without an initial zero hold
+            no_hold = set()
+            if self.unit.starts_from_silence and self.M > 2:
+                no_hold = set(int(x) for x in rng.choice(np.arange(1, self.M), size=min(2, self.M - 1), replace=False))
             for i in range(self.M):
                 if plans[i] is None:
-                    plans[i] = self.random_track_plan(i)
+                    plans[i] = self.random_track_plan(i, allow_initial_hold=(i not in no_hold))
             if any(p is None for p in plans):
                 continue
             cand = self.make_candidate(plans, origin)  # type: ignore[arg-type]
@@ -604,4 +689,5 @@ class Bank:
 
     def stats(self) -> Dict[str, object]:
         return {"generated": self.n_generated, "rejected_illegal": self.n_failed,
-                "goal_policy": self.goal_policy, "notes": sorted(set(self.notes))}
+                "goal_policy": self.goal_policy, "notes": sorted(set(self.notes)),
+                "relations": dict(self.rel_stats)}

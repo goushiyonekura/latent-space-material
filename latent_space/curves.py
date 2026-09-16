@@ -118,6 +118,48 @@ class Segment:
                    float(d["start_gain"]), float(d["end_gain"]), d.get("label", ""))
 
 
+@dataclass
+class Bump:
+    """Local additive correction with zero value / velocity / acceleration at both ends
+    (audit C6.1):  dg(t) = amplitude * 64 s^3 (1-s)^3,  s = (n - start)/(end - start)."""
+    start: int
+    end: int
+    amplitude: float
+
+    @property
+    def frames(self) -> int:
+        return self.end - self.start
+
+    def _s(self, frames: np.ndarray) -> np.ndarray:
+        return np.clip((np.asarray(frames, dtype=np.float64) - self.start) / float(self.frames), 0.0, 1.0)
+
+    def values(self, frames: np.ndarray) -> np.ndarray:
+        s = self._s(frames)
+        inside = (frames >= self.start) & (frames < self.end)
+        return np.where(inside, self.amplitude * 64.0 * s ** 3 * (1.0 - s) ** 3, 0.0)
+
+    def derivatives(self, frames: np.ndarray, fs: float):
+        """(dg, dg1, dg2, dg3): value and first three time derivatives (gain, gain/s, gain/s^2, gain/s^3)."""
+        s = self._s(frames)
+        inside = (frames >= self.start) & (frames < self.end)
+        h = self.frames / float(fs)
+        a = self.amplitude
+        f0 = 64.0 * s ** 3 * (1.0 - s) ** 3
+        f1 = 192.0 * s ** 2 * (1.0 - s) ** 2 * (1.0 - 2.0 * s)
+        f2 = 384.0 * s * (1.0 - s) * (1.0 - 5.0 * s + 5.0 * s * s)
+        f3 = 384.0 * ((1.0 - 2.0 * s) * (1.0 - 5.0 * s + 5.0 * s * s) + (s - s * s) * (-5.0 + 10.0 * s))
+        z = np.zeros_like(s)
+        return (np.where(inside, a * f0, z), np.where(inside, a * f1 / h, z),
+                np.where(inside, a * f2 / (h * h), z), np.where(inside, a * f3 / (h ** 3), z))
+
+    def to_dict(self) -> dict:
+        return {"start_frame": int(self.start), "end_frame": int(self.end), "amplitude": float(self.amplitude)}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Bump":
+        return cls(int(d["start_frame"]), int(d["end_frame"]), float(d["amplitude"]))
+
+
 # ----------------------------------------------------------------------------- analytic pieces
 
 def q5_peaks(delta: float, T: float) -> Tuple[float, float, float]:
@@ -268,6 +310,7 @@ def check_segment(seg: Segment, fs: float, lim: MotionLimits) -> List[str]:
 @dataclass
 class TrackCurve:
     segments: List[Segment] = field(default_factory=list)
+    bumps: List[Bump] = field(default_factory=list)
 
     @property
     def start(self) -> int:
@@ -277,7 +320,7 @@ class TrackCurve:
     def end(self) -> int:
         return self.segments[-1].end
 
-    def values(self, frames: np.ndarray) -> np.ndarray:
+    def base_values(self, frames: np.ndarray) -> np.ndarray:
         frames = np.asarray(frames)
         out = np.empty(frames.shape, dtype=np.float64)
         out.fill(np.nan)
@@ -295,15 +338,176 @@ class TrackCurve:
                 out[mask] = seg.a + (seg.b - seg.a) * Q(np.clip(s, 0.0, 1.0))
         return out
 
+    def _bumps_overlapping(self, frames: np.ndarray) -> List["Bump"]:
+        if not self.bumps or len(frames) == 0:
+            return []
+        fmin, fmax = int(frames.min()), int(frames.max())
+        return [b for b in self.bumps if b.end > fmin and b.start <= fmax]
+
+    def values(self, frames: np.ndarray) -> np.ndarray:
+        """Composite gain: base segments plus local bump corrections."""
+        frames = np.asarray(frames)
+        out = self.base_values(frames)
+        for b in self._bumps_overlapping(frames):
+            out = out + b.values(frames)
+        return out
+
     def value_at(self, frame: int) -> float:
         return float(self.values(np.array([frame]))[0])
 
-    def velocity_after(self, frame: int) -> float:
-        """Direction/speed of the segment containing `frame` (0 for holds)."""
+    def derivatives(self, frames: np.ndarray, fs: float):
+        """Analytic (g, g1, g2, g3) of the composite curve at integer frames: gain, gain/s,
+        gain/s^2, gain/s^3 (audit B12: real derivatives, not segment directions)."""
+        frames = np.asarray(frames)
+        g = np.empty(frames.shape, dtype=np.float64)
+        v = np.zeros(frames.shape, dtype=np.float64)
+        a = np.zeros(frames.shape, dtype=np.float64)
+        j = np.zeros(frames.shape, dtype=np.float64)
+        starts = np.array([sg.start for sg in self.segments])
+        idx = np.clip(np.searchsorted(starts, frames, side="right") - 1, 0, len(self.segments) - 1)
+        for k, seg in enumerate(self.segments):
+            mask = idx == k
+            if not mask.any():
+                continue
+            if seg.kind == "HOLD":
+                g[mask] = seg.a
+                continue
+            T = seg.frames / float(fs)
+            s = np.clip((frames[mask] - seg.start) / float(seg.frames), 0.0, 1.0)
+            d = seg.b - seg.a
+            g[mask] = seg.a + d * Q(s)
+            v[mask] = d * Qp(s) / T
+            a[mask] = d * Qpp(s) / (T * T)
+            j[mask] = d * Qppp(s) / (T ** 3)
+        for b in self._bumps_overlapping(frames):
+            d0, d1, d2, d3 = b.derivatives(frames, fs)
+            g, v, a, j = g + d0, v + d1, a + d2, j + d3
+        return g, v, a, j
+
+    def state_at(self, frame: int, fs: float):
+        """(gain, velocity, acceleration) at an integer frame."""
+        g, v, a, _ = self.derivatives(np.array([frame]), fs)
+        return float(g[0]), float(v[0]), float(a[0])
+
+    def direction_after(self, frame: int) -> int:
+        """Direction (+1/-1/0) of the *base* segment containing `frame` (not a velocity)."""
         for seg in self.segments:
             if seg.start <= frame < seg.end:
-                return float(seg.direction)
-        return 0.0
+                return int(seg.direction)
+        return 0
+
+    def add_bump(self, bump: "Bump") -> "TrackCurve":
+        return TrackCurve(self.segments, self.bumps + [bump])
+
+    def base_boundaries(self) -> List[int]:
+        return [self.segments[0].start] + [sg.end for sg in self.segments]
+
+    def check_composite(self, fs: float, lim: MotionLimits, start: Optional[int] = None,
+                        end: Optional[int] = None, sample_hz: float = 100.0,
+                        cap_intervals: Optional[List[Tuple[int, int, float]]] = None,
+                        max_extension_seconds: float = 40.0) -> List[str]:
+        """Sampled hard checks of the composite curve on [start, end) extended to the enclosing
+        base-segment boundaries: bounds, velocity / acceleration / jerk / relative dB rate, and
+        the motion-episode rules (minimum amplitude, mean velocity, slow zones) applied to the
+        *actual* monotone episodes delimited by sign changes of the composite velocity."""
+        v: List[str] = []
+        if not self.segments:
+            return ["no_segments"]
+        c0, c1 = self.start, self.end
+        if start is None:
+            start = c0
+        if end is None:
+            end = c1
+        bounds = self.base_boundaries()
+        # span = nearest base boundaries around [start, end) that are NOT straddled by a bump (the
+        # composite velocity is exactly zero there), searched within a bounded distance (audit-2
+        # runtime fix: no unbounded chain through earlier committed bumps).  If no such boundary
+        # exists within the bound, the edge is partial and its cut episode is not judged here.
+        ext = int(round(max_extension_seconds * fs))
+        lo_cands = [b for b in bounds if start - ext <= b <= start and not any(bp.start < b < bp.end for bp in self.bumps)]
+        hi_cands = [b for b in bounds if end <= b <= end + ext and not any(bp.start < b < bp.end for bp in self.bumps)]
+        if c0 >= start - ext:
+            lo_cands.append(c0)
+        if c1 <= end + ext:
+            hi_cands.append(c1)
+        partial_lo = len(lo_cands) == 0
+        partial_hi = len(hi_cands) == 0
+        lo = max(lo_cands) if lo_cands else max(c0, start - ext)
+        hi = min(hi_cands) if hi_cands else min(c1, end + ext)
+        partial_edges = (partial_lo, partial_hi)
+        step = max(1, int(round(fs / sample_hz)))
+        frames = np.arange(lo, hi, step, dtype=np.int64)
+        if len(frames) < 3:
+            return v
+        g, vel, acc, jerk = self.derivatives(frames, fs)
+        m = 1.0 + lim.rel_margin
+        tol = lim.bound_tol
+        # The derivatives of a bump peak exactly at its endpoints (s = 0 / s = 1: |g'''| = 384|a|/h^3).
+        # A uniform sample grid only sees those spikes when its phase happens to align, so the local
+        # check of the realizer ([t0, t1) extended to base boundaries) and this final check (the whole
+        # curve) could disagree and an illegal composite could be accepted.  The pointwise limits are
+        # therefore evaluated on the sample grid PLUS the bump endpoints; the motion-episode analysis
+        # below stays on the uniform grid, whose constant spacing its durations assume.
+        pf, pg, pv, pa, pj = frames, g, vel, acc, jerk
+        if self.bumps:
+            ext = np.array(sorted({int(f) for b in self.bumps for f in (b.start, b.end - 1)}), dtype=np.int64)
+            ext = np.setdiff1d(ext[(ext >= lo) & (ext < hi)], frames)
+            if ext.size:
+                eg, ev, ea, ej = self.derivatives(ext, fs)
+                pf = np.concatenate([frames, ext])
+                pg, pv = np.concatenate([g, eg]), np.concatenate([vel, ev])
+                pa, pj = np.concatenate([acc, ea]), np.concatenate([jerk, ej])
+        if not np.all(np.isfinite(pg)) or pg.max() > 1.0 + tol or pg.min() < -tol:
+            v.append(f"composite_gain_out_of_bounds:[{pg.min():.4g},{pg.max():.4g}]")
+        if np.max(np.abs(pv)) > lim.velocity_max * m:
+            v.append(f"composite_velocity_max_exceeded:{np.max(np.abs(pv)):.4g}")
+        if np.max(np.abs(pa)) > lim.acceleration_max * m:
+            v.append(f"composite_acceleration_max_exceeded:{np.max(np.abs(pa)):.4g}")
+        if np.max(np.abs(pj)) > lim.jerk_max * m:
+            v.append(f"composite_jerk_max_exceeded:{np.max(np.abs(pj)):.4g}")
+        dbr = (20.0 / LN10) * np.abs(pv) / (np.clip(pg, 0.0, None) + lim.gain_log_epsilon)
+        if np.max(dbr) > lim.regularized_db_rate_max * m:
+            v.append(f"composite_db_rate_exceeded:{np.max(dbr):.4g}")
+        if cap_intervals:
+            for (a0, a1, cap) in cap_intervals:
+                mk = (pf >= a0) & (pf < a1)
+                if mk.any() and pg[mk].max() > cap + tol:
+                    v.append(f"composite_cap_exceeded:{a0}:{pg[mk].max():.4g}>{cap}")
+        sign = np.sign(vel)
+        sign[np.abs(vel) <= 1e-9] = 0
+        dt = step / float(fs)
+        k = 0
+        n = len(frames)
+        while k < n:
+            if sign[k] == 0:
+                k += 1
+                continue
+            k2 = k
+            while k2 + 1 < n and sign[k2 + 1] == sign[k]:
+                k2 += 1
+            ks, ke = max(0, k - 1), min(n - 1, k2 + 1)
+            touches_edge = (k == 0 and partial_edges[0]) or (k2 == n - 1 and partial_edges[1])
+            amp = abs(float(g[ke] - g[ks]))
+            T = (ke - ks) * dt
+            if T > 0 and not touches_edge:
+                if amp < lim.minimum_move_amplitude / m:
+                    v.append(f"episode_amplitude_below_min@{int(frames[ks])}:{amp:.4g}")
+                if amp / T < lim.mean_velocity_min / m:
+                    v.append(f"episode_mean_velocity_below_min@{int(frames[ks])}:{amp / T:.4g}")
+                sp = np.abs(vel[ks:ke + 1])
+                if sp.max() <= lim.velocity_min_bulk:
+                    v.append(f"episode_peak_velocity_not_above_vmin@{int(frames[ks])}")
+                slow = sp < lim.velocity_min_bulk
+                if slow.mean() > lim.slow_fraction_max * m + 1e-9:
+                    v.append(f"episode_slow_fraction_exceeded@{int(frames[ks])}:{slow.mean():.3f}")
+                run = 0
+                for z in slow:
+                    run = run + 1 if z else 0
+                    if run * dt > lim.ramp_component_max_seconds * m:
+                        v.append(f"episode_ramp_component_exceeded@{int(frames[ks])}")
+                        break
+            k = k2 + 1
+        return v
 
     def moves(self) -> List[Segment]:
         return [s for s in self.segments if s.kind == "Q5"]
@@ -327,14 +531,25 @@ class TrackCurve:
         return v
 
     def to_list(self) -> List[dict]:
-        return [s.to_dict() for s in self.segments]
+        out = [s.to_dict() for s in self.segments]
+        if self.bumps:
+            out.append({"type": "BUMPS", "bumps": [b.to_dict() for b in self.bumps]})
+        return out
 
     @classmethod
     def from_list(cls, lst: List[dict]) -> "TrackCurve":
-        return cls([Segment.from_dict(d) for d in lst])
+        segs = [Segment.from_dict(d) for d in lst if d.get("type") != "BUMPS"]
+        bumps = [Bump.from_dict(b) for d in lst if d.get("type") == "BUMPS" for b in d["bumps"]]
+        return cls(segs, bumps)
 
     def motion_energy(self, fs: float, lim: MotionLimits) -> float:
-        """Sum over segments of frames * mean[(g'/Vmax)^2 + (g''/Amax)^2]  (for E_motion)."""
+        """Sum over segments of frames * mean[(g1/Vmax)^2 + (g2/Amax)^2]  (for E_motion).
+        With bumps the composite is sampled; otherwise the analytic Q5 integrals are used."""
+        if self.bumps:
+            step = max(1, int(round(fs / 50.0)))
+            fr = np.arange(self.start, self.end, step, dtype=np.int64)
+            _g, vel, acc, _j = self.derivatives(fr, fs)
+            return float(((vel / lim.velocity_max) ** 2 + (acc / lim.acceleration_max) ** 2).mean() * (self.end - self.start))
         tot = 0.0
         for seg in self.segments:
             if seg.kind != "Q5":

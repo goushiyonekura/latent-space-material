@@ -5,3 +5,6 @@ __pycache__/
 inputs/
 dev/
 output/*/result.wav
+output_explore/*/result.wav
+output_explore/*.log
+latent_space_code_002.zip

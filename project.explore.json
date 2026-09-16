@@ -17,35 +17,23 @@
     "cycles": 2,
     "timing_policy": "adaptive",
     "intro_seconds": 12,
-    "open_seconds": 20,
+    "open_seconds": 320,
     "contract_seconds": 30,
     "goal_hold_seconds": 5,
-    "reopen_seconds": 30
-  },
-  "analysis": {
-    "window_frames": 2048,
-    "hop_seconds": 0.1,
-    "spectral_bands": 8
+    "reopen_seconds": 30,
+    "final_reopen": true
   },
   "search": {
     "candidate_bank_target": 24,
     "max_total_candidates_per_cycle": 128,
-    "max_search_rounds": 6,
-    "normalized_mode_tolerance": 0.1,
-    "minimum_improvement": 0.0001,
-    "patience_rounds": 2,
     "targets_per_round": 4
   },
   "history": {
     "enabled": true,
     "update_rate": 0.1,
     "recent_event_capacity": 16,
-    "parent_capacity": 8
-  },
-  "render": {
-    "format": "WAV_FLOAT32",
-    "processing_precision": "float64",
-    "block_frames": 8192
+    "parent_capacity": 8,
+    "time_constant_seconds": 60.0
   },
   "calibration_status": "UNVERIFIED",
   "mode_defaults": {

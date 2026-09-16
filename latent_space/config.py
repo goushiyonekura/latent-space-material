@@ -34,6 +34,9 @@ DEFAULTS: Dict[str, Any] = {
         "slow_fraction_max": 0.40,
         "ramp_component_max_seconds": 3.0,
         "nonzero_scored_holds": False,
+        # audit E2: an explicit alternative profile scales the same curve family in time by k:
+        # V*k, A*k^2, J*k^3, L*k, minimum velocities *k, ramp component /k (UNVERIFIED perceptually)
+        "profile": "baseline",            # 'baseline' | 'responsive_x2_UNVERIFIED'
     },
     "form": {
         "cycles": 2,
@@ -60,6 +63,7 @@ DEFAULTS: Dict[str, Any] = {
         "silence_energy": 1e-10,
         "feature_std_floor": 0.02,
         "feature_epsilon": 1e-12,
+        "model_step_seconds": 0.1,        # audit B6/C6: model-internal time step, separate from the hop
     },
     "search": {
         "candidate_bank_target": 16,
@@ -88,6 +92,8 @@ DEFAULTS: Dict[str, Any] = {
         "selection_temperature_base": 0.05,
         "selection_temperature_open": 0.45,
         "mode_error_scale": {"diffusion": 1.0, "vae": 1.0, "transformer": 1.0, "gan": 1.0},
+        "w_neff": 0.25, "n_eff_target": 2.0,        # audit E3 (soft, OPEN-like rows only)
+        "w_energy": 0.25, "energy_min_ratio": 0.05,
     },
     "mode_defaults": {
         "diffusion_particles": 4,
@@ -97,18 +103,24 @@ DEFAULTS: Dict[str, Any] = {
                        "kappa_E": 0.25, "kappa_M": 0.5, "anchor_nongoal_gain": 0.4,
                        "anchor_goal_gain": 0.1, "time_correlation": 0.8,
                        "correlation_significance": 0.2, "similarity_sign_threshold": 0.5, "max_triples": 10,
-                       "init_spread": 0.5, "realized_pull": 0.5, "search_matrix_scale": 1.0, "hint_pairs": 3},
+                       "init_spread": 0.5, "realized_pull": 0.5, "search_matrix_scale": 1.0, "hint_pairs": 3,
+                       # audit-2: window-local field exploration before freezing (realized_pull is ignored)
+                       "window_continuation_seconds": 2.5, "window_internal_steps_max": 8,
+                       "window_step_budget_per_unit": 4096, "relation_lag_seconds": 1.0},
         "vae_latent_dim": 2,
         "vae": {"mu_H_init": 0.5, "sigma_H_init": 0.04, "K_F": 0.1, "ridge_epsilon": 1e-6,
                 "cov_floor": 1e-4, "probe_goal_gain": 0.1, "probe_in_gain": 0.7,
-                "probe_out_gain": 0.15, "time_correlation": 0.9},
+                "probe_out_gain": 0.15, "time_correlation": 0.9,
+                "latent_correlation_seconds": 0.949},   # audit B6: correlation time in seconds (= 0.9 per 0.1 s)
         "transformer_heads": ["similarity", "contrast", "memory"],
         "transformer": {"sigma_F": 1.0, "tau_H_seconds": 180.0, "alpha_s": 0.25, "alpha_c": 0.25,
                          "alpha_m": 0.25, "alpha_G": 1.0, "cov_diag_floor": 1e-4,
                          "probe_foreground_gain": 0.7, "probe_background_gain": 0.15,
                          "bias_scale": 0.5, "noise_scale": 0.5, "ar_stride": 1, "time_correlation": 0.9,
                          "excursion_radius": 0.35, "feedback_rate": 0.5, "feedback_bound": 3.0,
-                         "step_seconds_reference": 0.1, "tendency_gain": 0},
+                         "step_seconds_reference": 0.1, "tendency_gain": 0,
+                         "tau_noise_seconds": 0.949,    # audit D3.3: AR correlation time in seconds
+                         "memory_digest_slots": 0},      # 0 = automatic (one long-term digest slot per track)
         "gan_reference_target": 8,
         "gan_components": 2,
         "gan_adversarial_rounds_max": 4,
@@ -117,10 +129,28 @@ DEFAULTS: Dict[str, Any] = {
                 "sigma_min": 0.01, "sigma_max": 1.0, "basis_rank": 3, "samples_per_round": 4,
                 "inner_steps_D": 40, "inner_steps_G": 10, "fresh_parents": 2, "generator_step_clip": 0.05,
                 "generator_gradient_clip": 10.0, "hint_min_correlation": 0.3, "max_hints": 4,
-                "importance_ess_min_fraction": 0.5},
+                "importance_ess_min_fraction": 0.5,
+                # audit-2: per-commit adversarial update unit (observe_committed)
+                "inner_steps_D_per_commit": 8, "inner_steps_G_per_commit": 4, "generator_batch_max": 4,
+                "baseline_ema_rate": 0.2, "reference_continuity_seconds": 2.0, "min_block_free_rows": 3},
     },
     "history": {"enabled": True, "update_rate": 0.10, "recent_event_capacity": 16,
-                "parent_capacity": 8, "cov_regularization": 1e-6},
+                "parent_capacity": 8, "cov_regularization": 1e-6,
+                "time_constant_seconds": 60.0},   # audit C7: rho(dt) = 1 - exp(-dt / tau_H)
+    # audit C5/C6: fixed-reference realization in short commit steps inside the long form
+    "realization": {
+        "commit_seconds": 1.5,            # length committed to the history per step
+        "lookahead_seconds": 10.0,        # window improved against the frozen reference
+        "n_reference_proposals": 2,       # proposals per window; one is frozen (chosen by warm-start J)
+        "max_refinement_sweeps": 3,       # coordinate-search sweeps over bump amplitudes
+        "initial_step": 0.06,             # bump amplitude step (gain units)
+        "min_step": 0.01,
+        "improvement_epsilon": 1e-6,
+        "max_evaluations_per_step": 80,   # acoustic evaluations (window compositions) per step
+        "w_relation": 0.25,               # weight of J_rel (mode-supplied relation terms)
+        "w_smooth": 0.01,                 # weight of the sampled motion energy on the window
+        "bump_short_fraction": 0.5,       # second bump covers this fraction of the lookahead
+    },
     "render": {"format": "WAV_FLOAT32", "processing_precision": "float64", "block_frames": 8192,
                "csv_step_seconds": 0.05},
     "numerics": {"gain_bound_tolerance": 1e-9, "motion_relative_margin": 1e-6,
@@ -128,6 +158,27 @@ DEFAULTS: Dict[str, Any] = {
     "calibration_status": "UNVERIFIED",
     "perceptual_status": "UNVERIFIED",
 }
+
+
+PROFILE_SCALE = {"baseline": 1.0, "responsive_x2_UNVERIFIED": 2.0}
+
+
+def apply_motion_profile(motion: Dict[str, Any]) -> Dict[str, Any]:
+    """Scale the motion limits for the named profile (time compression by k, audit E2)."""
+    k = PROFILE_SCALE.get(str(motion.get("profile", "baseline")))
+    if k is None:
+        raise ValueError(f"unknown motion.profile {motion.get('profile')!r}; known: {sorted(PROFILE_SCALE)}")
+    m = dict(motion)
+    if k != 1.0:
+        m["velocity_max"] = float(motion["velocity_max"]) * k
+        m["acceleration_max"] = float(motion["acceleration_max"]) * k * k
+        m["jerk_max"] = float(motion["jerk_max"]) * k ** 3
+        m["regularized_db_rate_max"] = float(motion["regularized_db_rate_max"]) * k
+        m["velocity_min_bulk"] = float(motion["velocity_min_bulk"]) * k
+        m["mean_velocity_min"] = float(motion["mean_velocity_min"]) * k
+        m["ramp_component_max_seconds"] = float(motion["ramp_component_max_seconds"]) / k
+    m["profile_scale_k"] = k
+    return m
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -200,6 +251,7 @@ def load_config(path: str, mode_override: str | None = None) -> Dict[str, Any]:
     cfg["config_aliases_applied"] = applied
     if mode_override:
         cfg["mode"] = mode_override
+    cfg["motion"] = apply_motion_profile(cfg["motion"])
     validate_config(cfg)
     return cfg
 
@@ -243,6 +295,11 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ValueError("search.tolerance_applies_to must be 'mode_error' or 'target_fit'")
     if s["final_targets"] not in ("best_round", "last_round"):
         raise ValueError("search.final_targets must be 'best_round' or 'last_round'")
+    r = cfg["realization"]
+    if float(r["commit_seconds"]) <= 0 or float(r["lookahead_seconds"]) < float(r["commit_seconds"]):
+        raise ValueError("realization.lookahead_seconds must be >= commit_seconds > 0")
+    if float(cfg["history"]["time_constant_seconds"]) <= 0:
+        raise ValueError("history.time_constant_seconds must be > 0")
     ge = cfg["form"]["goal_exposure"]
     if ge["policy"] not in ("contract_only", "free"):
         raise ValueError("form.goal_exposure.policy must be 'contract_only' or 'free'")

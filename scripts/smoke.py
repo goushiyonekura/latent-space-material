@@ -116,6 +116,41 @@ def check_A():
     ok("goal_hold_equals_scaled_goal_pcm_exactly", np.array_equal(y[n1:], ref))
     ok("goal_hold_curve_is_exact_constant", np.all(cv0.values(np.arange(n1, total)) == 1.0)
        and np.all(cv1.values(np.arange(n1, total)) == 0.0) and np.all(cv2.values(np.arange(n1, total)) == 0.0))
+    # audit-2 F1: sync derivation (audit B3 example) and local counter relation
+    from latent_space.bank import Bank
+    from latent_space.types import UnitContext
+    from latent_space.curves import Bump
+    t1 = 20 * fs
+    tend = 22 * fs
+    class _A:  # analyzer stand-in: plan derivation needs no acoustics
+        pass
+    u = UnitContext(index=0, start=0, end=tend, goal_arrival=t1, starts_from_silence=True, idx=np.arange(10), centers=np.arange(10),
+                    seconds=np.arange(10) / fs, o=np.ones(10), phase_names=np.array(["OPEN"] * 10), hold_mask=np.zeros(10, bool),
+                    xi_goal=np.zeros((10, 3)), f_mat=None, S=None, chi=None, start_gains=np.zeros(3), fs=fs, M=3, d_xi=3, analyzer=_A(),
+                    phase_frames={"INTRO": (0, 0), "OPEN": (0, 10 * fs), "CONTRACT": (10 * fs, t1), "GOAL_HOLD": (t1, tend)})
+    base_pts = [(0, 0.0, "MOVE"), (10 * fs, 0.5, "MOVE"), (t1, 0.0, "GOAL_HOLD"), (tend, 0.0, "")]
+    n_ok = 0
+    for sd in range(5):
+        bk = Bank(u, lim, DEFAULTS, np.random.default_rng(sd), None, None)
+        out = bk.derived_track_plan(2, base_pts, "sync")
+        n_ok += int(out is not None and C.curve_from_waypoints(out).check(fs, lim) == [])
+    ok("sync derivation of the audit B3 example is legal (5 seeds)", n_ok == 5, f"{n_ok}/5")
+    t1b, tendb = 40 * fs, 42 * fs
+    u.goal_arrival, u.end = t1b, tendb
+    u.phase_frames = {"INTRO": (0, 0), "OPEN": (0, 20 * fs), "CONTRACT": (20 * fs, t1b), "GOAL_HOLD": (t1b, tendb)}
+    base2 = [(0, 0.0, "MOVE"), (10 * fs, 0.6, "MOVE"), (18 * fs, 0.2, "MOVE"), (26 * fs, 0.7, "MOVE"), (t1b, 0.0, "GOAL_HOLD"), (tendb, 0.0, "")]
+    n_ok = 0
+    for sd in range(5):
+        bk = Bank(u, lim, DEFAULTS, np.random.default_rng(sd), None, None)
+        out = bk.derived_track_plan(2, base2, "counter")
+        n_ok += int(out is not None and C.curve_from_waypoints(out).check(fs, lim) == [])
+    ok("counter relation realized on an interior interval (5 seeds)", n_ok == 5, f"{n_ok}/5")
+    # composite curve: bump derivatives and checker
+    cvq = TrackCurve([Segment("Q5", 0, 10 * fs, 0.0, 0.5, "MOVE")])
+    ok("state_at returns the real velocity at the Q5 midpoint", abs(cvq.state_at(5 * fs, fs)[1] - 0.09375) < 1e-9)
+    ok("composite checker rejects a too-strong bump", cvq.add_bump(Bump(2 * fs, 7 * fs, 0.5)).check_composite(fs, lim) != [])
+    ok("composite checker rejects a sub-minimum reversal", TrackCurve([Segment("HOLD", 0, 10 * fs, 0.3, 0.3, "SCORED_HOLD")])
+       .add_bump(Bump(2 * fs, 7 * fs, -0.01)).check_composite(fs, lim) != [])
     REPORT["A"] = {"T_lo_seconds_0_to_0.8": T_lo, "T_hi": T_hi, "db_rate_bound": bound}
 
 
@@ -191,20 +226,32 @@ def check_B(modes, fx, alt, n2, n7):
                          for sg in lst if sg["type"] == "Q5"])
         ok(f"{mode}: material moves mix short and long durations", len(durs) > 0 and durs.min() < 6.0
            and float(np.mean(durs < 8.0)) >= 0.2, f"n={len(durs)} min={durs.min():.1f}s median={np.median(durs):.1f}s frac<8s={np.mean(durs < 8.0):.2f}")
-        ok(f"{mode}: chosen candidate is within the acceptance set of the final targets",
-           all(u["selection"]["in_acceptance_set"] for u in tr["units"]))
+        # audit-2 F2/F3: fixed-reference improvement (hash unchanged), commits, non-zero-velocity joints
+        steps = [st for u in tr["units"] for st in u["steps"]]
+        ok(f"{mode}: references frozen during realization (hash recorded, never updated)",
+           all(st["reference_hash"] and st["reference_updated_during_realization"] is False for st in steps))
+        ok(f"{mode}: joint objective never worsens and improves in some steps against frozen references",
+           all(st["final_joint_objective"] <= st["initial_joint_objective"] + 1e-12 for st in steps)
+           and sum(1 for st in steps if st["accepted_changes"] > 0) >= max(1, len(steps) // 4),
+           f"{sum(1 for st in steps if st['accepted_changes'] > 0)}/{len(steps)} steps improved")
+        ok(f"{mode}: commits update the history each step",
+           all(u["commits"] == u["history_updates"] and u["commits"] >= 3 for u in tr["units"]), [u["commits"] for u in tr["units"]])
+        ok(f"{mode}: at least one internal joint crossed with non-zero velocity",
+           tr["hard_checks"].get("nonzero_velocity_joints", 0) >= 1, tr["hard_checks"].get("nonzero_velocity_joints"))
+        rep["realization"] = [u["realization_summary"] for u in tr["units"]]
         ev = tr["history"]["events"]
         ok(f"{mode}: history events ordered by time", all(ev[i]["end_frame"] <= ev[i + 1]["end_frame"] for i in range(len(ev) - 1)))
         rc = tr["hard_checks"]["rendered_composition_check"]
-        ok(f"{mode}: proxy composition matches rendered PCM (same windows)", all(c["proxy_vs_rendered_mean_dist2"] < 1e-3 for c in rc),
+        ok(f"{mode}: proxy composition matches rendered PCM (spread windows)", all(c["proxy_vs_rendered_mean_dist2"] < 1e-3 for c in rc),
            [round(c["proxy_vs_rendered_mean_dist2"], 6) for c in rc])
         rep["rendered_composition_check"] = rc
         if mode == "gan":
             dp = tr["mode_trace"]["gan"]["discriminator_parameters"]
             ok("gan: discriminator input standardisation frozen after the first unit",
                all(d.get("feature_scale_source") == "frozen_from_first_unit" for d in dp[1:]))
-            upd = [r["mode_update"] for u in tr["units"] for r in u["rounds"] if r.get("mode_update")]
-            ok("gan: importance-corrected generator steps recorded", all("importance_ess" in m for m in upd))
+            upd = [st["mode_observe"] for u in tr["units"] for st in u["steps"] if isinstance(st.get("mode_observe"), dict)]
+            ok("gan: adversarial D/G updates recorded at commit observations",
+               any(("updates_D" in m or "D_loss_after" in m) for m in upd), f"{len(upd)} observations")
         # --- controlled comparisons on unit 1: same current audio, same phase, same rng
         base_job, _ = job_for(fx, mode, "cmp")
         base_job.load_inputs()
@@ -283,7 +330,7 @@ def check_C(modes, fx, hard):
         y1, _ = read_wav(os.path.join(out, "result.wav"))
         ok(f"{mode}: re-render from trace curves is bit-exact", np.array_equal(y1, y2))
         kinds = {s["type"] for lst in tr["curve_segments_per_track"] for s in lst}
-        ok(f"{mode}: only Q5/HOLD segments", kinds <= {"Q5", "HOLD"}, kinds)
+        ok(f"{mode}: only Q5/HOLD segments plus local bumps", kinds <= {"Q5", "HOLD", "BUMPS"}, kinds)
         REPORT["C"][mode] = {"run_status": tr["run_status"], "warnings": tr.get("warnings", [])}
     # configuration aliases are applied and unknown keys are rejected (audit §7)
     alias_cfg = os.path.join(DEV, "alias.json")

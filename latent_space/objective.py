@@ -42,22 +42,89 @@ class Objective:
         self.temp_open = float(o["selection_temperature_open"])
         self.mode_scale = dict(o["mode_error_scale"])
         self.tolerance = float(cfg["search"]["normalized_mode_tolerance"])
+        # audit E3: soft terms against degenerate OPEN (single foreground / low mixture energy)
+        self.w_neff = float(o.get("w_neff", 0.25))
+        self.n_eff_target = float(o.get("n_eff_target", 2.0))
+        self.w_energy = float(o.get("w_energy", 0.25))
+        self.energy_min_ratio = float(o.get("energy_min_ratio", 0.05))
+        self.rel = dict(cfg.get("realization", {}))
 
     # ------------------------------------------------------------------ E_form
+    def form_penalty_rows(self, unit, xi: np.ndarray, parts: Dict[str, np.ndarray], rows: np.ndarray) -> np.ndarray:
+        """Per-row form penalty on the given rows (xi/parts indexed like rows)."""
+        rows = np.asarray(rows)
+        o = unit.o[rows]
+        phase = unit.phase_names[rows]
+        d2_goal = unit.analyzer.dist2(xi, unit.xi_goal[rows])
+        contract = phase == "CONTRACT"
+        hold = unit.hold_mask[rows]
+        opening = (~contract) & (~hold)
+        c = parts["c"]
+        nongoal = c[:, 1:].sum(axis=1)
+        pen = np.zeros(len(rows))
+        pen[contract] = (1.0 - o[contract]) ** 2 * d2_goal[contract]
+        short = np.maximum(self.open_target - nongoal[opening], 0.0)
+        pen[opening] = (o[opening] ** 2) * short ** 2
+        # audit E3: effective number of participating materials and mixture energy (OPEN-like rows)
+        if self.w_neff > 0 or self.w_energy > 0:
+            p = c[:, 1:] / (nongoal[:, None] + 1e-12)
+            n_eff = np.where(nongoal > 1e-9, 1.0 / (np.sum(p * p, axis=1) + 1e-12), 0.0)
+            neff_pen = np.maximum(self.n_eff_target - n_eff, 0.0) ** 2
+            E = parts["E"] / max(1e-300, unit.analyzer.E_ref)
+            en_pen = np.maximum(self.energy_min_ratio - E, 0.0) ** 2 / max(1e-12, self.energy_min_ratio ** 2)
+            pen[opening] += (o[opening] ** 2) * (self.w_neff * neff_pen[opening] + self.w_energy * en_pen[opening])
+        return pen
+
     def e_form(self, unit, xi: np.ndarray, parts: Dict[str, np.ndarray]) -> float:
         fm = unit.free_mask
         if not fm.any():
             return 0.0
-        o = unit.o
-        d2_goal = unit.dist2(xi, unit.xi_goal)
-        contract = unit.phase_names == "CONTRACT"
-        opening = (~contract) & fm
-        nongoal = parts["c"][:, 1:].sum(axis=1)
-        pen = np.zeros(unit.J)
-        pen[contract] = (1.0 - o[contract]) ** 2 * d2_goal[contract]
-        short = np.maximum(self.open_target - nongoal[opening], 0.0)
-        pen[opening] = (o[opening] ** 2) * short ** 2
+        pen = self.form_penalty_rows(unit, xi, parts, np.arange(unit.J))
         return float(pen[fm].mean())
+
+    def e_form_rows(self, unit, xi_rows: np.ndarray, parts_rows: Dict[str, np.ndarray], rows: np.ndarray) -> float:
+        fm = unit.free_mask[rows]
+        if not fm.any():
+            return 0.0
+        pen = self.form_penalty_rows(unit, xi_rows, parts_rows, rows)
+        return float(pen[fm].mean())
+
+    def n_eff(self, parts: Dict[str, np.ndarray]) -> np.ndarray:
+        c = parts["c"]
+        nongoal = c[:, 1:].sum(axis=1)
+        p = c[:, 1:] / (nongoal[:, None] + 1e-12)
+        return np.where(nongoal > 1e-9, 1.0 / (np.sum(p * p, axis=1) + 1e-12), 0.0)
+
+    # ------------------------------------------------------------------ soft relation term (audit C3)
+    def j_relation(self, unit, parts_rows: Dict[str, np.ndarray], rows: np.ndarray, terms: Optional[Dict]) -> float:
+        """J_rel = < sum_{i<j} omega_ij (D_l c_i - s_ij D_l c_j - dstar_ij)^2 > over interior rows,
+        D_l = change over lag_seconds; terms supplied by the mode (None -> 0)."""
+        if not terms:
+            return 0.0
+        rows = np.asarray(rows)
+        hop = unit.analyzer.hop / float(unit.fs)
+        lag = max(1, int(round(float(terms.get("lag_seconds", 1.0)) / hop)))
+        c = parts_rows["c"]
+        if len(c) <= lag + 1:
+            return 0.0
+        dc = c[lag:] - c[:-lag]
+        fm = unit.free_mask[rows][lag:]
+        interior = fm.copy()
+        if len(interior) > 2 * lag:
+            interior[:lag] = False
+            interior[-lag:] = False
+        if not interior.any():
+            return 0.0
+        omega = np.asarray(terms["omega"], dtype=np.float64)
+        sgn = np.asarray(terms["s"], dtype=np.float64)
+        dstar = np.asarray(terms.get("dstar", np.zeros_like(omega)), dtype=np.float64)
+        iu = unit.analyzer.iu
+        w = omega[iu]
+        if w.sum() <= 0:
+            return 0.0
+        resid = dc[:, iu[0]] - sgn[iu][None, :] * dc[:, iu[1]] - dstar[iu][None, :]
+        val = (w[None, :] * resid ** 2).sum(axis=1) / w.sum()
+        return float(val[interior].mean())
 
     # ------------------------------------------------------------------ comparison grid
     def phase_blocks(self, unit, xi: np.ndarray) -> Dict[str, np.ndarray]:

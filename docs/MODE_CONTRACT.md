@@ -1,91 +1,80 @@
-# Mode-controller contract (for parallel implementation of diffusion / transformer / gan)
+# Mode-controller contract (audit-2 revision, 2026-09-16)
 
-Package: `latent_space/` (numpy only, Python 3.9, **no other dependencies**). The pipeline
-already runs end to end with the reference mode `latent_space/modes/vae.py`. Read these files
-before writing anything:
+This replaces the earlier contract.  The old rules "do not edit shared files" and "the mode
+updates its targets toward realized candidates during a search" are withdrawn.  Shared files may
+be edited when a shared change is genuinely needed (coordinate through the engine owner); the
+reference a trajectory is scored against must never move while it is being scored.
 
-- `latent_space/modes/base.py`   — the `ModeController` interface you must implement
-- `latent_space/modes/vae.py`    — complete reference implementation (copy its structure)
-- `latent_space/types.py`        — `UnitContext`, `Target`, `Candidate`, `Realization`
-- `latent_space/analysis.py`     — composition state ξ, `dist2`, `split`, `weight_vector`, probes
-- `latent_space/history.py`      — `History` (h_c, M_H, corr(), events, change_direction, parents, mode_state)
-- `latent_space/objective.py`    — `Objective` (e_form, e_hist, phase_blocks / blocks_to_unit, temperatures)
-- `latent_space/engine.py`       — how the engine calls the mode (`run_unit`)
-- `latent_space/bank.py`         — how candidates are generated; the `hints` format
+Package: `latent_space/` (numpy only, Python 3.9).  Read first: `modes/base.py` (interface),
+`engine.py` (`run_unit`: warm start, commit steps, `_window_eval`, `_refine_window`),
+`types.py`, `analysis.py`, `history.py` (`observe_committed`, `rho_dt`), `objective.py`
+(`e_form_rows`, `j_relation`), `curves.py` (`TrackCurve.bumps`, `state_at`, `check_composite`).
 
-Run/test with the synthetic fixtures (already generated):
+## What the engine does per planning unit
 
-```bash
-cd /Users/goushiyonekura/Claude/latent-space-material
-python3 -m latent_space generate --config dev/fixture_vae.json --mode <mode> --output dev/out/<mode>
-python3 - <<'EOF'
-import json; t=json.load(open('dev/out/<mode>/state_trace.json'))
-print(t['run_status'], t['hard_checks']['all_passed'], t['warnings']); print(json.dumps(t['mode_trace'], indent=1)[:3000])
-for u in t['units']: print(u['unit'], u['stop_reason'], u['tolerance_met'], u['chosen'], u['history_internal_effect'], u['history_realized_effect'])
-EOF
+1. `mode.begin_unit(unit, history)` — condition on materials F, history H (read
+   `history.mode_state[<key>]`, `h_c`, `M_H`, `corr()`, `events`, `change_direction`,
+   `parents`, `recent_xi`), openness `unit.o`.
+2. `mode.hints(unit, history)` — optional `(i, j, 'sync'|'counter')` hints for the bank
+   (relations are realized locally on interior intervals; stats in `bank.stats()['relations']`).
+3. Warm start: bank candidates; `mode.propose(unit, history, 0, n)` full-unit ideal trajectories;
+   the proposal whose best candidate has the lowest joint J is FROZEN as the unit reference R0
+   (hash recorded); the best candidate against R0 (plus bounded mutations against the same R0) is
+   the warm-start tail.
+4. Commit steps (`realization.commit_seconds`, lookahead `realization.lookahead_seconds`):
+   - `refs = mode.prepare_reference(unit, history, rows, xi_current, n)` — ideal trajectories for
+     the window rows, built from the committed history and the realized current composition
+     `xi_current` (the last committed row).  One of them is chosen by the current tail's joint J
+     and FROZEN (`reference_hash`).  It does not move afterwards.
+   - The tail is improved on the window by additive bump corrections
+     `dg = a * 64 s^3 (1-s)^3` (zero value / velocity / acceleration at both ends) with a
+     finite-difference coordinate search on the joint objective
+     `J = w_mode * window_error/scale + w_form * E_form_rows + w_relation * J_rel + w_smooth * motion`
+     computed from the actual mixed composition; only improvements are accepted; hard checks run
+     on the composite curve (`check_composite`: limits, dB rate, actual motion episodes).
+   - The first commit block is committed: `history.observe_committed(...)` with
+     `rho = 1 - exp(-dt / tau_H)`, completed base motion events appended (time-ordered), then
+     `mode.observe_committed(unit, history, rows_c, xi_c, parts_c, reference, stats)`.
+5. `mode.end_unit(unit, history, chosen, alternatives)` — persist the mode summary into
+   `history.mode_state[<key>]` (JSON-able).  `chosen.candidate` is the final composite trajectory.
+
+`mode.update(...)` is NOT called any more.  Adaptation of the ideal happens only in
+`prepare_reference` (before freezing) and `observe_committed` (after committing).
+
+## Hooks a mode implements
+
+```
+begin_unit(unit, history)
+propose(unit, history, round_index, n_targets) -> [Target]           # full-unit (warm start)
+prepare_reference(unit, history, rows, xi_current, n_proposals) -> [Target]
+     Target.xi_hat has shape (J, d_xi) on the unit grid; only `rows` must be meaningful;
+     GOAL_HOLD rows == unit.xi_goal (use fix_hold_rows).  Default: propose(...).
+window_error(unit, xi_rows, rows, target) -> float                  # default mean d_xi^2 on free rows
+relation_terms(unit) -> {"omega": (M,M), "s": (M,M), "dstar": (M,M), "lag_seconds": float} | None
+observe_committed(unit, history, rows, xi_rows, parts_rows, reference, stats) -> dict
+end_unit(unit, history, chosen, alternatives)
+signature() -> 1-D array (fixed length within a job)                # history-intervention probe
+trace() -> JSON-able dict
 ```
 
-## What the engine does per planning unit (`engine.Job.run_unit`)
+Time scales (audit B6/C6): `analyzer.hop / fs` is the observation hop; `cfg['analysis']
+['model_step_seconds']` is the model step; AR coefficients are `exp(-step / tau)` (helper
+`ar1_rho_for`); the history rate is `history.rho_dt(dt)`.
 
-1. `mode.begin_unit(unit, history)` — condition on current material features `F`, the history
-   `H` (**you must read `history`**: at least `history.mode_state[<your key>]`, and where the spec
-   says so `history.h_c`, `history.M_H`, `history.corr()`, `history.events`,
-   `history.change_direction`, `history.parents`), and openness `unit.o`.
-2. `hints = mode.hints(unit, history)` — optional list of `(track_i, track_j, 'sync'|'counter')`
-   telling the bank to build joint plans (same reversal times, same/opposite directions).
-3. The bank builds ~8–16 legal joint gain trajectories (`Candidate`s), each with realized
-   composition `cand.xi` (J, d_xi) computed from the **actual summed PCM** of the analysis windows.
-4. For `round_index` in range(max_search_rounds):
-   - `targets = mode.propose(unit, history, round_index, n_targets)` → list of `Target`
-     (`xi_hat` shape (J, d_xi); **GOAL_HOLD rows must equal `unit.xi_goal`** — use
-     `fix_hold_rows(unit, xi_hat)` from `base.py`).
-   - For each target, every candidate is scored: `total = w_mode * mode.mode_error(unit, cand, target)/scale
-     + w_form*e_form + w_hist*e_hist + w_motion*e_motion`; the best candidate is mutated a few
-     times (budgeted) and re-scored.  The best `Realization` per target is collected.
-   - `stats = mode.update(unit, history, realizations, round_index)` — **the mode's required
-     internal update from realized compositions** (returns a small JSON-able dict).
-5. One trajectory is selected by softmax over totals; then `mode.end_unit(unit, history, chosen,
-   alternatives)` — write your mode summary into `history.mode_state[<key>]` (JSON-able: lists,
-   floats, dicts — no numpy arrays in what you put in mode_state, convert with `.tolist()`), then
-   the engine updates the common history (h_c, M_H, events, comparison archive).
-6. `mode.signature()` → 1-D numpy vector summarising the ideal distribution / internal parameters
-   (used to verify that a different history changes the internal state: the engine deep-copies
-   the mode, calls `begin_unit` with an **empty** history and compares signatures; so the
-   signature must depend on what you read from `history`).
-7. `mode.trace()` → JSON-able dict (the engine serialises with a numpy-aware encoder; plain
-   numpy arrays are fine here but keep it small: no per-candidate full matrices).
+## Coordinates and helpers
 
-## Coordinates
+`xi = [phi_norm (d_phi = 2 + 8) | c (M) | upper(R) (M(M-1)/2)]`; `analyzer.split`, `dist2`,
+`weight_vector`; `unit.probe(g)`, `unit.composition(gains)`; `unit.f_mat`, `unit.S`, `unit.chi`,
+`unit.o`, `unit.hold_mask`, `unit.free_mask`, `unit.xi_goal`, `unit.phase_names`, `unit.centers`,
+`unit.seconds`, `unit.J`, `unit.M`, `unit.index`, `unit.start_gains`; `objective.phase_blocks` /
+`blocks_to_unit`; `history.recent_xi` (committed rows, short list), `history.events` (committed,
+time-ordered), `history.parents`, `history.mode_state`.
 
-`xi = [phi_norm (d_phi = 2 + 8 bands) | c (M) | upper(R) (M(M-1)/2)]`, `analyzer.split(xi)`
-returns the three blocks; `analyzer.dist2(a, b)` is eq. (22) per row; `analyzer.weight_vector()`
-is the diagonal W with `d^T W d == dist2`. `unit.probe(gain_vector)` → `(xi (J,d), parts)`
-for a constant gain vector across the unit (probes are *analysis material*, not commands).
-`unit.composition(gains (J,M))` for time-varying gains. `unit.f_mat` (J, M, d_phi) are the
-normalized current material features, `unit.S` (J, M, M) their similarity
-`exp(-||f_i-f_j||^2/(2 sigma_F^2))`, `unit.chi` (J, M) the tanh-bounded log-energy change per
-material, `unit.o` openness, `unit.hold_mask`, `unit.free_mask`, `unit.xi_goal` (J,d),
-`unit.phase_names` (J,) in {INTRO, OPEN, CONTRACT, GOAL_HOLD, REOPEN}, `unit.centers` (frames),
-`unit.seconds`, `unit.J`, `unit.M`, `unit.N`, `unit.index`, `unit.start_gains` (M,).
-Goal track is index 0. `objective.phase_blocks(unit, xi)` / `objective.blocks_to_unit(unit, blocks)`
-map a composition trajectory to/from a phase-relative fixed grid (use this to carry past
-compositions — parents, memory — into a new unit of possibly different length).
-`parts['c']` (J,M) contributions, `parts['R']` (J,M,M), `parts['phi']`.
-Config for your mode: `cfg['mode_defaults'][<key>]` plus the scalar keys next to it (see
-`latent_space/config.py` DEFAULTS; add keys there only inside your own sub-dict).
-Common history update rate: `cfg['history']['update_rate']`. RNG: `self.rng` (numpy Generator).
+## Rules
 
-## Rules (from the spec, non-negotiable)
-
-- The mode never produces or edits gains; it produces ideal *acoustic compositions* and scores
-  *realized* compositions (`cand.xi`).  Never use `cand.gains` as the object of the mode error
-  (you may look at gains for auxiliary hints only).
-- No dummies: the mode's defining computation must actually run (see your spec section).
-- Bounded iterations only (use the config maxima).  No file I/O, no threads, no new deps.
-- Do not edit shared files (`engine.py`, `bank.py`, `analysis.py`, `types.py`, `objective.py`,
-  `history.py`, `base.py`, `vae.py`); if you believe a shared change is needed, implement a
-  local workaround inside your module and describe the request in your final report.
-- Keep runtime small: the fixture job must finish in well under 60 s; real jobs have J≈900 per
-  unit, d_xi≈25, M=5.
-- Record in `trace()` the fields the spec lists for your mode plus warnings and per-unit
-  summaries (`self.unit_traces`, `self.warnings`).
+- The mode never produces or edits gains; it defines targets / relations / possibilities and
+  scores realized compositions.  Never use `cand.gains` as the object of an error.
+- No dummies, bounded iterations, no file I/O, no threads, no new dependencies.
+- Record what was inherited and what was re-initialised whenever an internal coordinate system
+  (basis) changes.  Record internal iterations separately from musical time.
+- Keep the fixture job (`dev/fixture_vae.json`) under ~90 s.
