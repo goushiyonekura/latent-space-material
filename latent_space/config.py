@@ -106,12 +106,20 @@ DEFAULTS: Dict[str, Any] = {
                        "init_spread": 0.5, "realized_pull": 0.5, "search_matrix_scale": 1.0, "hint_pairs": 3,
                        # audit-2: window-local field exploration before freezing (realized_pull is ignored)
                        "window_continuation_seconds": 2.5, "window_internal_steps_max": 8,
-                       "window_step_budget_per_unit": 4096, "relation_lag_seconds": 1.0},
+                       "window_step_budget_per_unit": 4096, "relation_lag_seconds": 1.0,
+                       # fragment-vocabulary mode: field SDE integrated in musical time (per model step)
+                       "frag_step": 40.0, "frag_temperature_per_openness": 0.0016, "frag_drift_substeps": 10,
+                       "frag_max_displacement_per_step": 1.5, "frag_anchor_samples": 24, "frag_anchor_offsets": 3,
+                       "frag_anchor_seed": 104729, "frag_energy_probe_samples": 8},
         "vae_latent_dim": 2,
         "vae": {"mu_H_init": 0.5, "sigma_H_init": 0.04, "K_F": 0.1, "ridge_epsilon": 1e-6,
                 "cov_floor": 1e-4, "probe_goal_gain": 0.1, "probe_in_gain": 0.7,
                 "probe_out_gain": 0.15, "time_correlation": 0.9,
-                "latent_correlation_seconds": 0.949},   # audit B6: correlation time in seconds (= 0.9 per 0.1 s)
+                "latent_correlation_seconds": 0.949,    # audit B6: correlation time in seconds (= 0.9 per 0.1 s)
+                # fragment-vocabulary basis (random fragment compositions, seeded) and tanh range control
+                "sigma_H_floor_frag": 0.09, "basis_scale_quantile": 99.0, "basis_scale_target_tanh": 0.95,
+                "basis_fragment_compositions": 300, "basis_fragment_offsets": 5, "basis_min_rows": 1500,
+                "basis_seed_offset": 9176},
         "transformer_heads": ["similarity", "contrast", "memory"],
         "transformer": {"sigma_F": 1.0, "tau_H_seconds": 180.0, "alpha_s": 0.25, "alpha_c": 0.25,
                          "alpha_m": 0.25, "alpha_G": 1.0, "cov_diag_floor": 1e-4,
@@ -120,7 +128,12 @@ DEFAULTS: Dict[str, Any] = {
                          "excursion_radius": 0.35, "feedback_rate": 0.5, "feedback_bound": 3.0,
                          "step_seconds_reference": 0.1, "tendency_gain": 0,
                          "tau_noise_seconds": 0.949,    # audit D3.3: AR correlation time in seconds
-                         "memory_digest_slots": 0},      # 0 = automatic (one long-term digest slot per track)
+                         "memory_digest_slots": 0,       # 0 = automatic (one long-term digest slot per track)
+                         # fragment-vocabulary mode: fragment tokens, exact foregrounding values
+                         "fragment_tokens_per_source": 6, "fragment_value_offsets": 3,
+                         "fragment_step_seconds_reference": 0, "noise_scale_fragment": 0.25,
+                         "excursion_radius_fragment": 1.0, "fragment_bound_growth_steps": 0,
+                         "recurrence_tolerance_seconds": 2.0},
         "gan_reference_target": 8,
         "gan_components": 2,
         "gan_adversarial_rounds_max": 4,
@@ -132,7 +145,9 @@ DEFAULTS: Dict[str, Any] = {
                 "importance_ess_min_fraction": 0.5,
                 # audit-2: per-commit adversarial update unit (observe_committed)
                 "inner_steps_D_per_commit": 8, "inner_steps_G_per_commit": 4, "generator_batch_max": 4,
-                "baseline_ema_rate": 0.2, "reference_continuity_seconds": 2.0, "min_block_free_rows": 3},
+                "baseline_ema_rate": 0.2, "reference_continuity_seconds": 2.0, "min_block_free_rows": 3,
+                # fragment-vocabulary reference distribution (observe_committed statistics use a separate stream)
+                "frag_references": 12, "frag_segment_seconds": 2.0, "frag_offset_rows": 0, "frag_discriminator_samples": 2},
     },
     "history": {"enabled": True, "update_rate": 0.10, "recent_event_capacity": 16,
                 "parent_capacity": 8, "cov_regularization": 1e-6,
@@ -174,6 +189,12 @@ DEFAULTS: Dict[str, Any] = {
         "n_reference_proposals": 2,
         "goal_rise_seconds": 12.0,        # smooth goal rise at the end of CONTRACT (convergence gesture)
         "w_relation": 0.25, "w_smooth": 0.0,
+        # fragment-vocabulary revision (2026-09-16): candidates scored by clip-averaged fragment
+        # features, multi-track jumps via a beam search on exact mixtures, references built on fragments
+        "fragment_vocabulary": False,
+        "clip_feature_seconds": 2.0,      # fragment features = mean over this many seconds after the position
+        "beam_width": 3,
+        "candidate_rows": 8,              # rows of the window used while scoring jump combinations
     },
     "numerics": {"gain_bound_tolerance": 1e-9, "motion_relative_margin": 1e-6,
                  "db_rate_subintervals": 128},

@@ -19,7 +19,7 @@ Composition state (eq. 17):  xi = [phi_norm (2+bands) | c (M) | upper(R) (M(M-1)
 """
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -199,6 +199,55 @@ class Analyzer:
             self.solo_pos.append(pos)
             self.solo_f.append((raw - self.norm_mean) / self.norm_std)
             self.solo_E.append(np.concatenate(Es))
+
+    def build_fragment_bank(self, clip_seconds: float) -> None:
+        """Fragment vocabulary: for every solo-bank position, the features averaged over the
+        clip_seconds that follow it (what actually sounds after a jump), circular over the source."""
+        n = max(1, int(round(clip_seconds * self.fs / self.solo_hop)))
+        self.frag_rows = n
+        self.frag_f: List[np.ndarray] = []
+        self.frag_E: List[np.ndarray] = []
+        for i in range(self.M):
+            f = self.solo_f[i]
+            E = self.solo_E[i]
+            P = len(f)
+            idx = (np.arange(P)[:, None] + np.arange(n)[None, :]) % P
+            self.frag_f.append(f[idx].mean(axis=1))
+            self.frag_E.append(E[idx].mean(axis=1))
+
+    def fragment_composition(self, sources: Sequence[np.ndarray], positions: np.ndarray, levels: np.ndarray,
+                             offsets: np.ndarray):
+        """Exact composition rows of the mixture in which track i plays from source position
+        positions[i] at level levels[i]; one row per offset (frames after the positions)."""
+        offsets = np.asarray(offsets, dtype=np.int64)
+        pos = np.stack([(int(positions[i]) + offsets) % sources[i].shape[0] for i in range(self.M)], axis=1)
+        G0, Gb = self.grams_at_positions(sources, offsets, pos)
+        _f, S, _chi = self.material_features_at(pos)
+        gains = np.broadcast_to(np.asarray(levels, dtype=np.float64), (len(offsets), self.M)).copy()
+        return self.composition_from_grams(gains, G0, Gb, S)
+
+    def random_fragment_composition(self, sources: Sequence[np.ndarray], rng: np.random.Generator, offsets: np.ndarray,
+                                    goal_level: float = 0.0, levels: Optional[np.ndarray] = None):
+        """A random legal fragment composition (random positions, random material levels)."""
+        positions = np.array([int(rng.integers(0, sources[i].shape[0])) for i in range(self.M)])
+        if levels is None:
+            levels = rng.uniform(0.0, 1.0, self.M)
+            levels[0] = goal_level
+        xi, parts = self.fragment_composition(sources, positions, levels, offsets)
+        return xi, parts, {"positions": positions.tolist(), "levels": np.asarray(levels).tolist()}
+
+    def fragment_candidates(self, track: int, target_ratios: np.ndarray, n: int, exclude_near: Optional[int] = None,
+                            exclude_frames: int = 0) -> List[int]:
+        """Top-n fragment positions of `track` whose clip-averaged band profile is closest to the
+        target (normalized band block), silent fragments penalised."""
+        F = self.frag_f[track]
+        d = ((F[:, 1:1 + self.nb] - np.asarray(target_ratios)[None, :]) ** 2).sum(axis=1)
+        d = d + 4.0 * (self.frag_E[track] < self.silence_energy)
+        if exclude_near is not None and exclude_frames > 0:
+            near = np.abs(self.solo_pos[track] - exclude_near) < exclude_frames
+            d = d + 1e6 * near
+        order = np.argsort(d)[: max(1, n)]
+        return [int(self.solo_pos[track][k]) for k in order]
 
     def grams_at_positions(self, sources: Sequence[np.ndarray], starts: np.ndarray, positions: np.ndarray):
         """Window Gram matrices for explicit per-track source positions (positions: (n, M) source

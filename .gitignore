@@ -9,3 +9,5 @@ output_explore/*/result.wav
 output_explore/*.log
 latent_space_code_002.zip
 output_hires/*/result.wav
+output_hires_v1_backup/
+output_frag/*/result.wav

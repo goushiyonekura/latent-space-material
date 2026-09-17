@@ -115,3 +115,24 @@ python3 -m latent_space generate --config project.hires.diffusion.json --mode di
 ```
 
 **元に戻すには**：`project.json`（従来設定）で生成すればよい。高精細版は設定のみの切替で、従来パイプラインのコードは変更していない。
+
+## 断片語彙版（fragment-vocabulary、2026-09-16 利用者承認）
+
+高精細版の測定で、律速は実現層ではなく**理想側**（方式の参照が遅く、連続時計の probe に係留）と分かったため、
+四方式の理想を「断片語彙」の上に置き直した版。opt-in（`hires.fragment_vocabulary: true`）で、従来版・高精細版 v1 は
+そのまま残る（v1 の状態は git タグ `hires-v1`、出力は `output_hires_v1_backup/`）。
+
+- **断片語彙**：各素材の 0.1 秒刻みの位置について「そこからジャンプしたら `clip_feature_seconds`（2 s）鳴る音」の
+  平均特徴を持つ。再生の最小単位は `min_clip_seconds`（2 s）以上の連続区間で、0.1 秒の細切れにはならない。
+- **厳密な断片配合**：`Analyzer.fragment_composition` が「各素材が指定位置から指定レベルで鳴る混合」の配合状態を、
+  その位置の実 PCM の Gram から厳密に計算する。方式の基底・アンカー・トークン・参照分布はこれで作る。
+- **探索**：ジャンプ候補は断片特徴（2 秒平均）と参照の帯域プロファイルの距離で選び、複数トラック同時ジャンプを
+  ビーム探索（幅 3、行の部分集合で厳密混合を評価）で決め、生き残った組合せでレベル探索。
+- **特徴空間**：24 帯域（対数間隔）、d_ξ = 41。方式の内部時間 `model_step_seconds` = 0.5 s（確定間隔と同じ）。
+- **方式**：Diffusion は場の SDE を音楽時間で積分（アンカーは断片配合の標本平均）、VAE は断片配合のランダム標本の SVD 基底
+  （k=4）、Transformer は断片トークンへの注意（値は断片を前景化した厳密配合）、GAN は断片配合の参照分布と系譜。
+
+```bash
+python3 scripts/sweep_period.py --base=project.frag.json --out=output_frag --tag=frag   # 周期 120/180/240 s を各方式で選ぶ
+python3 scripts/ideal_vs_realized.py output_frag output_hires                              # 理想がどれだけ音に届いたか
+```

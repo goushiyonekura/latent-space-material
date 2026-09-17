@@ -10,9 +10,14 @@ import json, os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
-modes = sys.argv[1:] or ["diffusion", "vae", "transformer", "gan"]
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+opts = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--") and "=" in a)
+modes = args or ["diffusion", "vae", "transformer", "gan"]
 OPENS = [90, 150, 210]          # + contract 30 -> cycle 120 / 180 / 240 s
-base = json.load(open("project.hires.json"))
+BASE = opts.get("base", "project.hires.json")
+OUT = opts.get("out", "output_hires")
+TAG = opts.get("tag", "hires")
+base = json.load(open(BASE))
 base["materials"] = [os.path.abspath(m) for m in base["materials"]]
 base["goal"] = os.path.abspath(base["goal"])
 report = {}
@@ -22,10 +27,10 @@ for mode in modes:
         cfg = json.loads(json.dumps(base))
         cfg["mode"] = mode
         cfg["form"]["open_seconds"] = op
-        cpath = f"dev/sweep/config_{mode}_{op}.json"
-        os.makedirs("dev/sweep", exist_ok=True)
+        cpath = f"dev/sweep_{TAG}/config_{mode}_{op}.json"
+        os.makedirs(f"dev/sweep_{TAG}", exist_ok=True)
         json.dump(cfg, open(cpath, "w"), indent=1)
-        out = f"dev/sweep/{mode}_{op}"
+        out = f"dev/sweep_{TAG}/{mode}_{op}"
         subprocess.run([sys.executable, "-m", "latent_space", "generate", "--config", cpath, "--mode", mode, "--output", out],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tp = os.path.join(out, "state_trace.json")
@@ -48,12 +53,12 @@ for mode in modes:
         cfg = json.loads(json.dumps(base))
         cfg["mode"] = mode
         cfg["form"]["open_seconds"] = best["open"]
-        json.dump(cfg, open(f"project.hires.{mode}.json", "w"), indent=2, ensure_ascii=False)
-        dst = f"output_hires/{mode}"
+        json.dump(cfg, open(f"project.{TAG}.{mode}.json", "w"), indent=2, ensure_ascii=False)
+        dst = f"{OUT}/{mode}"
         shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(f"dev/sweep/{mode}_{best['open']}", dst)
+        shutil.copytree(f"dev/sweep_{TAG}/{mode}_{best['open']}", dst)
         report[mode] = {"adopted_open_seconds": best["open"], "adopted_cycle_seconds": best["cycle"], "sweep": results}
     else:
         report[mode] = {"adopted_open_seconds": None, "sweep": results}
-    json.dump(report, open(f"dev/sweep/report_{'_'.join(modes)}.json", "w"), indent=1)
+    json.dump(report, open(f"dev/sweep_{TAG}/report_{'_'.join(modes)}.json", "w"), indent=1)
 print(json.dumps(report, indent=1))

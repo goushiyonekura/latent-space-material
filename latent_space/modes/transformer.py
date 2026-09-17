@@ -58,6 +58,54 @@ Audit-2 changes (B5/C4/D3):
   time `tau_noise_seconds` (rho = exp(-model_step / tau_noise)).  Changing the analysis hop alone
   does not change the expressed dynamics (trace field `time_scale`).
 
+Fragment-vocabulary revision (docs/FRAG_CONTRACT.md, 2026-09-16), active exactly when the analyzer
+carries a fragment bank (`an.frag_f`) and the engine has published the source PCM on the mode
+(`self.sources`).  Everything below replaces the *token side* only; the attention of eq. (35), the
+autoregression of eq. (37)/(38) and all learning hooks keep their form.
+
+* TOKENS ARE FRAGMENTS.  Per source i >= 1 the vocabulary holds K = 6
+  (`transformer.fragment_tokens_per_source`) fragment positions of that source:
+    - the fragment currently played by i (always included, and the only one masked as
+      self-reference for query i),
+    - ceil((K-1)/2) positions whose clip-averaged fragment features `an.frag_f[i]` are CLOSEST to
+      the features that source i is actually playing now (`unit.f_mat[row0, i]`) — the relevance a
+      similarity head can use,
+    - the remaining (K-1) positions whose clip-averaged band profile is FARTHEST from the band
+      block of the current composition `xi_current[1:1+nb]` — the relevance a contrast head can
+      use.  Silent fragments (`an.frag_E < an.silence_energy`) are pushed to the back of both
+      lists.  Plus one goal token (p = 0), key = the goal track's own fragment features.
+* TOKEN VALUES ARE EXACT COMPOSITION DIFFERENCES.  nu_p = <xi(foreground p)> - <xi(no change)>,
+  both computed with `an.grams_at_positions` / `an.composition_from_grams` (i.e. exactly what
+  `an.fragment_composition` computes, batched into a single Gram call) for the fragment at
+  `probe_foreground_gain`, every other track at its CURRENT level and CURRENT position, averaged
+  over `fragment_value_offsets` = 3 offsets spread over the fragment clip.  The goal token keeps
+  its original value xi_G - xi_current.  The absolute key composition of a token is therefore
+  xi_key_p = xi_current + nu_p, an exactly realizable mixture, and the similarity / contrast heads
+  stay the "relative" heads of eq. (37) with those keys.
+* CURRENT STATE.  Positions come from `stats["positions"]` of the last committed block, advanced by
+  the elapsed frames (playback clocks run at 1:1 between commits); at unit start the continuous
+  clock `(window start) mod L_i` is used.  Material levels are tracked exactly from the committed
+  events' `end_gain`; the goal level follows the exposure schedule, which is constant over the
+  windowed search.  The distance between the reconstructed current composition and the realized
+  `xi_current` is recorded per window (`current_composition_reconstruction_dist2`).
+* BOUND.  The radial tanh excursion is kept, but anchored and sized in the fragment vocabulary:
+  anchor (1-o) xi_G + o * xi_current, radius `excursion_radius_fragment` * o_j * max_p d_xi(nu_p, 0)
+  over the fragment tokens * (1 + min(s, cap)) with s the model-step index inside the window — at
+  openness o, after s+1 commit steps the ideal may be up to s+1 maximal one-step fragment moves away
+  from the composition the realizer is actually at, and at o = 0 the ball collapses onto xi_G.  Its
+  usage rate is recorded per unit.
+* TIME.  In fragment mode the increment of eq. (37) is defined per MODEL step (dt_scale = 1,
+  `fragment_step_seconds_reference` = the model step): one token value is what the realizer can do
+  in one commit step, so the ideal moves per step by a realizable amount.  The mean per-step
+  displacement of the ideal is recorded in d_xi units.
+* STATISTICS (per commit / per unit): attention entropy per head (nats and normalized), the
+  recurrence fraction (model steps whose top memory reference is an event whose `src_position` is
+  within `recurrence_tolerance_seconds` = 2 s of the position played in the committed block), the
+  bound usage rate and the mean per-step displacement of the ideal.
+
+When the fragment bank is absent every one of these branches is skipped and the mode behaves
+exactly as before (baseline configs).
+
 Realization (§9.4, eq. 39): E_T = <d_xi^2(xi_t(gamma), xi_hat_t)> over the non-hold rows (the
 window restriction of the same quantity is the default `window_error`).
 
@@ -107,6 +155,7 @@ class TransformerMode(ModeController):
 
     def __init__(self, cfg, analyzer, fs, rng, objective):
         super().__init__(cfg, analyzer, fs, rng, objective)
+        self.sources = None          # the engine publishes job.sources here (FRAG_CONTRACT)
         md = cfg.get("mode_defaults", {})
         self.p = dict(md.get("transformer", {}))
         heads = [str(h) for h in md.get("transformer_heads", _HEADS_FALLBACK)]
@@ -170,6 +219,27 @@ class TransformerMode(ModeController):
         self._last_event_key: tuple = (-1, -1, -1)
         self._saturation_noted = False
         self._max_step_traces = 2000
+        # ---- fragment vocabulary (FRAG_CONTRACT) ---------------------------------------
+        # K = 6 fragment tokens per source; all keys read with .get so a config may override.
+        self.K_frag = max(1, int(self.p.get("fragment_tokens_per_source", 6)))
+        self.n_frag_offsets = max(1, int(self.p.get("fragment_value_offsets", 3)))
+        self.frag_excursion = max(1e-3, float(self.p.get("excursion_radius_fragment", 1.0)))
+        self.frag_noise_scale = float(self.p.get("noise_scale_fragment", 0.25))
+        # in fragment mode one token value is one commit step, so the eq. (37) increment is defined
+        # per model step (dt_scale = 1) instead of per step_seconds_reference (0.1 s).
+        _fsr = float(self.p.get("fragment_step_seconds_reference", 0.0))
+        self.frag_step_ref = _fsr if _fsr > 0 else 2.0 * self.model_step
+        self.frag_dt_scale = self.model_step / max(1e-9, self.frag_step_ref)
+        # the bound radius grows with the model-step index (the reachable set grows per commit),
+        # capped at the lookahead window so the unit-level warm-start path stays bounded.
+        _look = float(cfg.get("hires", {}).get("lookahead_seconds", 4.0))
+        _cap = int(self.p.get("fragment_bound_growth_steps", 0))
+        self.frag_growth_cap = _cap if _cap > 0 else max(1, int(round(_look / max(1e-9, self.model_step))))
+        self.recurrence_tol_s = float(self.p.get("recurrence_tolerance_seconds", 2.0))
+        self._pos_ref: Optional[tuple] = None       # (reference frame, positions (M,)) of the last commit
+        self._levels = np.zeros(self.M)
+        self.frag_traces: List[Dict[str, Any]] = []
+        self._frag_warned = False
 
     def _f(self, key: str, default: float) -> float:
         return float(self.p.get(key, default))
@@ -214,7 +284,8 @@ class TransformerMode(ModeController):
                     if k.shape == (dphi,) and v.shape == (d,) and np.isfinite(k).all() and np.isfinite(v).all():
                         digest.append({"key": k, "value": v, "t": float(slot.get("t_seconds", 0.0)),
                                        "track": int(slot.get("track", -1)), "unit": int(slot.get("unit", -1)),
-                                       "count": int(slot.get("count", 0))})
+                                       "count": int(slot.get("count", 0)),
+                                       "src_position": int(slot.get("src_position", -1))})
                 except Exception:  # noqa: BLE001
                     continue
         keys = [np.asarray(e["xi_end"], dtype=np.float64)[:dphi] for e in ev]
@@ -222,6 +293,9 @@ class TransformerMode(ModeController):
         ts = [float(e.get("end_seconds", 0.0)) for e in ev]
         tracks = [int(e.get("track", -1)) for e in ev]
         units = [int(e.get("unit", -1)) for e in ev]
+        # fragment revision: committed events now carry the played source position and the jump flag
+        poss = [int(e.get("src_position", -1)) for e in ev]
+        jumps = [bool(e.get("jump", False)) for e in ev]
         kinds = ["recent"] * len(ev)
         for slot in digest:
             keys.append(slot["key"])
@@ -229,17 +303,207 @@ class TransformerMode(ModeController):
             ts.append(slot["t"])
             tracks.append(slot["track"])
             units.append(slot["unit"])
+            poss.append(int(slot.get("src_position", -1)))
+            jumps.append(False)
             kinds.append("digest")
         n_real = len(keys)
         if n_real == 0:                                  # empty recollection -> one zero token (§9.2)
             keys, vals = [np.zeros(dphi)], [np.zeros(d)]
             ts, tracks, units, kinds = [float(unit.seconds[0])], [-1], [-1], ["empty"]
+            poss, jumps = [-1], [False]
         return {"corr": corr, "A": A,
                 "ev_key": np.stack(keys), "ev_val": np.stack(vals), "ev_t": np.asarray(ts, dtype=np.float64),
                 "ev_track": np.asarray(tracks, dtype=np.int64), "ev_unit": np.asarray(units, dtype=np.int64),
+                "ev_pos": np.asarray(poss, dtype=np.int64), "ev_jump": list(jumps),
                 "ev_kind": kinds, "n_recent": len(ev), "n_digest": len(digest), "n_tokens": n_real,
                 "source": "empty_history" if empty else "committed_history",
                 "history_version": 0 if (empty or history is None) else int(history.n_updates)}
+
+    # ================================================================== fragment vocabulary
+    def _frag_active(self) -> bool:
+        """Fragment mode: the analyzer carries the fragment bank AND the engine has published the
+        source PCM on the mode (`mode.sources = job.sources`, FRAG_CONTRACT)."""
+        return (getattr(self.analyzer, "frag_f", None) is not None
+                and getattr(self, "sources", None) is not None)
+
+    def _init_levels(self, unit: UnitContext) -> None:
+        """Current MATERIAL levels at the unit start.  Materials start every unit at the unit-start
+        gains (0: the realizer's deterministic tail ramps them down before the goal hold / the unit
+        boundary); from there they are tracked exactly from the committed events' `end_gain`.
+        The goal track is not tracked here — it follows its deterministic exposure schedule
+        (`_goal_level_at`)."""
+        lv = np.zeros(self.M)
+        sg = np.asarray(unit.start_gains, dtype=np.float64).reshape(-1)
+        if sg.shape == (self.M,):
+            lv[1:] = np.clip(sg[1:], 0.0, 1.0)
+        self._levels = lv
+
+    def _goal_level_at(self, unit: UnitContext, frame: int) -> float:
+        """The goal track's level at `frame`, from the deterministic exposure schedule.
+
+        The windowed search always stops at the goal rise, so inside it the schedule is: 0 when the
+        unit starts from silence; otherwise the level left by the preceding GOAL_HOLD (1), descending
+        with a Q5 over min(goal_rise_seconds, REOPEN length) to the open cap when the unit opens with
+        a REOPEN, and held afterwards."""
+        ge = self.cfg.get("form", {}).get("goal_exposure", {}) or {}
+        cap = 1.0 if str(ge.get("policy", "contract_only")) == "free" else float(ge.get("open_max", 0.0))
+        if bool(unit.starts_from_silence):
+            return 0.0
+        g0 = 1.0                                   # the preceding unit ends in GOAL_HOLD
+        reopen = (unit.phase_frames or {}).get("REOPEN")
+        if reopen is None:
+            return g0
+        hz = self.cfg.get("hires", {}) or {}
+        commit = max(1, int(round(float(hz.get("commit_seconds", 0.5)) * float(self.fs))))
+        ramp = max(1, min(commit, int(round(float(hz.get("ramp_seconds", 0.25)) * float(self.fs)))))
+        rise = max(ramp, int(round(float(hz.get("goal_rise_seconds", 12.0)) * float(self.fs))))
+        desc = max(1, min(rise, int(reopen[1]) - int(reopen[0])))
+        s = float(np.clip((float(frame) - float(unit.start)) / float(desc), 0.0, 1.0))
+        q = s * s * s * (10.0 + s * (-15.0 + 6.0 * s))          # Q5 smoothstep, as in the realizer
+        return float(g0 + (cap - g0) * q)
+
+    def _commit_end_frame(self, unit: UnitContext, rows: np.ndarray) -> int:
+        """End frame of the block just committed.  The realizer commits `hires.commit_seconds`
+        starting at `unit.start`, so the k-th commit ends at unit.start + (k+1) * commit_frames;
+        the last commit of a unit can be short, so the value is clamped into the half-open interval
+        the committed rows allow (centre of the last committed row, + one analysis hop].  This is
+        the frame at which `stats["positions"]` was read."""
+        hz = self.cfg.get("hires", {}) or {}
+        commit = max(1, int(round(float(hz.get("commit_seconds", 0.5)) * float(self.fs))))
+        c_end = int(unit.start) + (int(self._unit_commits) + 1) * commit
+        last = int(unit.centers[int(np.asarray(rows, dtype=np.int64)[-1])])
+        return int(min(max(c_end, last + 1), last + int(self.analyzer.hop)))
+
+    def _positions_now(self, unit: UnitContext, row0: int):
+        """Source positions of every track at the start of the analysis window of `row0`.
+
+        Primary source: `stats["positions"]` of the last committed block (the playback clock of a
+        track advances 1:1 with the output between commits — jumps happen only at commit steps, and
+        every commit step passes through `observe_committed` — so the recorded position is simply
+        advanced by the elapsed frames).  Its reference frame is reconstructed exactly by
+        `_commit_end_frame`.  Fallback at the unit start: the continuous clock."""
+        an = self.analyzer
+        L = [int(x) for x in an.source_lengths]
+        f_eval = int(unit.centers[int(row0)]) - int(an.W) // 2
+        if self._pos_ref is not None:
+            f_ref, pos_ref = self._pos_ref
+            adv = f_eval - int(f_ref)
+            return (np.array([int((int(pos_ref[i]) + adv) % L[i]) for i in range(self.M)], dtype=np.int64),
+                    "committed_positions_advanced")
+        return (np.array([int(f_eval % L[i]) for i in range(self.M)], dtype=np.int64), "continuous_clock")
+
+    def _fragment_tokens(self, unit: UnitContext, rows: np.ndarray, xi_cur: np.ndarray,
+                         positions: np.ndarray, levels: np.ndarray) -> Dict[str, Any]:
+        """The fragment token bank for one window (FRAG_CONTRACT, Transformer §1).
+
+        Returns the token keys (clip-averaged fragment features), the token values nu_p (EXACT
+        composition of foregrounding that fragment minus the exact current composition, averaged
+        over a few offsets inside the fragment clip) and the absolute key compositions
+        xi_current + nu_p."""
+        an = self.analyzer
+        src = self.sources
+        nb = int(an.nb)
+        K = max(1, int(self.K_frag))
+        xi0 = np.asarray(xi_cur, dtype=np.float64).reshape(-1)
+        clip_frames = max(int(an.solo_hop), int(getattr(an, "frag_rows", 1)) * int(an.solo_hop))
+        offs = np.unique(np.round(np.linspace(0.0, float(clip_frames), int(self.n_frag_offsets),
+                                              endpoint=False)).astype(np.int64))
+        n_off = int(len(offs))
+        f_cur = np.asarray(unit.f_mat[int(rows[0])], dtype=np.float64)          # (M, d_phi) played
+        b_cur = xi0[1:1 + nb]
+        n_sim = int(np.ceil((K - 1) / 2.0))
+        n_con = max(0, (K - 1) - n_sim)
+        tracks: List[int] = []
+        poss: List[int] = []
+        is_cur: List[bool] = []
+        rank: List[str] = []
+        for i in range(1, self.M):
+            sp = np.asarray(an.solo_pos[i])
+            P = int(len(sp))
+            kc = int(np.clip(int(round(float(positions[i]) / float(an.solo_hop))), 0, P - 1))
+            F = np.asarray(an.frag_f[i], dtype=np.float64)
+            silent = np.asarray(an.frag_E[i], dtype=np.float64) < float(an.silence_energy)
+            d_sim = ((F - f_cur[i][None, :]) ** 2).sum(axis=1) + 1e3 * silent
+            d_con = ((F[:, 1:1 + nb] - b_cur[None, :]) ** 2).sum(axis=1) - 1e3 * silent
+            taken = {kc}
+            tracks.append(i); poss.append(int(sp[kc])); is_cur.append(True); rank.append("played")
+            for k in np.argsort(d_sim, kind="stable"):
+                if len(taken) >= 1 + n_sim:
+                    break
+                k = int(k)
+                if k in taken:
+                    continue
+                taken.add(k)
+                tracks.append(i); poss.append(int(sp[k])); is_cur.append(False); rank.append("similar")
+            for k in np.argsort(-d_con, kind="stable"):
+                if len(taken) >= 1 + n_sim + n_con:
+                    break
+                k = int(k)
+                if k in taken:
+                    continue
+                taken.add(k)
+                tracks.append(i); poss.append(int(sp[k])); is_cur.append(False); rank.append("contrasting")
+        # ---- exact composition of foregrounding each fragment (one batched Gram call) ----------
+        Ls = [int(x.shape[0]) for x in src]
+        base_pos = np.asarray(positions, dtype=np.int64)
+        lv0 = np.clip(np.asarray(levels, dtype=np.float64), 0.0, 1.0)
+        n_blocks = 1 + len(tracks)
+        pos_all = np.zeros((n_blocks * n_off, self.M), dtype=np.int64)
+        gains_all = np.zeros((n_blocks * n_off, self.M))
+        for bi in range(n_blocks):
+            sl = slice(bi * n_off, (bi + 1) * n_off)
+            p = np.stack([(int(base_pos[k]) + offs) % Ls[k] for k in range(self.M)], axis=1)
+            lv = lv0.copy()
+            if bi > 0:
+                tr = tracks[bi - 1]
+                p[:, tr] = (int(poss[bi - 1]) + offs) % Ls[tr]
+                lv[tr] = float(self.fg_gain)
+            pos_all[sl] = p
+            gains_all[sl] = lv[None, :]
+        G0, Gb = an.grams_at_positions(src, np.zeros(n_blocks * n_off, dtype=np.int64), pos_all)
+        _f, S_all, _chi = an.material_features_at(pos_all)
+        xi_blocks = np.zeros((n_blocks, self.d_xi))
+        xi_at0 = np.zeros(self.d_xi)
+        for bi in range(n_blocks):
+            sl = slice(bi * n_off, (bi + 1) * n_off)
+            # per block: the flux feature is computed inside the block only, exactly as
+            # an.fragment_composition would do for that single fragment mixture
+            xi_b, _pb = an.composition_from_grams(gains_all[sl], G0[sl], Gb[sl], S_all[sl])
+            xi_blocks[bi] = xi_b.mean(axis=0)
+            if bi == 0:
+                xi_at0 = xi_b[0].copy()          # offset 0: the state-tracking check against xi0
+        xi_base = xi_blocks[0]
+        nu_frag = xi_blocks[1:] - xi_base[None, :]
+        # ---- goal token (p = 0): the original value xi_G - xi_current --------------------------
+        xi_goal_win = np.asarray(unit.xi_goal[np.asarray(rows, dtype=np.int64)], dtype=np.float64).mean(axis=0)
+        k0 = int(np.clip(int(round(float(positions[0]) / float(an.solo_hop))), 0, len(an.solo_pos[0]) - 1))
+        nu = np.concatenate([(xi_goal_win - xi0)[None, :], nu_frag], axis=0)
+        keys = np.concatenate([np.asarray(an.frag_f[0][k0], dtype=np.float64)[None, :],
+                               np.stack([np.asarray(an.frag_f[tr][int(np.clip(
+                                   int(round(q / float(an.solo_hop))), 0, len(an.solo_pos[tr]) - 1))],
+                                   dtype=np.float64) for tr, q in zip(tracks, poss)])], axis=0)
+        tok_track = np.asarray([0] + tracks, dtype=np.int64)
+        tok_pos = np.asarray([int(an.solo_pos[0][k0])] + poss, dtype=np.int64)
+        tok_cur = np.asarray([True] + is_cur, dtype=bool)
+        tok_rank = ["goal"] + rank
+        xi_key = xi0[None, :] + nu
+        centroid = xi_key.mean(axis=0)
+        # reach of ONE commit step in the fragment vocabulary: the largest single-fragment move
+        # (the goal token is excluded — it is not a fragment move)
+        reach2 = float(np.max(self.analyzer.dist2(nu_frag, np.zeros(self.d_xi)))) if len(nu_frag) else 0.0
+        return {"nu": nu, "key": keys, "track": tok_track, "pos": tok_pos, "is_cur": tok_cur,
+                "rank": tok_rank, "xi_key": xi_key, "centroid": centroid,
+                "reach2": max(reach2, 1e-12), "n_tokens": int(len(nu)),
+                "offsets": [int(x) for x in offs], "levels": lv0.tolist(),
+                "positions": [int(x) for x in base_pos],
+                "xi_base": xi_base,
+                # state-tracking check: the exact composition at OFFSET 0 (same 46 ms window as the
+                # realized xi_current) against xi_current.  The clip-averaged baseline xi_base is a
+                # different quantity (it averages over the fragment clip) and is not compared here.
+                "reconstruction_dist2": float(self.analyzer.dist2(xi_at0, xi0)),
+                "clip_average_offset_dist2": float(self.analyzer.dist2(xi_base, xi_at0)),
+                "value_norms": [float(np.sqrt(max(0.0, float(self.analyzer.dist2(v, np.zeros(self.d_xi))))))
+                                for v in nu]}
 
     # ================================================================== context / attention
     def _coarse_rows(self, rows: np.ndarray) -> np.ndarray:
@@ -255,21 +519,58 @@ class TransformerMode(ModeController):
         return sel
 
     def _context(self, unit: UnitContext, crows: np.ndarray, xi_start: np.ndarray,
-                 pack: Dict[str, Any]) -> Dict[str, Any]:
-        """Scores of eq. (35) on the model-step rows `crows` for one history pack and start state."""
+                 pack: Dict[str, Any], tok: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Scores of eq. (35) on the model-step rows `crows` for one history pack and start state.
+
+        `tok` is the fragment token bank (fragment mode); without it the material-probe tokens of
+        the baseline are used and every shape / definition is the previous one."""
         S = int(len(crows))
         K = int(pack["ev_key"].shape[0])
         f = unit.f_mat[crows]                                        # (S, M, d_phi)
-        diff = f[:, :, None, :] - f[:, None, :, :]
         dm = f[:, :, None, :] - pack["ev_key"][None, None, :, :]
+        xi0 = np.asarray(xi_start, dtype=np.float64).reshape(-1).copy()
+        o = np.asarray(unit.o[crows], dtype=np.float64)
+        if tok is None:
+            diff = f[:, :, None, :] - f[:, None, :, :]
+            D2 = (diff ** 2).sum(axis=-1)                            # (S, M, M)
+            mask_pair = np.broadcast_to(np.eye(self.M, dtype=bool), (S, self.M, self.M))
+            xi_key = self.xi_key[crows]                              # (S, M, d_xi)
+            xi_ref = self.xi_ref[crows]
+            rad2 = self.rad2_all[crows]
+            tok_track = np.arange(self.M, dtype=np.int64)
+        else:
+            dk = f[:, :, None, :] - tok["key"][None, None, :, :]
+            D2 = (dk ** 2).sum(axis=-1)                              # (S, M, T)
+            self_ref = (tok["track"][None, :] == np.arange(self.M, dtype=np.int64)[:, None]) & tok["is_cur"][None, :]
+            mask_pair = np.broadcast_to(self_ref, (S, self.M, int(tok["n_tokens"])))
+            xi_key = tok["xi_key"]                                   # (T, d_xi), constant on the window
+            # Bound in the fragment vocabulary: the anchor slides from the goal composition (o = 0,
+            # where eq. (37) has to end on xi_G) to the REALIZED CURRENT composition (o = 1), and the
+            # radius is the reach of one commit step in the vocabulary, grown by one step per model
+            # step.  Anchoring on xi_current (rather than on the token centroid) means the start
+            # state is at distance 0 while the unit is open, so the bound never squashes the ideal
+            # merely for starting where the realizer actually is.
+            xi_ref = (1.0 - o)[:, None] * unit.xi_goal[crows] + o[:, None] * xi0[None, :]
+            grow = 1.0 + np.minimum(np.arange(S, dtype=np.float64), float(self.frag_growth_cap))
+            # ... and never smaller than the distance the closing term alpha_G (1-o)(xi_G - xi) still
+            # has to cover: at o = 0 the ball is centred on xi_G and just reaches the current
+            # composition, so the bound limits the fragment drift without fighting the goal pull.
+            d_goal2 = self.analyzer.dist2(unit.xi_goal[crows], xi0[None, :])
+            rad2 = np.maximum((self.frag_excursion * o * grow) ** 2 * float(tok["reach2"]),
+                              (1.0 - o) ** 2 * d_goal2)
+            rad2 = np.maximum(rad2, 1e-12)
+            tok_track = tok["track"]
         return {
-            "rows": crows, "S": S, "xi_start": np.asarray(xi_start, dtype=np.float64).copy(),
-            "D2": (diff ** 2).sum(axis=-1),                          # (S, M, M)
+            "rows": crows, "S": S, "xi_start": xi0,
+            "D2": D2,
             "D2m": (dm ** 2).sum(axis=-1),                           # (S, M, K)
             "recency": np.maximum(unit.seconds[crows][:, None, None] - pack["ev_t"][None, None, :], 0.0) / self.tau_H,
-            "mask_pair": np.broadcast_to(np.eye(self.M, dtype=bool), (S, self.M, self.M)),
+            "mask_pair": mask_pair,
             "mask_mem": np.zeros((S, self.M, K), dtype=bool),
-            "xi_key": self.xi_key[crows], "pack": pack,
+            "xi_key": xi_key, "pack": pack, "tok": tok, "tok_track": tok_track,
+            "xi_ref": xi_ref, "rad2": rad2,
+            "dt_scale": (self.frag_dt_scale if tok is not None else self.dt_scale),
+            "noise_scale": (self.frag_noise_scale if tok is not None else self.noise_scale),
         }
 
     def _bias_tendency(self, pack: Dict[str, Any], h: str) -> np.ndarray:
@@ -281,9 +582,31 @@ class TransformerMode(ModeController):
         dev = A - A.mean(axis=1, keepdims=True)
         return self.bias_scale * np.tanh(self.tendency_gain * dev)
 
+    @staticmethod
+    def _entropy(A: np.ndarray) -> tuple:
+        """Mean attention entropy over queries and model steps (nats) and its normalized value."""
+        p = np.clip(np.asarray(A, dtype=np.float64), 1e-300, 1.0)
+        H = -(p * np.log(p)).sum(axis=-1)
+        n = float(A.shape[-1])
+        return float(H.mean()), float(H.mean() / np.log(n)) if n > 1 else 0.0
+
+    def _by_track(self, A_mean: np.ndarray, key_track: np.ndarray) -> np.ndarray:
+        """(M, n_keys) mean attention aggregated to (M, M) by the SOURCE of each key."""
+        out = np.zeros((self.M, self.M))
+        for k, tr in enumerate(np.asarray(key_track, dtype=np.int64)):
+            if 0 <= int(tr) < self.M:
+                out[:, int(tr)] += A_mean[:, k]
+        return out
+
     def _attention(self, ctx: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """All heads at once on the model-step rows, including the value-side context of eq. (36)."""
+        """All heads at once on the model-step rows, including the value-side context of eq. (36).
+
+        Fragment mode: the keys/values of the two material heads are the fragment tokens, whose
+        values are composition DIFFERENCES from the current composition; the head's absolute
+        context is therefore xi_current + sum_p A_p nu_p, an exactly realizable mixture, and the
+        head stays "relative" in eq. (37) exactly as the probe tokens were."""
         pack = ctx["pack"]
+        tok = ctx.get("tok")
         ev_track = pack["ev_track"]
         out: Dict[str, Dict[str, Any]] = {}
         B_corr = self.bias_scale * np.tanh(pack["corr"])
@@ -299,50 +622,74 @@ class TransformerMode(ModeController):
                 A = _softmax_masked(logits, ctx["mask_mem"])                      # (S, M, K)
                 base = np.einsum("sip,pd->sd", A, pack["ev_val"]) / float(self.M)
                 A_mean = A.mean(axis=0)
-                by_track = np.zeros((self.M, self.M))
-                for k, tr in enumerate(ev_track):
-                    if 0 <= tr < self.M:
-                        by_track[:, tr] += A_mean[:, k]
-                out[h] = {"A_mean": A_mean, "by_track": by_track, "base": base, "relative": False}
+                ent, entn = self._entropy(A)
+                out[h] = {"A_mean": A_mean, "by_track": self._by_track(A_mean, ev_track), "base": base,
+                          "relative": False, "entropy": ent, "entropy_normalized": entn,
+                          "top_per_step": [int(k) for k in np.argmax(A.mean(axis=1), axis=-1)]}
             else:
                 s = -score_pair if h == "similarity" else score_pair
-                B = B_corr + self._bias_tendency(pack, h)
-                logits = s + B[None, :, :]
-                A = _softmax_masked(logits, ctx["mask_pair"])                     # (S, M, M)
-                base = np.einsum("sip,spd->sd", A, ctx["xi_key"]) / float(self.M)
-                A_mean = A.mean(axis=0)
-                out[h] = {"A_mean": A_mean, "by_track": A_mean, "base": base, "relative": True}
+                if tok is None:
+                    B = B_corr + self._bias_tendency(pack, h)
+                    logits = s + B[None, :, :]
+                    A = _softmax_masked(logits, ctx["mask_pair"])                 # (S, M, M)
+                    base = np.einsum("sip,spd->sd", A, ctx["xi_key"]) / float(self.M)
+                    A_mean = A.mean(axis=0)
+                    by = A_mean
+                else:
+                    tt = ctx["tok_track"]
+                    B = (B_corr + self._bias_tendency(pack, h))[:, tt.clip(0, self.M - 1)]   # (M, T)
+                    logits = s + B[None, :, :]
+                    A = _softmax_masked(logits, ctx["mask_pair"])                 # (S, M, T)
+                    disp = np.einsum("sip,pd->sd", A, tok["nu"]) / float(self.M)
+                    base = ctx["xi_start"][None, :] + disp                        # absolute context
+                    A_mean = A.mean(axis=0)
+                    by = self._by_track(A_mean, tt)
+                ent, entn = self._entropy(A)
+                out[h] = {"A_mean": A_mean, "by_track": by, "base": base, "relative": True,
+                          "entropy": ent, "entropy_normalized": entn,
+                          "top_per_step": [int(k) for k in np.argmax(A.mean(axis=1), axis=-1)]}
         return out
 
     # ================================================================== eq. (37)/(38)
-    def _bound(self, mu: np.ndarray, j: int):
+    def _bound(self, mu: np.ndarray, ref: np.ndarray, rad2: float):
         """Bounded excursion of the generated ideal state, applied once per MODEL step.
 
         With alpha_s = alpha_c the two material heads of eq. (37) contribute a pure translation
         alpha (Ctx_sim - Ctx_contrast), and the only restoring term, alpha_G (1 - o)(xi_G - xi),
         vanishes exactly where o = 1 (the OPEN phase), so the recursion is a drifting random walk
-        there.  The excursion around the openness anchor xi_ref is therefore squashed smoothly
+        there.  The excursion around the openness anchor `ref` is therefore squashed smoothly
         (tanh: identity to first order, saturating at the radius) into the ball of radius
-        excursion_radius * o_j * max_p d_xi(key_p, key centroid)."""
-        ref = self.xi_ref[j]
+        sqrt(rad2).  Baseline: ref = (1-o) xi_G + o * probe centroid, radius excursion_radius * o_j
+        * max_p d_xi(key_p, centroid).  Fragment mode: ref = (1-o) xi_G + o * fragment-token
+        centroid, radius excursion_radius_fragment * o_j * max_p d_xi(xi_key_p, centroid) *
+        (1 + min(s, cap)) — the reachable set grows by one maximal fragment move per commit."""
         d = mu - ref
         d2 = float(self.analyzer.dist2(d, np.zeros(self.d_xi)))
         if d2 <= 1e-300:
             return mu, False
-        r = float(np.sqrt(self.rad2_all[j]))
+        r = float(np.sqrt(rad2))
         rho = float(np.sqrt(d2))
         scale = r * np.tanh(rho / r) / rho
         return ref + d * scale, bool(rho > r)
 
     def _ar_path(self, ctx: Dict[str, Any], att: Dict[str, Dict[str, Any]], eps):
         """One conditional future on the model-step grid of `ctx` (the sampled state is the context
-        of the next step).  eps=None gives the deterministic mean path."""
+        of the next step).  eps=None gives the deterministic mean path.
+
+        Returns (path, clipped model steps, mean per-step displacement of the ideal in d_xi units,
+        free model steps).  The displacement statistic skips GOAL_HOLD steps (those are pinned)."""
         unit = self.unit
         rows = ctx["rows"]
         nh = len(self.heads)
+        dt_scale = float(ctx.get("dt_scale", self.dt_scale))
+        noise_scale = float(ctx.get("noise_scale", self.noise_scale))
+        xi_ref = ctx["xi_ref"]
+        rad2 = ctx["rad2"]
         xi = ctx["xi_start"].copy()
         out = np.zeros((ctx["S"], self.d_xi))
         n_clip = 0
+        disp_sum = 0.0
+        n_free = 0
         for s in range(ctx["S"]):
             j = int(rows[s])
             o = float(unit.o[j])
@@ -352,21 +699,24 @@ class TransformerMode(ModeController):
                 Oh = att[h]["base"][s] - xi if att[h]["relative"] else att[h]["base"][s]
                 O.append(Oh)
                 step = step + self.sign[h] * self.alpha[h] * Oh
-            mu = xi + self.dt_scale * (o * step + self.alpha_G * (1.0 - o) * (unit.xi_goal[j] - xi))
+            mu = xi + dt_scale * (o * step + self.alpha_G * (1.0 - o) * (unit.xi_goal[j] - xi))
             if eps is not None:
                 u = eps[s]
                 fl = np.zeros(self.d_xi)
                 for k in range(nh):
                     fl = fl + float(u[k]) * O[k]
-                fl = self.noise_scale * fl + self.cov_sd * u[nh:]
-                mu = mu + np.sqrt(self.dt_scale) * o * fl   # openness-gated fluctuation, per sqrt(dt)
-            mu, clipped = self._bound(mu, j)
+                fl = noise_scale * fl + self.cov_sd * u[nh:]
+                mu = mu + np.sqrt(dt_scale) * o * fl   # openness-gated fluctuation, per sqrt(dt)
+            mu, clipped = self._bound(mu, xi_ref[s], float(rad2[s]))
             n_clip += int(clipped)
             if unit.hold_mask[j]:
                 mu = unit.xi_goal[j].copy()
+            else:
+                disp_sum += float(np.sqrt(max(0.0, float(self.analyzer.dist2(mu, xi)))))
+                n_free += 1
             out[s] = mu
             xi = mu
-        return out, n_clip
+        return out, n_clip, (disp_sum / float(n_free) if n_free else 0.0), n_free
 
     def _interp(self, coarse: np.ndarray, crows: np.ndarray, rows: np.ndarray) -> np.ndarray:
         """Model-step path -> analysis rows (the only place the hop enters the dynamics)."""
@@ -381,18 +731,38 @@ class TransformerMode(ModeController):
             out[:, d] = np.interp(x, xp, coarse[:, d])
         return out
 
-    def _att_meta(self, att: Dict[str, Dict[str, Any]], pack: Dict[str, Any]) -> Dict[str, Any]:
+    def _att_meta(self, att: Dict[str, Dict[str, Any]], pack: Dict[str, Any],
+                  tok: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         mem = att.get("memory")
         ev_w = mem["A_mean"].mean(axis=0) if mem is not None else None
-        return {
+        meta = {
             "attention_by_track": {h: att[h]["by_track"].tolist() for h in self.heads},
+            "attention_entropy": {h: float(att[h]["entropy"]) for h in self.heads},
+            "attention_entropy_normalized": {h: float(att[h]["entropy_normalized"]) for h in self.heads},
+            "attention_keys": {h: int(att[h]["A_mean"].shape[1]) for h in self.heads},
             "memory_reference_weights": (ev_w.tolist() if ev_w is not None else []),
+            "memory_top_token_per_step": (list(mem["top_per_step"]) if mem is not None else []),
             "memory_tokens": [{"unit": int(pack["ev_unit"][k]), "track": int(pack["ev_track"][k]),
-                               "end_seconds": float(pack["ev_t"][k]), "kind": pack["ev_kind"][k]}
+                               "end_seconds": float(pack["ev_t"][k]), "kind": pack["ev_kind"][k],
+                               "src_position": int(pack["ev_pos"][k])}
                               for k in range(int(pack["ev_key"].shape[0]))],
             "memory_token_counts": {"recent": int(pack["n_recent"]), "digest": int(pack["n_digest"])},
             "history_version": int(pack["history_version"]),
         }
+        if tok is not None:
+            meta["fragment_tokens"] = {
+                "n_tokens": int(tok["n_tokens"]),
+                "per_source": int(self.K_frag),
+                "track": [int(x) for x in tok["track"]],
+                "src_position": [int(x) for x in tok["pos"]],
+                "rank": list(tok["rank"]),
+                "value_norm_d_xi": [round(float(x), 6) for x in tok["value_norms"]],
+                "levels_used": tok["levels"], "positions_used": tok["positions"],
+                "offsets_frames": tok["offsets"],
+                "one_step_reach_d_xi": float(np.sqrt(tok["reach2"])),
+                "current_composition_reconstruction_dist2": float(tok["reconstruction_dist2"]),
+            }
+        return meta
 
     # ================================================================== conditioning (§9.1)
     def begin_unit(self, unit: UnitContext, history) -> None:
@@ -426,11 +796,30 @@ class TransformerMode(ModeController):
         self.xi_ref = (1.0 - o_col) * unit.xi_goal + o_col * key_mean
         d2p = self.analyzer.dist2(self.xi_key, key_mean[:, None, :])                 # (J, M)
         self.rad2_all = np.maximum((self.excursion * unit.o) ** 2 * d2p.max(axis=1), 1e-12)
+        # --- fragment vocabulary: unit-start token bank (continuous-clock positions) ----
+        self.frag = self._frag_active()
+        self._init_levels(unit)
+        self.tok_unit: Optional[Dict[str, Any]] = None
+        pos_src = "n/a"
+        if self.frag:
+            try:
+                pos0, pos_src = self._positions_now(unit, 0)
+                lv0 = self._levels.copy()
+                lv0[0] = self._goal_level_at(unit, int(unit.centers[0]))
+                self.tok_unit = self._fragment_tokens(unit, np.arange(J, dtype=np.int64), self.xi_start,
+                                                      pos0, lv0)
+            except Exception as e:  # noqa: BLE001
+                self.tok_unit = None
+                self.frag = False
+                if not self._frag_warned:
+                    self._frag_warned = True
+                    self.warnings.append(f"transformer: fragment token bank unavailable ({e!r}); "
+                                         "falling back to the probe-token baseline")
         # --- unit-level (warm start) context on the model-step grid --------------------
         self.crows_unit = self._coarse_rows(np.arange(J, dtype=np.int64))
-        self.ctx_unit = self._context(unit, self.crows_unit, self.xi_start, pack0)
+        self.ctx_unit = self._context(unit, self.crows_unit, self.xi_start, pack0, self.tok_unit)
         self.att0 = self._attention(self.ctx_unit)
-        coarse, n_clip = self._ar_path(self.ctx_unit, self.att0, None)
+        coarse, n_clip, disp_unit, _nf = self._ar_path(self.ctx_unit, self.att0, None)
         self.mu_det = fix_hold_rows(unit, self._interp(coarse, self.crows_unit, np.arange(J, dtype=np.int64)))
         fm = unit.free_mask
         self.mu_det_mean = self.mu_det[fm].mean(axis=0) if fm.any() else self.mu_det.mean(axis=0)
@@ -440,8 +829,31 @@ class TransformerMode(ModeController):
         self._unit_bound_clipped = 0
         self._unit_bound_steps = 0
         self._unit_window_refs = 0
+        self._unit_disp_sum = 0.0
+        self._unit_disp_n = 0
+        self._unit_real_disp: List[float] = []
+        self._unit_ent: Dict[str, List[float]] = {h: [] for h in self.heads}
+        self._unit_entn: Dict[str, List[float]] = {h: [] for h in self.heads}
+        self._unit_recur_hits = 0
+        self._unit_recur_steps = 0
+        self._unit_recon: List[float] = []
         self._win_probe: Optional[Dict[str, Any]] = None
         self._xi_current_warned = False
+        if self.frag and self.tok_unit is not None:
+            self.frag_traces.append({
+                "unit": int(unit.index), "scope": "unit_start",
+                "position_source": pos_src, "positions": self.tok_unit["positions"],
+                "levels": self.tok_unit["levels"], "n_tokens": int(self.tok_unit["n_tokens"]),
+                "tokens_per_source": int(self.K_frag),
+                "value_offsets_frames": self.tok_unit["offsets"],
+                "value_offsets_seconds": [round(float(x) / float(self.fs), 4) for x in self.tok_unit["offsets"]],
+                "one_step_reach_d_xi": float(np.sqrt(self.tok_unit["reach2"])),
+                "mean_token_value_norm_d_xi": float(np.mean(self.tok_unit["value_norms"][1:]))
+                if len(self.tok_unit["value_norms"]) > 1 else 0.0,
+                "current_composition_reconstruction_dist2": float(self.tok_unit["reconstruction_dist2"]),
+                "unit_path_mean_step_displacement_d_xi": float(disp_unit),
+                "unit_path_bound_usage_rate": float(n_clip) / float(max(1, int(self.ctx_unit["S"]))),
+            })
         # re-openability (§9.4): the composition that reached the goal last time, carried onto this
         # unit's grid, against the context eq. (35)-(38) has just regenerated
         reopen = None
@@ -455,6 +867,10 @@ class TransformerMode(ModeController):
         S = int(self.ctx_unit["S"])
         self.attention_traces.append({
             "unit": int(unit.index), "grid_rows": int(J), "autoregression_steps": S,
+            "fragment_mode": bool(self.frag),
+            "token_count": int(self.tok_unit["n_tokens"]) if self.tok_unit is not None else int(self.M),
+            "mean_step_displacement_d_xi_unit_path": float(disp_unit),
+            "attention_entropy_unit_start": {h: float(self.att0[h]["entropy"]) for h in self.heads},
             "memory_tokens": int(self.n_events),
             "memory_token_counts": {"recent": int(pack0["n_recent"]), "digest": int(pack0["n_digest"])},
             "openness_mean_free": float(unit.mean_openness),
@@ -488,6 +904,14 @@ class TransformerMode(ModeController):
             "stride_analysis_rows": int(self.stride),
             "step_seconds_reference": self.step_ref,
             "dt_scale": self.dt_scale,
+            "fragment_mode": bool(getattr(self, "frag", False)),
+            "fragment_step_seconds_reference": self.frag_step_ref,
+            "fragment_dt_scale": self.frag_dt_scale,
+            "fragment_time_note": "in fragment mode one token value is what the realizer can do in ONE commit "
+                                  "step, so the eq. (37) increment is defined per model step "
+                                  "(fragment_step_seconds_reference = the model step, dt_scale = 1) instead of "
+                                  "per step_seconds_reference (0.1 s); the AR noise correlation, the bounding "
+                                  "cadence and the interpolation to the analysis rows are unchanged",
             "tau_noise_seconds": self.tau_noise,
             "ar_noise_rho": self.rho_t,
             "tau_memory_seconds": self.tau_H,
@@ -525,7 +949,8 @@ class TransformerMode(ModeController):
         for h, rel, n in (("similarity", "sync", 2), ("contrast", "counter", 1)):
             if h not in self.att0:
                 continue
-            sub = np.array(self.att0[h]["A_mean"][1:, 1:], dtype=np.float64)
+            # by_track is (M, M) in both vocabularies (fragment tokens aggregated by their source)
+            sub = np.array(self.att0[h]["by_track"][1:, 1:], dtype=np.float64)
             if sub.size == 0:
                 continue
             np.fill_diagonal(sub, -np.inf)
@@ -544,21 +969,24 @@ class TransformerMode(ModeController):
         """Full-unit ideal trajectories from the unit start (used only for the legal warm start)."""
         att = self.att0
         pack = self.ctx_unit["pack"]
-        meta0 = self._att_meta(att, pack)
+        meta0 = self._att_meta(att, pack, self.tok_unit)
         all_rows = np.arange(unit.J, dtype=np.int64)
         targets: List[Target] = []
         nd = len(self.heads) + self.d_xi
         for a in range(int(n_targets)):
             eps = ar1_noise(self.rng, int(self.ctx_unit["S"]), nd, self.rho_t)
-            coarse, n_clip = self._ar_path(self.ctx_unit, att, eps)
+            coarse, n_clip, disp, _nf = self._ar_path(self.ctx_unit, att, eps)
             xi_hat = fix_hold_rows(unit, self._interp(coarse, self.crows_unit, all_rows))
             meta = dict(meta0)
             meta.update({
                 "scope": "unit", "round": int(round_index),
-                "start_from": "unit_start_probe(unit.start_gains)",
+                "start_from": ("unit_start_probe(unit.start_gains) + fragment tokens at the "
+                               "continuous-clock positions" if self.frag else
+                               "unit_start_probe(unit.start_gains)"),
                 "model_steps": int(self.ctx_unit["S"]),
                 "excursion_clipped_steps": int(n_clip),
                 "bound_usage_rate": float(n_clip) / float(max(1, int(self.ctx_unit["S"]))),
+                "mean_step_displacement_d_xi": float(disp),
                 "mean_free_state": (xi_hat[unit.free_mask].mean(axis=0).tolist()
                                     if unit.free_mask.any() else xi_hat.mean(axis=0).tolist()),
             })
@@ -588,18 +1016,35 @@ class TransformerMode(ModeController):
             xi0 = self.xi_start.copy()
         pack = self._history_pack(unit, history)
         crows = self._coarse_rows(rows)
-        ctx = self._context(unit, crows, xi0, pack)
+        # --- fragment token bank for this window (current levels / current positions) ----------
+        tok = None
+        pos_src = "n/a"
+        if self.frag:
+            try:
+                pos_now, pos_src = self._positions_now(unit, int(rows[0]))
+                lv_now = self._levels.copy()
+                lv_now[0] = self._goal_level_at(unit, int(unit.centers[int(rows[0])]))
+                tok = self._fragment_tokens(unit, rows, xi0, pos_now, lv_now)
+            except Exception as e:  # noqa: BLE001
+                tok = None
+                if not self._frag_warned:
+                    self._frag_warned = True
+                    self.warnings.append(f"unit {unit.index}: fragment token bank unavailable ({e!r}); "
+                                         "this window uses the probe-token baseline")
+        ctx = self._context(unit, crows, xi0, pack, tok)
         att = self._attention(ctx)
         # audit D3.6: once per unit, how much the committed history moves the frozen window reference
         if self._win_probe is None and int(getattr(history, "n_updates", 0)) > 0:
-            self._win_probe = self._window_history_probe(unit, ctx, att, rows, crows, xi0, pack)
-        meta0 = self._att_meta(att, pack)
+            self._win_probe = self._window_history_probe(unit, ctx, att, rows, crows, xi0, pack, tok)
+        meta0 = self._att_meta(att, pack, tok)
         nd = len(self.heads) + self.d_xi
         fm_w = unit.free_mask[rows]
         out: List[Target] = []
         for a in range(max(1, int(n_proposals))):
+            # n proposals = n independent noise draws; the token bank, the attention and the
+            # deterministic part of eq. (37) are shared by all of them
             eps = ar1_noise(self.rng, int(ctx["S"]), nd, self.rho_t)
-            coarse, n_clip = self._ar_path(ctx, att, eps)
+            coarse, n_clip, disp, _nf = self._ar_path(ctx, att, eps)
             xi_hat = self.mu_det.copy()                     # unit-level path outside the window
             xi_hat[rows] = self._interp(coarse, crows, rows)
             xi_hat = fix_hold_rows(unit, xi_hat)
@@ -611,6 +1056,8 @@ class TransformerMode(ModeController):
                 "model_steps": int(ctx["S"]),
                 "excursion_clipped_steps": int(n_clip),
                 "bound_usage_rate": float(n_clip) / float(max(1, int(ctx["S"]))),
+                "mean_step_displacement_d_xi": float(disp),
+                "position_source": pos_src,
                 "mean_free_state": (xi_hat[rows][fm_w].mean(axis=0).tolist() if fm_w.any()
                                     else xi_hat[rows].mean(axis=0).tolist()),
             })
@@ -622,14 +1069,14 @@ class TransformerMode(ModeController):
 
     def _window_history_probe(self, unit: UnitContext, ctx: Dict[str, Any], att: Dict[str, Dict[str, Any]],
                               rows: np.ndarray, crows: np.ndarray, xi0: np.ndarray,
-                              pack: Dict[str, Any]) -> Dict[str, Any]:
+                              pack: Dict[str, Any], tok: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Window-level history intervention (audit D3.6, bounded: one extra deterministic path per
         unit): the same frozen window reference built from the committed history and from an empty
-        history, with everything else (unit, rows, realized start state, rng) identical."""
-        a, _ = self._ar_path(ctx, att, None)
+        history, with everything else (unit, rows, realized start state, token bank, rng) identical."""
+        a, _c, _d, _n = self._ar_path(ctx, att, None)
         pack_e = self._history_pack(unit, None, empty=True)
-        ctx_e = self._context(unit, crows, xi0, pack_e)
-        b, _ = self._ar_path(ctx_e, self._attention(ctx_e), None)
+        ctx_e = self._context(unit, crows, xi0, pack_e, tok)
+        b, _c2, _d2, _n2 = self._ar_path(ctx_e, self._attention(ctx_e), None)
         ra = self._interp(a, crows, rows)
         rb = self._interp(b, crows, rows)
         return {
@@ -679,8 +1126,42 @@ class TransformerMode(ModeController):
         mass = np.asarray(self.A_ema[self._ref_head()], dtype=np.float64).sum(axis=0)
         st["reference_order"] = [int(i) for i in np.argsort(-mass)]
         st["reference_mass"] = [float(x) for x in mass]
+        # --- fragment state: played positions / levels of the committed block -------------------
+        pos_played = stats.get("positions")
+        if pos_played is not None:
+            try:
+                pp = np.asarray(pos_played, dtype=np.int64).reshape(-1)
+                if pp.shape == (self.M,):
+                    self._pos_ref = (self._commit_end_frame(unit, rows) - 1, pp.copy())
+            except Exception:  # noqa: BLE001
+                pass
         # --- long-term memory digest (audit C7: short recent list + small long-term summary) ---
+        # (also folds the committed events' end_gain into the tracked current levels)
         n_new = self._update_digest(st, history, rho)
+        # --- statistics of the attention that actually produced the committed reference ---------
+        ent = meta.get("attention_entropy") or {}
+        entn = meta.get("attention_entropy_normalized") or {}
+        for h in self.heads:
+            if h in ent:
+                self._unit_ent[h].append(float(ent[h]))
+            if h in entn:
+                self._unit_entn[h].append(float(entn[h]))
+        recur = self._recurrence(meta, stats)
+        if recur.get("fraction") is not None:      # undefined without played source positions
+            self._unit_recur_hits += int(recur["hits"])
+            self._unit_recur_steps += int(recur["steps"])
+        disp = meta.get("mean_step_displacement_d_xi")
+        if isinstance(disp, (int, float)):
+            self._unit_disp_sum += float(disp)
+            self._unit_disp_n += 1
+        # the realizer's own composition change over this committed block, in the same units: the
+        # calibration target for the ideal's per-step displacement
+        xr = np.asarray(xi_rows, dtype=np.float64)
+        if xr.ndim == 2 and xr.shape[0] >= 2:
+            self._unit_real_disp.append(float(np.sqrt(max(0.0, float(self.analyzer.dist2(xr[-1], xr[0]))))))
+        ft = meta.get("fragment_tokens") or {}
+        if "current_composition_reconstruction_dist2" in ft:
+            self._unit_recon.append(float(ft["current_composition_reconstruction_dist2"]))
         st["n_memory_tokens"] = int(len(meta.get("memory_tokens") or []))
         st["last_commit"] = {"unit": int(unit.index), "rows": int(len(rows)), "dt_seconds": dt, "rho": rho,
                              "reference_hash": stats.get("reference_hash"),
@@ -706,6 +1187,17 @@ class TransformerMode(ModeController):
             "committed_fit_dist2": fitd,
             "top_memory_reference": top,
             "reference_order_after": st["reference_order"],
+            "attention_entropy": ent, "attention_entropy_normalized": entn,
+            "recurrence": recur,
+            "mean_step_displacement_d_xi": disp,
+            "fragment_tokens": ({"n_tokens": int(ft.get("n_tokens", 0)),
+                                 "one_step_reach_d_xi": ft.get("one_step_reach_d_xi"),
+                                 "src_position": ft.get("src_position"),
+                                 "rank": ft.get("rank"),
+                                 "current_composition_reconstruction_dist2":
+                                     ft.get("current_composition_reconstruction_dist2")} if ft else None),
+            "played_positions": (list(pos_played) if pos_played is not None else None),
+            "jumps": stats.get("jumps"),
         }
         if len(self.step_traces) < self._max_step_traces:
             self.step_traces.append(rec)
@@ -714,7 +1206,62 @@ class TransformerMode(ModeController):
                 "new_committed_events_digested": int(n_new),
                 "bound_usage_rate": float(meta.get("bound_usage_rate", 0.0)),
                 "committed_fit_dist2": fitd, "top_memory_reference": top,
+                "attention_entropy": ent, "recurrence": recur,
+                "mean_step_displacement_d_xi": disp,
+                "fragment_tokens": int(ft.get("n_tokens", 0)) if ft else 0,
                 "reference_scope": meta.get("scope", "unit")}
+
+    def _recurrence(self, meta: Dict[str, Any], stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Recurrence of the memory head over the committed block (FRAG_CONTRACT, Transformer §3).
+
+        A model step counts as recurrent when the memory head's top reference (the key with the
+        largest query-averaged attention at that step) is a committed event whose `src_position`
+        lies within `recurrence_tolerance_seconds` of the position the SAME track plays in the
+        committed block (`stats["positions"]`), measured circularly in the source."""
+        top = meta.get("memory_top_token_per_step") or []
+        toks = meta.get("memory_tokens") or []
+        pos_played = stats.get("positions")
+        out: Dict[str, Any] = {"steps": int(len(top)), "hits": 0, "fraction": None,
+                               "tolerance_seconds": float(self.recurrence_tol_s),
+                               "positions_attended": []}
+        if not top or not toks or pos_played is None:
+            # no played source positions (baseline realizer): the statistic is undefined, not zero
+            out["undefined"] = "no played source positions in stats"
+            return out
+        try:
+            pp = np.asarray(pos_played, dtype=np.int64).reshape(-1)
+        except Exception:  # noqa: BLE001
+            return out
+        if pp.shape != (self.M,):
+            return out
+        tol = float(self.recurrence_tol_s) * float(self.fs)
+        L = [int(x) for x in self.analyzer.source_lengths]
+        hits = 0
+        seen = []
+        for k in top:
+            k = int(k)
+            if not (0 <= k < len(toks)):
+                continue
+            t = toks[k]
+            tr = int(t.get("track", -1))
+            q = int(t.get("src_position", -1))
+            if tr < 0 or tr >= self.M or q < 0:
+                continue
+            d = abs(q - int(pp[tr])) % max(1, L[tr])
+            d = min(d, L[tr] - d)
+            hit = bool(d <= tol)
+            hits += int(hit)
+            seen.append({"track": tr, "event_src_position": q, "played_src_position": int(pp[tr]),
+                         "distance_seconds": round(float(d) / float(self.fs), 4), "recurrent": hit,
+                         "kind": str(t.get("kind", "recent"))})
+        out["hits"] = int(hits)
+        out["fraction"] = float(hits) / float(max(1, len(top)))
+        # bounded record of which source positions the memory head attended in this block
+        uniq: Dict[tuple, Dict[str, Any]] = {}
+        for s in seen:
+            uniq.setdefault((s["track"], s["event_src_position"]), s)
+        out["positions_attended"] = list(uniq.values())[:4]
+        return out
 
     def _ref_head(self) -> str:
         return "similarity" if "similarity" in self.heads else self.heads[0]
@@ -733,6 +1280,14 @@ class TransformerMode(ModeController):
                 continue
         n_ok = 0
         for e in new:
+            # fragment revision: the committed events carry the realized end level of their track,
+            # which keeps the mode's picture of the CURRENT levels exact between commits
+            tr_lv = int(e.get("track", -1))
+            if 0 <= tr_lv < self.M and "end_gain" in e:
+                try:
+                    self._levels[tr_lv] = float(np.clip(float(e["end_gain"]), 0.0, 1.0))
+                except Exception:  # noqa: BLE001
+                    pass
             k = np.asarray(e.get("xi_end"), dtype=np.float64)
             v = np.asarray(e.get("dxi"), dtype=np.float64)
             if k.shape != (self.d_xi,) or v.shape != (self.d_xi,):
@@ -742,7 +1297,8 @@ class TransformerMode(ModeController):
             cur = slots.get(tr)
             if cur is None:
                 cur = {"track": tr, "key": k.tolist(), "value": v.tolist(), "count": 0,
-                       "t_seconds": float(e.get("end_seconds", 0.0)), "unit": int(e.get("unit", -1))}
+                       "t_seconds": float(e.get("end_seconds", 0.0)), "unit": int(e.get("unit", -1)),
+                       "src_position": int(e.get("src_position", -1))}
             else:
                 pk = np.asarray(cur["key"], dtype=np.float64)
                 pv = np.asarray(cur["value"], dtype=np.float64)
@@ -752,6 +1308,9 @@ class TransformerMode(ModeController):
                 cur["value"] = ((1.0 - rho) * pv + rho * v).tolist()
                 cur["t_seconds"] = float(e.get("end_seconds", cur["t_seconds"]))
                 cur["unit"] = int(e.get("unit", cur.get("unit", -1)))
+                # the digest keeps the MOST RECENT played position of the track (a position is not
+                # a linear quantity, so it is carried, not averaged)
+                cur["src_position"] = int(e.get("src_position", cur.get("src_position", -1)))
             cur["count"] = int(cur.get("count", 0)) + 1
             slots[tr] = cur
             n_ok += 1
@@ -776,13 +1335,14 @@ class TransformerMode(ModeController):
                    str(t.get("kind", "recent")))
             acc = self._unit_mem_acc.setdefault(key, {
                 "event_unit": key[0], "track": key[1], "end_seconds": key[2], "kind": key[3],
+                "src_position": int(t.get("src_position", -1)),
                 "weight_sum": 0.0, "max_weight": 0.0, "commits": 0})
             acc["weight_sum"] += float(w[k])
             acc["max_weight"] = max(acc["max_weight"], float(w[k]))
             acc["commits"] += 1
             if top is None:
                 top = {"event_unit": key[0], "track": key[1], "end_seconds": key[2], "kind": key[3],
-                       "weight": float(w[k])}
+                       "src_position": int(t.get("src_position", -1)), "weight": float(w[k])}
         return top
 
     # ================================================================== memory write (eq. 27)
@@ -816,9 +1376,13 @@ class TransformerMode(ModeController):
         history.mode_state["transformer"] = st
         # --- traces ---------------------------------------------------------------------
         refs = sorted(self._unit_mem_acc.values(), key=lambda a: -a["weight_sum"])[:6]
+        L = [int(x) for x in self.analyzer.source_lengths]
         for a in refs:
             a["mean_weight"] = float(a["weight_sum"]) / float(max(1, a["commits"]))
             a["recency_seconds_at_unit_end"] = float(unit.seconds[-1] - a["end_seconds"])
+            q, tr = int(a.get("src_position", -1)), int(a.get("track", -1))
+            a["src_position_seconds"] = (round(float(q) / float(self.fs), 4)
+                                         if (q >= 0 and 0 <= tr < len(L)) else None)
         self.memory_traces.append({
             "unit": int(unit.index),
             "memory_tokens_at_unit_start": int(self.n_events),
@@ -844,14 +1408,61 @@ class TransformerMode(ModeController):
                          "target_id": pool[int(k)].target.id,
                          "total": float(totals[int(k)]), "softmax_weight": float(wsel[int(k)]),
                          "chosen": bool(int(k) == 0)} for k in order_w]})
+        bound_rate = (float(self._unit_bound_clipped) / float(self._unit_bound_steps)
+                      if self._unit_bound_steps else 0.0)
+        stats_unit = {
+            "fragment_mode": bool(self.frag),
+            "attention_entropy_mean": {h: (float(np.mean(self._unit_ent[h])) if self._unit_ent[h] else None)
+                                       for h in self.heads},
+            "attention_entropy_normalized_mean": {h: (float(np.mean(self._unit_entn[h])) if self._unit_entn[h]
+                                                      else None) for h in self.heads},
+            "attention_entropy_definition": "mean over queries and model steps of -sum_p A_ip log A_ip for the "
+                                            "attention that produced the COMMITTED window references (nats; the "
+                                            "normalized value divides by log(number of keys of that head))",
+            "recurrence_fraction": (float(self._unit_recur_hits) / float(self._unit_recur_steps)
+                                    if self._unit_recur_steps else None),
+            "recurrence_steps": int(self._unit_recur_steps),
+            "recurrence_definition": "fraction of model steps of the committed references whose top memory "
+                                     "reference is an event with src_position within %.1f s (circular in the "
+                                     "source) of the position that track plays in the committed block"
+                                     % float(self.recurrence_tol_s),
+            "bound_usage_rate": float(bound_rate),
+            "bound_usage_definition": "model steps of the window references whose pre-bound state left the ball "
+                                      "(the tanh squash is applied to every step; this counts the binding ones)",
+            "mean_ideal_displacement_per_step": (float(self._unit_disp_sum) / float(self._unit_disp_n)
+                                                 if self._unit_disp_n else None),
+            "mean_ideal_displacement_definition": "mean d_xi (= sqrt of the eq. (22) distance) between consecutive "
+                                                  "model steps of the committed window references, GOAL_HOLD steps "
+                                                  "excluded; d_xi units",
+            "mean_realized_displacement_per_commit": (float(np.mean(self._unit_real_disp))
+                                                      if self._unit_real_disp else None),
+            "mean_realized_displacement_definition": "mean d_xi between the first and the last row of each COMMITTED "
+                                                     "block (the realizer's own composition change per commit step) "
+                                                     "- the calibration target of the ideal's per-step displacement",
+            "current_composition_reconstruction_dist2_mean": (float(np.mean(self._unit_recon))
+                                                              if self._unit_recon else None),
+            "internal_iterations": {"model_steps_per_window_reference": int(self._unit_bound_steps)
+                                    // max(1, int(self._unit_window_refs)),
+                                    "window_references_built": int(self._unit_window_refs),
+                                    "commits": int(self._unit_commits),
+                                    "note": "one autoregression step per model step (%.3f s); no inner optimisation"
+                                            % float(self.model_step)},
+            "inherited_vs_reinitialised": {
+                "inherited_from_history": ["attention EMA", "reference order", "memory digest",
+                                           "committed events (memory keys)", "M_H correlation bias"],
+                "carried_across_units_on_the_mode": ["played source positions (advanced by the elapsed frames)"],
+                "reinitialised_per_unit": ["track levels (materials 0 at every unit start, goal = exposure "
+                                           "schedule)", "token bank", "autoregression state (xi_current)"],
+            },
+        }
         self.unit_traces.append({
             "unit": int(unit.index), "warm_start_target": chosen.target.id,
             "normalized_mode_error": float(chosen.normalized_mode_error),
             "memory_tokens_at_unit_start": int(self.n_events),
             "commits": int(self._unit_commits),
             "window_references_built": int(self._unit_window_refs),
-            "bound_usage_rate_window_references": (float(self._unit_bound_clipped) / float(self._unit_bound_steps)
-                                                   if self._unit_bound_steps else 0.0),
+            "bound_usage_rate_window_references": bound_rate,
+            "statistics": stats_unit,
             "reference_order_after": order,
             "probe_gains": self.probe_gains,
             "window_reference_history_effect": self._win_probe,
@@ -867,31 +1478,98 @@ class TransformerMode(ModeController):
         return np.concatenate(parts)
 
     def trace(self) -> Dict[str, Any]:
-        return {
-            "token_definition": {
-                "queries": "M track tokens at the current row (track 0 = goal), feature f_i(t)",
+        frag = bool(getattr(self, "frag", False))
+        tok_def: Dict[str, Any] = {
+            "vocabulary": "fragments" if frag else "material probes (baseline)",
+            "queries": "M track tokens at the current row (track 0 = goal), feature f_i(t) at the PLAYED "
+                       "position (unit.f_mat, written by the realizer before prepare_reference)",
+            "heads": list(self.heads),
+            "coefficients": {"alpha": {h: self.alpha[h] for h in self.heads},
+                             "sign": {h: self.sign[h] for h in self.heads},
+                             "alpha_G": self.alpha_G, "sigma_F": self.sigma_F,
+                             "tau_H_seconds": self.tau_H, "bias_scale": self.bias_scale,
+                             "noise_scale": (self.frag_noise_scale if frag else self.noise_scale),
+                             "cov_diag_floor": self.cov_sd ** 2,
+                             "tendency_gain": self.tendency_gain,
+                             "excursion_radius": (self.frag_excursion if frag else self.excursion)},
+            "memory_digest_slots": int(self.digest_slots),
+            "ignored_parameters": list(self.ignored_parameters),
+        }
+        if frag:
+            tok_def.update({
+                "keys_values": "goal token p=0 (value xi_G - xi_current, key = the goal track's own fragment "
+                               "features) + K fragment tokens per source i >= 1 + the committed memory events "
+                               "(value dxi, key phi(xi_end)) with their bounded per-track long-term digest",
+                "fragment_tokens_per_source": int(self.K_frag),
+                "fragment_token_selection": (
+                    "per source: the currently played fragment (always; the only self-reference masked for that "
+                    "query), then ceil((K-1)/2) positions whose clip-averaged fragment features an.frag_f[i] are "
+                    "closest to the features source i plays now (similarity-head relevance), then the remaining "
+                    "(K-1) positions whose clip-averaged band profile is farthest from the band block of the "
+                    "current composition xi_current[1:1+nb] (contrast-head relevance).  Fragments below "
+                    "an.silence_energy are pushed to the back of both lists."),
+                "fragment_token_value": (
+                    "nu_p = mean_offsets xi(fragment p at probe_foreground_gain %.3f, every other track at its "
+                    "current level and current position) - mean_offsets xi(no change), both EXACT mixtures via "
+                    "an.grams_at_positions / an.composition_from_grams (the batched form of "
+                    "an.fragment_composition), over %d offsets spread over the fragment clip; the absolute key "
+                    "composition is xi_key_p = xi_current + nu_p" % (self.fg_gain, self.n_frag_offsets)),
+                "fragment_value_offsets": int(self.n_frag_offsets),
+                "current_state": (
+                    "positions: stats['positions'] of the last committed block advanced by the elapsed frames "
+                    "(reference frame = the last committed window centre, so <= one 0.1 s fragment-grid step of "
+                    "quantisation); at unit start the continuous clock (window start) mod L_i.  Levels: the "
+                    "committed events' end_gain per material (exact), goal level from the exposure schedule "
+                    "(constant over the windowed search, which stops at the goal rise)."),
+                "bound": (
+                    "radial tanh squash of (mu - xi_ref) once per model step; xi_ref = (1 - o) xi_G + o * "
+                    "xi_current, radius = excursion_radius_fragment %.3f * o_j * max_p d_xi(nu_p, 0) over the "
+                    "FRAGMENT tokens * (1 + min(s, %d)) with s the model-step index inside the window: at "
+                    "openness o, after s+1 commit steps the ideal may be up to s+1 maximal one-step fragment "
+                    "moves away from the composition the realizer is actually at; at o = 0 the ball collapses "
+                    "onto xi_G, where eq. (37) has to end" % (self.frag_excursion, int(self.frag_growth_cap))),
+                "probe_gains_note": "the material probe compositions are still built (probe_gains below) but are "
+                                    "NOT the tokens in fragment mode; they only carry the baseline fallback",
+            })
+        else:
+            tok_def.update({
                 "keys_values": "goal token (xi_G - xi_current), material probes (nu_p), committed memory "
                                "events (dxi) + bounded per-track long-term digest",
                 "probe_gains": "foreground %.3f / background %.3f" % (self.fg_gain, self.bg_gain),
-                "heads": list(self.heads),
-                "coefficients": {"alpha": {h: self.alpha[h] for h in self.heads},
-                                 "sign": {h: self.sign[h] for h in self.heads},
-                                 "alpha_G": self.alpha_G, "sigma_F": self.sigma_F,
-                                 "tau_H_seconds": self.tau_H, "bias_scale": self.bias_scale,
-                                 "noise_scale": self.noise_scale, "cov_diag_floor": self.cov_sd ** 2,
-                                 "tendency_gain": self.tendency_gain, "excursion_radius": self.excursion},
-                "memory_digest_slots": int(self.digest_slots),
-                "ignored_parameters": list(self.ignored_parameters),
+                "bound": "radial tanh squash of (mu - xi_ref) at radius excursion_radius %.3f * o_j * "
+                         "max_p d_xi(key_p, key centroid), once per model step" % self.excursion,
+            })
+        return {
+            "token_definition": tok_def,
+            "statistics_definition": {
+                "attention_entropy": "per head, mean over queries and model steps of -sum_p A_ip log A_ip for the "
+                                     "attention that produced the COMMITTED window references (nats); the "
+                                     "normalized value divides by log(number of keys of that head)",
+                "recurrence_fraction": "fraction of model steps of the committed references whose top memory "
+                                       "reference (largest query-averaged memory attention at that step) is an "
+                                       "event whose src_position is within %.1f s, circularly in its source, of "
+                                       "the position that track plays in the committed block "
+                                       "(stats['positions'])" % float(self.recurrence_tol_s),
+                "bound_usage_rate": "model steps of the window references whose pre-bound state left the ball",
+                "mean_ideal_displacement_per_step": "mean d_xi between consecutive model steps of the committed "
+                                                    "window references (GOAL_HOLD steps excluded), d_xi units",
+                "current_composition_reconstruction_dist2": "d_xi^2 between the exact composition rebuilt from the "
+                                                            "tracked levels/positions and the realized xi_current "
+                                                            "handed to prepare_reference (accuracy of the state "
+                                                            "tracking; not used in the dynamics)",
             },
             "reference_policy": {
                 "unit": "propose(): full-unit path from the unit-start probe, warm start only",
                 "window": "prepare_reference(): restarted from the realized current composition, model-step "
                           "autoregression over the window rows, committed history only; frozen by the engine",
-                "adaptation": "observe_committed() only (attention EMA, reference order, memory digest); "
-                              "update() is not implemented and is never called",
+                "proposals": "n proposals = n independent AR(1) noise draws over the SAME token bank, attention "
+                             "and deterministic increment",
+                "adaptation": "observe_committed() only (attention EMA, reference order, memory digest, tracked "
+                              "levels/positions); update() is not implemented and is never called",
                 "hypotheses": "future states stay inside the proposal; the mode never writes history.events",
             },
             "time_scale": self._time_scale(),
+            "fragment_vocabulary": self.frag_traces,
             "attention_summary": self.attention_traces,
             "memory_references": self.memory_traces,
             "commit_steps": self.step_traces,

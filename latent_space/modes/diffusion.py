@@ -58,6 +58,73 @@ Audit-2 revision (§C4 / §D1), what changed in this module
 * D1.5  Unreachable parts of an ideal trajectory (band contributions no material supplies,
         negative contributions, contributions the gain bounds cannot produce) stay in the
         residual and are reported; they are never "realized" by breaking a gain constraint.
+
+Fragment-vocabulary revision (docs/FRAG_CONTRACT.md, 2026-09-16), what changed
+-----------------------------------------------------------------------------
+Active only in FRAGMENT MODE, i.e. when the analyzer carries the fragment bank
+(`getattr(analyzer, "frag_f", None) is not None`, built by `Analyzer.build_fragment_bank` when
+`hires.enabled` and `hires.fragment_vocabulary`) AND the engine has handed the mode the source
+PCM (`mode.sources = job.sources`, set in `engine.setup`).  Without both, every code path below
+is skipped and the module behaves exactly as before (the baseline config `dev/fixture_vae.json`
+produces a bit-identical render and gain curve).
+
+* F1  `prepare_reference` integrates the field as a TIME PROCESS in MUSICAL time instead of
+      running dimensionless Langevin iterations on window particles:
+
+        xi_{k+1} = xi_k - tau M_D grad E_D(xi_k) dt + sqrt(2 tau T dt) L_D eps_k
+
+      one step per model step (dt = `analysis.model_step_seconds`, 0.5 s in the fragment
+      fixture), starting from the realized current composition `xi_current` at the first window
+      row; the window rows (hop 0.1 s) are linear interpolations of the model-step knots, so the
+      reference is a piecewise-linear path on the same grid on which the realizer switches
+      levels (0.25 s Q5 ramp) and commits (0.5 s).  The `n` proposals are `n` INDEPENDENT NOISE
+      DRAWS of the same process from the same initial condition (they no longer differ in their
+      initialisation blend).  GOAL_HOLD knots and rows stay pinned to xi_G.  The field
+      coefficients (w_ij, s_ij, d_ij, beta, M_D) are still rebuilt from the committed history in
+      `prepare_reference` and frozen for the window -- unchanged.
+      Stability: explicit Euler on eq. (29) needs tau dt L < 2; at the tau the musical time scale
+      demands, one Euler step per model step diverges.  The DRIFT of a model step is therefore
+      integrated in `frag_drift_substeps` sub-steps of dt/n (same total drift in the small-step
+      limit, n times the stability margin) with a trust region of
+      `frag_max_displacement_per_step` / n on each sub-step; the FLUCTUATION stays one Wiener
+      increment per model step.  The binding fraction of the trust region is recorded.
+* F2  ANCHOR TERM: the fixed 0.4 / 0.1 probe mix on the continuous clock is replaced by the mean
+      of a small sample of RANDOM FRAGMENT COMPOSITIONS (`an.random_fragment_composition`,
+      `frag_anchor_samples` = 24 compositions x `frag_anchor_offsets` = 3 offsets) drawn once per
+      unit, per goal-exposure group (goal level 0 wherever `form.goal_exposure` caps it, 1 where
+      the goal is exposed, 0.5 in the middle of the deterministic rise).  The sample is drawn
+      from a generator seeded from (config seed, unit index): reproducible, it does not perturb
+      the Langevin noise stream, and the history-intervention probe sees the same anchor.  Every
+      draw (positions and levels) is recorded in the trace.
+      `lambda_phi` is unchanged configuration -- what changed is WHERE the anchor lives: it is no
+      longer a point of the continuous-clock probe family but the centre of the FRAGMENT SPACE,
+      i.e. of the same reachable set from which the realizer picks its jump candidates.  The
+      pair and triple terms are untouched, and so is their weight relative to the anchor.
+* F3  `frag_step` (tau) and `frag_temperature_per_openness` (T per unit of mean openness) are the
+      musical-time coefficients; `step` / `temperature_per_openness` keep their meaning for the
+      dimensionless iteration-time recursion that `propose()` (the warm start) still uses.  The
+      defaults (tau = 40, T_per_o = 0.0016, 10 drift sub-steps, trust region 1.5) were measured
+      on `dev/fixture_frag.json`: they give a mean per-step displacement of the ideal of
+      0.43 - 0.58 in d_xi metric units at o = 1 (a single material's full level change is ~0.33,
+      a playback jump ~0.36, a complete redraw of the fragment composition ~0.88), with a
+      per-step drift/noise ratio of 1.1 - 3.7 and a net (accumulated over a window) drift/noise
+      ratio well above 1 -- the field decides where the ideal goes, the temperature only spreads
+      the proposals.
+* F4  `window_error` and `relation_terms` are unchanged in form.  `observe_committed` keeps the
+      v / M_D re-estimation from the committed composition and adds one statistic: the field
+      energy of the committed block against the mean field energy of the unit's random fragment
+      sample, evaluated with the SAME field parameters on the same number of rows (per commit
+      step in `steps`, summarised per unit in `trace()['fragment_statistics_per_unit']`).
+* F5  `propose()` is unchanged (the baseline warm start); in fragment mode its particles are
+      initialised toward the fragment anchor instead of the probe anchor, because they use the
+      same `xi_anchor`.
+
+Configuration keys added by this revision are read with `.get()` only and are NOT in
+`config.DEFAULTS`, so no shared file was edited: `frag_step`, `frag_temperature_per_openness`,
+`frag_drift_substeps`, `frag_max_displacement_per_step`, `frag_anchor_samples`,
+`frag_anchor_offsets`, `frag_anchor_seed`, `frag_energy_probe_samples` (all under
+`mode_defaults.diffusion`).  They therefore cannot be set from a project JSON without adding
+them to `config.DEFAULTS` first (`load_config` rejects unknown keys).
 """
 from __future__ import annotations
 
@@ -231,6 +298,46 @@ class DiffusionMode(ModeController):
         # search can cover (drift grows like m0, fluctuation like sqrt(m0)).  Default: literal.
         self.m_scale = max(1e-9, float(p.get("search_matrix_scale", 1.0)))
 
+        # ---------------- fragment-vocabulary revision (FRAG_CONTRACT, Diffusion section) -------
+        # All of these are read with .get() only: none of them is in config.DEFAULTS, so no shared
+        # file was edited.  They are used ONLY when the analyzer carries a fragment bank and the
+        # engine has handed the mode the source PCM (`self.sources`); the baseline configuration
+        # (8 bands, no hires, no `frag_f`) never reaches any of this code.
+        #
+        # `frag_step` (tau) and `frag_temperature_per_openness` (T per unit openness) replace
+        # `step` / `temperature_per_openness` in the *musical-time* integration of
+        #     xi_{k+1} = xi_k - tau M_D grad E_D(xi_k) dt + sqrt(2 tau T dt) L_D eps
+        # over the window rows (dt = analysis.model_step_seconds).  `step`/`temperature_...`
+        # remain the coefficients of the dimensionless iteration-time recursion eq. (29) used by
+        # `propose()` (the warm start), which is unchanged.  Defaults are measured on
+        # dev/fixture_frag.json: see `_frag_time_process` and the trace key
+        # `ideal_displacement_per_model_step`.
+        self.frag_tau = float(p.get("frag_step", 40.0))
+        self.frag_T_per_o = float(p.get("frag_temperature_per_openness", 0.0016))
+        self.frag_anchor_samples = max(1, int(p.get("frag_anchor_samples", 24)))
+        self.frag_anchor_offsets = max(1, int(p.get("frag_anchor_offsets", 3)))
+        self.frag_anchor_seed = int(p.get("frag_anchor_seed", 104729))
+        self.frag_energy_probe_samples = max(1, int(p.get("frag_energy_probe_samples", 8)))
+        # explicit Euler on eq. (29) is only stable for tau * dt * L < 2 (L = largest curvature of
+        # E_D, dominated by the pair term in the c block); at the tau the musical time scale needs,
+        # one Euler step per model step diverges.  The DRIFT of one model step is therefore
+        # integrated in `frag_drift_substeps` sub-steps of dt / n (the total drift per model step
+        # is unchanged in the small-step limit, the stability limit is n times larger), while the
+        # FLUCTUATION stays one Wiener increment per model step -- so the reference is still a
+        # piecewise-linear path on the model-step grid, which is what the realizer can follow.
+        # `frag_max_displacement_per_step` is a trust region on the drift in d_xi units (a single
+        # material's full level change is ~0.33, a jump ~0.36 on the fixture): it is a guard, and
+        # the fraction of steps where it binds is recorded.
+        self.frag_substeps = max(1, int(p.get("frag_drift_substeps", 10)))
+        self.frag_max_step = float(p.get("frag_max_displacement_per_step", 1.5))
+        self.model_step_seconds = float(cfg["analysis"].get("model_step_seconds", 0.5))
+        self.sources = None                 # set by engine.setup (FRAG_CONTRACT); PCM of every track
+        self._frag = False                  # fragment mode active for the current unit
+        self.anchor_groups: Dict[float, np.ndarray] = {}
+        self.anchor_row_level = np.zeros(1)
+        self.anchor_meta: Dict[str, Any] = {}
+        self.frag_stats: List[Dict[str, Any]] = []
+
         self.A = max(1, int(md.get("diffusion_particles", 4)))
         self.steps_max = max(1, int(md.get("diffusion_internal_steps_max", 8)))
         self.max_rounds = max(1, int(cfg["search"]["max_search_rounds"]))
@@ -263,6 +370,7 @@ class DiffusionMode(ModeController):
         self.cG = np.zeros((1, self.M))
         self.o_bar = 0.0
         self.T_D = max(1e-12, self.T_per_o)
+        self.T_frag = max(1e-15, self.frag_T_per_o)
         self.init_weights: List[Dict[str, float]] = []
         self._prev_dir: Optional[np.ndarray] = None
         self._unit_ideal_cache: Optional[np.ndarray] = None
@@ -431,6 +539,276 @@ class DiffusionMode(ModeController):
                            unit.o[idx], unit.xi_goal[idx], self.Wv, ev,
                            self.lam_phi, self.lam_2, self.lam_3, self.lam_G, self.eps_D)
 
+    # ------------------------------------------------------------------ fragment vocabulary
+    def _fragment_ready(self) -> bool:
+        """Fragment mode: the analyzer carries the fragment bank AND the engine handed us the PCM."""
+        return (getattr(self.analyzer, "frag_f", None) is not None
+                and getattr(self, "sources", None) is not None)
+
+    def _anchor_offsets(self) -> np.ndarray:
+        """Row offsets (frames) of one fragment composition: `frag_anchor_offsets` analysis hops."""
+        return np.arange(self.frag_anchor_offsets, dtype=np.int64) * int(self.analyzer.hop)
+
+    def _goal_exposure_level(self, unit: UnitContext) -> np.ndarray:
+        """The goal track's intended level per row under `form.goal_exposure` (0 where it is
+        capped).  This mirrors the deterministic schedule the hires realizer builds (cap until
+        `goal_rise_seconds` before the goal time, Q5 rise to 1, 1 inside GOAL_HOLD, Q5 descent at
+        the head of a REOPEN); it is used only to decide with which goal level the random
+        fragment compositions of the anchor sample are drawn, so a coarse match is enough."""
+        ge = self.cfg["form"]["goal_exposure"]
+        names = np.asarray(unit.phase_names)
+        gl = np.zeros(unit.J, dtype=np.float64)
+        if str(ge.get("policy", "contract_only")) == "free":
+            gl[:] = 1.0                                    # uncapped: the goal may play like a material
+        else:
+            cap = float(ge.get("open_max", 0.0))
+            gl[:] = cap
+            gl[names == "INTRO"] = float(ge.get("intro_max", 0.0))
+            rise = max(1.0, float(self.cfg["hires"]["goal_rise_seconds"]) * float(unit.fs))
+            if unit.goal_arrival is not None:
+                s = np.clip((unit.centers - (float(unit.goal_arrival) - rise)) / rise, 0.0, 1.0)
+                q = s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
+                m = unit.centers < float(unit.goal_arrival)
+                gl[m] = gl[m] + (1.0 - gl[m]) * q[m]
+            re = unit.phase_frames.get("REOPEN")
+            if re is not None and unit.index > 0:
+                s = np.clip((unit.centers - float(re[0])) / rise, 0.0, 1.0)
+                q = s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
+                m = names == "REOPEN"
+                gl[m] = 1.0 + (gl[m] - 1.0) * q[m]
+        gl[unit.hold_mask] = 1.0
+        return np.clip(gl, 0.0, 1.0)
+
+    def _draw_anchor_sample(self, unit: UnitContext) -> Dict[str, Any]:
+        """FRAG_CONTRACT (Diffusion, anchor term): the fixed 0.4 / 0.1 probe mix is replaced by
+        the mean of a small sample of RANDOM FRAGMENT COMPOSITIONS drawn once per unit.
+
+        The sample is drawn per goal-exposure group (the goal level is 0 wherever the exposure
+        policy caps it, 1 where the goal is exposed, 0.5 in the middle of the rise) with a
+        generator seeded from (config seed, unit index) -- so it is reproducible, it does not
+        perturb the Langevin noise stream, and the history-intervention probe (which re-runs
+        `begin_unit` on a deep copy of the mode) sees exactly the same anchor.
+        """
+        an = self.analyzer
+        offs = self._anchor_offsets()
+        gl = self._goal_exposure_level(unit)
+        q = np.clip(np.round(gl * 2.0) / 2.0, 0.0, 1.0)              # groups {0, 0.5, 1}
+        rng = np.random.default_rng(int(self.cfg.get("seed", 0)) + self.frag_anchor_seed
+                                    + 7919 * int(unit.index))
+        groups: Dict[float, np.ndarray] = {}
+        meta: List[Dict[str, Any]] = []
+        for lev in sorted(float(x) for x in np.unique(q)):
+            rows = []
+            draws = []
+            for _k in range(self.frag_anchor_samples):
+                xi, _parts, info = an.random_fragment_composition(self.sources, rng, offs, goal_level=lev)
+                rows.append(np.asarray(xi, dtype=np.float64))
+                draws.append({"positions": [int(v) for v in info["positions"]],
+                              "levels": [round(float(v), 6) for v in info["levels"]]})
+            X = np.asarray(rows)                                     # (n, n_offsets, d_xi)
+            groups[lev] = X
+            flat = X.reshape(-1, self.d_xi)
+            meta.append({"goal_level": float(lev), "compositions": int(len(rows)),
+                         "offsets_per_composition": int(len(offs)),
+                         "rows": int(len(flat)),
+                         "mean_xi_phi_block": [float(v) for v in flat.mean(axis=0)[:self.d_phi]],
+                         "mean_xi_c_block": [float(v) for v in
+                                             flat.mean(axis=0)[self.d_phi:self.d_phi + unit.M]],
+                         "spread_mean_dist2_to_sample_mean": float(
+                             self.analyzer.dist2(flat, flat.mean(axis=0)[None, :]).mean()),
+                         "draws": draws})
+        self.anchor_groups = groups
+        self.anchor_row_level = q
+        xi_anchor = np.empty((unit.J, self.d_xi), dtype=np.float64)
+        for lev, X in groups.items():
+            xi_anchor[q == lev] = X.reshape(-1, self.d_xi).mean(axis=0)
+        self.anchor_meta = {
+            "source": "mean of random fragment compositions (an.random_fragment_composition)",
+            "seed": int(int(self.cfg.get("seed", 0)) + self.frag_anchor_seed + 7919 * int(unit.index)),
+            "offsets_frames": [int(v) for v in offs],
+            "offsets_seconds": [float(v) / float(unit.fs) for v in offs],
+            "goal_level_groups": [float(x) for x in sorted(groups)],
+            "rows_per_group": {str(float(lev)): int((q == lev).sum()) for lev in groups},
+            "groups": meta,
+            "lambda_phi_note": ("lambda_phi is unchanged configuration; what changed is WHERE the "
+                                "anchor lives: phi_anchor is no longer the phi block of the fixed "
+                                "0.4/0.1 probe mix on the continuous clock but the mean phi of a "
+                                "sample of exact fragment compositions, i.e. a point of the same "
+                                "reachable set the realizer picks from"),
+        }
+        return {"xi_anchor": xi_anchor, "meta": self.anchor_meta}
+
+    def _anchor_rows_for(self, level: float, n_rows: int, n_probe: int) -> List[np.ndarray]:
+        """`n_probe` random fragment compositions of the anchor sample, each tiled to `n_rows`
+        rows, for the "committed vs random" field-energy statistic."""
+        if not self.anchor_groups:
+            return []
+        lev = min(self.anchor_groups, key=lambda x: abs(x - float(level)))
+        X = self.anchor_groups[lev]
+        k = int(min(n_probe, len(X)))
+        take = np.arange(n_rows) % X.shape[1]
+        return [X[a][take] for a in range(k)]
+
+    def _fragment_sample_energy(self, P: FieldParams, n_rows: int, level: float) -> Dict[str, Any]:
+        """Mean field energy of the unit's random fragment sample evaluated with the SAME field
+        parameters as the composition it is compared with."""
+        probes = self._anchor_rows_for(level, n_rows, self.frag_energy_probe_samples)
+        if not probes:
+            return {"mean": None, "std": None, "n": 0}
+        e = np.array([field_energy(P, x) for x in probes])
+        return {"mean": float(e.mean()), "std": float(e.std()), "n": int(len(e)),
+                "min": float(e.min()), "max": float(e.max())}
+
+    def _rep_params(self, unit: UnitContext, coef: Dict[str, Any], row: int, k: int,
+                    n_rep: int) -> FieldParams:
+        """FieldParams of eq. (28) for ONE grid row `row` (position `k` inside the window's
+        coefficient arrays) replicated over `n_rep` independent proposal states, so that the
+        row-local gradient of all proposals is obtained with one `field_row_gradient` call."""
+        def rep(a):
+            return np.repeat(np.asarray(a, dtype=np.float64)[None, ...], n_rep, axis=0)
+        return FieldParams(self.d_phi, unit.M, self.d_xi, rep(self.phi_anchor[row]), rep(self.cG[row]),
+                           rep(coef["w"][k]), coef["s"], rep(coef["d"][k]), coef["beta"], self.triples,
+                           np.full(n_rep, float(unit.o[row])), rep(unit.xi_goal[row]), self.Wv,
+                           np.ones(n_rep, dtype=bool), self.lam_phi, self.lam_2, self.lam_3,
+                           self.lam_G, self.eps_D)
+
+    def _frag_time_process(self, unit: UnitContext, idx: np.ndarray, coef: Dict[str, Any],
+                           xi_current: np.ndarray, n_prop: int) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """FRAG_CONTRACT (Diffusion): integrate the field as a TIME PROCESS in musical time.
+
+            xi_{k+1} = xi_k - tau M_D grad E_D(xi_k) dt + sqrt(2 tau T dt) L_D eps_k
+
+        over the window, one step per model step (dt = `analysis.model_step_seconds`), starting
+        from the realized current composition `xi_current` at the first window row; the rows in
+        between are linear interpolations of the model-step knots (the realizer switches levels
+        on a 0.25 s ramp and commits every 0.5 s, so a reference that is piecewise linear between
+        model-step knots is inside what it can follow).  The `n_prop` proposals are `n_prop`
+        INDEPENDENT NOISE DRAWS of the same process from the same initial condition.  GOAL_HOLD
+        knots (and rows) are pinned to xi_G.  Openness scales drift and fluctuation row-wise
+        exactly as in eq. (29).
+        """
+        an = self.analyzer
+        hop_s = float(an.hop) / float(unit.fs)
+        dt_model = max(hop_s, float(self.model_step_seconds))
+        stride = max(1, int(round(dt_model / hop_s)))
+        n = int(len(idx))
+        kpos = np.arange(0, n, stride, dtype=np.int64)
+        if int(kpos[-1]) != n - 1:
+            kpos = np.append(kpos, n - 1)
+        K = int(len(kpos))
+        rows_k = idx[kpos]
+        hold_k = unit.hold_mask[rows_k]
+        goal_k = unit.xi_goal[rows_k]
+        o_k = unit.o[rows_k]
+        tau = self.frag_tau
+        T = self.T_frag
+        A = max(1, int(n_prop))
+
+        Z = np.repeat(np.asarray(xi_current, dtype=np.float64).ravel()[None, :], A, axis=0)
+        if bool(hold_k[0]):
+            Z[:] = goal_k[0]
+        X = np.empty((A, K, self.d_xi), dtype=np.float64)
+        X[:, 0] = Z
+        zero = np.zeros_like(Z)
+        disp: List[float] = []
+        disp_o: List[float] = []
+        dmag: List[float] = []
+        nmag: List[float] = []
+        acc_drift = np.zeros_like(Z)
+        acc_noise = np.zeros_like(Z)
+        steps = 0
+        clipped = 0
+        n_clip_checked = 0
+        for k in range(K - 1):
+            if self.window_steps_used >= self.window_step_budget_per_unit:
+                X[:, k + 1:] = X[:, k][:, None, :]
+                self.warnings.append(f"unit {unit.index}: window integration budget "
+                                     f"{self.window_step_budget_per_unit} reached")
+                break
+            dt = float(kpos[k + 1] - kpos[k]) * hop_s
+            ok = float(o_k[k])
+            P_k = self._rep_params(unit, coef, int(rows_k[k]), int(kpos[k]), A)
+            n_sub = self.frag_substeps
+            cap = (self.frag_max_step / float(n_sub)) if self.frag_max_step > 0.0 else 0.0
+            Zs = Z
+            bound = np.zeros(A, dtype=bool)
+            for _s in range(n_sub):
+                g = field_row_gradient(P_k, Zs)
+                sub = (-tau * (dt / n_sub) * ok) * self._apply_M_D(g)
+                if cap > 0.0:
+                    sn = np.sqrt(np.maximum(an.dist2(sub, zero), 0.0))
+                    over = sn > cap
+                    if over.any():
+                        sub = sub * np.where(over, cap / np.maximum(sn, 1e-12), 1.0)[:, None]
+                        bound |= over
+                Zs = Zs + sub
+            drift = Zs - Z
+            clipped += int(bound.sum())
+            n_clip_checked += A
+            eps = self.rng.standard_normal((A, self.d_xi))
+            noise = (float(np.sqrt(2.0 * tau * T * dt)) * ok) * self._apply_L_D(eps)
+            Zn = Z + drift + noise
+            if bool(hold_k[k + 1]):
+                Zn[:] = goal_k[k + 1]
+            step_d = np.sqrt(np.maximum(an.dist2(Zn, Z), 0.0))
+            disp += [float(v) for v in step_d]
+            if ok >= 0.25:                     # o-normalised figure only where openness is meaningful
+                disp_o += [float(v) / ok for v in step_d]
+            dmag.append(float(np.sqrt(np.maximum(an.dist2(drift, zero), 0.0)).mean()))
+            nmag.append(float(np.sqrt(np.maximum(an.dist2(noise, zero), 0.0)).mean()))
+            acc_drift += drift
+            acc_noise += noise
+            Z = Zn
+            X[:, k + 1] = Z
+            self.window_steps_used += 1
+            self.window_steps_total += 1
+            steps += 1
+
+        # --- linear interpolation of the model-step knots onto the window rows ---
+        t = np.arange(n, dtype=np.float64)
+        lo = np.clip(np.searchsorted(kpos, np.arange(n), side="right") - 1, 0, K - 2)
+        hi = lo + 1
+        span = (kpos[hi] - kpos[lo]).astype(np.float64)
+        wgt = np.where(span > 0, (t - kpos[lo]) / np.where(span > 0, span, 1.0), 0.0)[None, :, None]
+        Xr = (1.0 - wgt) * X[:, lo, :] + wgt * X[:, hi, :]
+        hold = unit.hold_mask[idx]
+        if hold.any():
+            Xr[:, hold, :] = unit.xi_goal[idx][hold]
+
+        d_mean = float(np.mean(disp)) if disp else 0.0
+        dr = float(np.mean(dmag)) if dmag else 0.0
+        nz = float(np.mean(nmag)) if nmag else 0.0
+        log = {
+            "integration": "musical time, forward Euler per model step, rows linearly interpolated",
+            "model_step_seconds": float(dt_model),
+            "rows_per_model_step": int(stride),
+            "model_steps": int(steps),
+            "knots": int(K),
+            "independent_noise_draws": int(A),
+            "initial_condition": "xi_current at the first window row (identical for every proposal)",
+            "ideal_displacement_per_model_step": d_mean,
+            "ideal_displacement_per_model_step_at_o1": float(np.mean(disp_o)) if disp_o else None,
+            "at_o1_knots": int(len(disp_o)),
+            "ideal_displacement_per_model_step_max": float(np.max(disp)) if disp else 0.0,
+            "ideal_displacement_per_second": d_mean / max(1e-9, dt_model),
+            "mean_drift_per_model_step": dr,
+            "mean_noise_per_model_step": nz,
+            "drift_noise_ratio": float(dr / nz) if nz > 1e-15 else None,
+            "net_drift_over_window": float(np.sqrt(np.maximum(an.dist2(acc_drift, zero), 0.0)).mean()),
+            "net_noise_over_window": float(np.sqrt(np.maximum(an.dist2(acc_noise, zero), 0.0)).mean()),
+            "net_drift_noise_ratio": (float(np.sqrt(np.maximum(an.dist2(acc_drift, zero), 0.0)).mean()
+                                            / max(1e-15, np.sqrt(np.maximum(an.dist2(acc_noise, zero), 0.0)).mean()))
+                                      if steps else None),
+            "mean_openness_on_knots": float(np.mean(o_k)),
+            "drift_substeps_per_model_step": int(self.frag_substeps),
+            "drift_trust_region": float(self.frag_max_step),
+            "drift_trust_region_binding_fraction": (float(clipped) / float(n_clip_checked)
+                                                    if n_clip_checked else 0.0),
+            "tau_frag_step": float(tau), "temperature_T_frag": float(T),
+            "displacement_units": "d_xi metric distance sqrt(analyzer.dist2) between consecutive knots",
+        }
+        return Xr, log
+
     # ------------------------------------------------------------------ conditioning (§7.1)
     def begin_unit(self, unit: UnitContext, history) -> None:
         J, M = unit.J, unit.M
@@ -451,10 +829,21 @@ class DiffusionMode(ModeController):
             fm = np.ones(J, dtype=bool)
         self.free_rows = fm
 
-        # --- phi_anchor: probe mix (goal 0.1, each material 0.4), analysis material only ---
+        # --- phi_anchor ----------------------------------------------------
+        # baseline: the phi block of the fixed probe mix (goal 0.1, each material 0.4).
+        # fragment mode (FRAG_CONTRACT): the mean of a small sample of random fragment
+        # compositions drawn once per unit -- the anchor now lives in the fragment space, i.e.
+        # inside the set the realizer can actually reach.  lambda_phi is unchanged.
         g_anchor = np.full(M, self.anchor_nongoal)
         g_anchor[0] = self.anchor_goal
-        xi_anchor, _ = unit.probe(g_anchor)
+        self._frag = self._fragment_ready()
+        self.anchor_groups = {}
+        self.anchor_meta = {}
+        if self._frag:
+            drawn = self._draw_anchor_sample(unit)
+            xi_anchor = drawn["xi_anchor"]
+        else:
+            xi_anchor, _ = unit.probe(g_anchor)
         self.xi_anchor = xi_anchor
         self.phi_anchor = xi_anchor[:, :self.d_phi]
 
@@ -487,6 +876,9 @@ class DiffusionMode(ModeController):
         # --- temperature and unit-level particles (warm-start reference) ---
         self.o_bar = float(unit.mean_openness)
         self.T_D = max(1e-12, self.T_per_o * self.o_bar)
+        # fragment mode: the musical-time process has its own tau / T (the iteration-time pair
+        # above still drives `propose()`, i.e. the warm-start reference, unchanged).
+        self.T_frag = max(1e-15, self.frag_T_per_o * self.o_bar)
         self._prev_dir = self._previous_direction(unit, st)
         self.particles = self._init_particles(unit, self._prev_dir)
         e0 = [field_energy(self.P, self.particles[a]) for a in range(self.A)]
@@ -497,6 +889,19 @@ class DiffusionMode(ModeController):
             "lambda_G": self.lam_G, "epsilon_D": self.eps_D, "step_tau": self.tau,
             "temperature_T_D": self.T_D, "mean_openness": self.o_bar, "kappa_E": self.kappa_E,
             "anchor_probe_gains": g_anchor.tolist(),
+            "anchor_source": ("fragment sample (FRAG_CONTRACT)" if self._frag
+                              else "fixed probe mix (baseline)"),
+            "anchor_fragment_sample": (dict(self.anchor_meta) if self._frag else None),
+            "fragment_mode": bool(self._frag),
+            "fragment_time_process": ({"step_tau_frag": self.frag_tau,
+                                       "temperature_T_frag": self.T_frag,
+                                       "temperature_per_openness": self.frag_T_per_o,
+                                       "model_step_seconds": float(self.model_step_seconds),
+                                       "note": ("prepare_reference integrates eq.(29) in MUSICAL time "
+                                                "(dt = model step) instead of dimensionless iterations; "
+                                                "propose() keeps the iteration-time recursion with "
+                                                f"step={self.tau}, T={self.T_D}")}
+                                      if self._frag else None),
             "phi_anchor_mean": self.phi_anchor[fm].mean(axis=0).tolist(),
             "w_ij_mean": self.w_bar.tolist(),
             "s_ij": self.s_ij.tolist(),
@@ -508,6 +913,8 @@ class DiffusionMode(ModeController):
                     "v": self.v_c.tolist(), "u_c_block": self.u[self.d_phi:self.d_phi + M].tolist()},
             "history_used": dict(coef["info"], previous_realized_blocks=bool(st.get("last_blocks"))),
             "initial_particle_field_energy": [float(x) for x in e0],
+            "unit_random_fragment_sample_field_energy": (
+                self._fragment_sample_energy(self.P, int(unit.J), 0.0) if self._frag else None),
             "particle_initialisation_weights": list(self.init_weights),
             "weights_are_fixed_configuration": ("the five lambda weights are configuration; they are "
                                                 "never re-scaled from the observed value share of the "
@@ -715,17 +1122,28 @@ class DiffusionMode(ModeController):
         self._win_P = self._params_for(unit, coef, idx)
         self._set_M_D(coef["v"], coef["aniso"] if coef["info"]["has_history"] else None)
 
-        X, weights = self._init_window_particles(unit, idx, xi_current)
-        e_init = [field_energy(self._win_P, X[a]) for a in range(self.A)]
-        done, drift, noise = self._langevin_window(unit, idx, X, self.window_steps_max)
+        n = max(1, min(int(n_proposals), self.A))
+        if self._frag:
+            # ---- fragment mode: the field is integrated as a TIME PROCESS over the window ----
+            X, tlog = self._frag_time_process(unit, idx, coef, xi_current, n)
+            weights = [{"initial_condition": "xi_current", "noise_draw": int(a)} for a in range(n)]
+            e_init = [float(field_energy(self._win_P, np.repeat(
+                np.asarray(xi_current, dtype=np.float64).ravel()[None, :], len(idx), axis=0)))]
+            done = int(tlog["model_steps"])
+            drift = float(tlog["mean_drift_per_model_step"])
+            noise = float(tlog["mean_noise_per_model_step"])
+        else:
+            X, weights = self._init_window_particles(unit, idx, xi_current)
+            e_init = [field_energy(self._win_P, X[a]) for a in range(self.A)]
+            done, drift, noise = self._langevin_window(unit, idx, X, self.window_steps_max)
+            tlog = None
         self.w_particles = X
-        energies = np.array([field_energy(self._win_P, X[a]) for a in range(self.A)])
-        order = np.argsort(energies)
+        energies = np.array([field_energy(self._win_P, X[a]) for a in range(len(X))])
+        order = np.arange(len(X)) if self._frag else np.argsort(energies)
 
         base_full = self._unit_ideal(unit)
-        n = max(1, min(int(n_proposals), self.A))
         targets: List[Target] = []
-        for k in range(n):
+        for k in range(min(n, len(X))):
             a = int(order[k])
             xi_hat = np.array(base_full, dtype=np.float64, copy=True)
             xi_hat[idx] = X[a]
@@ -736,7 +1154,11 @@ class DiffusionMode(ModeController):
                       "field_energy": float(energies[a]),
                       "field_energy_terms": field_breakdown(self._win_P, X[a]),
                       "internal_iterations": int(done),
-                      "rows_outside_window": "filled with the unit-level ideal (not scored)"}))
+                      "time_process": (dict(tlog) if tlog is not None else None),
+                      "rows_outside_window": ("integrated in musical time from xi_current; rows "
+                                              "outside the window filled with the unit-level ideal "
+                                              "(not scored)" if self._frag else
+                                              "filled with the unit-level ideal (not scored)")}))
 
         t0 = float(unit.seconds[idx[0]])
         self._win_log = {
@@ -746,12 +1168,14 @@ class DiffusionMode(ModeController):
             "window_rows": int(len(idx)), "free_rows": int(self._win_P.rows.sum()),
             "internal_iterations_this_window": int(done),
             "internal_iterations_unit_cumulative": int(self.window_steps_used),
-            "particles": int(self.A),
+            "particles": int(len(X)),
             "particle_field_energy_initial": [float(x) for x in e_init],
             "particle_field_energy_after": [float(x) for x in energies],
             "particle_field_energy_spread": float(energies.max() - energies.min()),
             "mean_abs_drift_per_iteration": float(drift),
             "mean_abs_noise_per_iteration": float(noise),
+            "fragment_mode": bool(self._frag),
+            "time_process": (dict(tlog) if tlog is not None else None),
             "initialisation_weights": weights,
             "xi_current_continuation_seconds": self.cont_seconds,
             "xi_current_row0_dist2": float(unit.analyzer.dist2(
@@ -879,6 +1303,36 @@ class DiffusionMode(ModeController):
         aniso = self._cov_anisotropy(getattr(history, "dc_cov", np.zeros((unit.M, unit.M))))
         self._set_M_D(v, aniso if history.has_history() else None)
 
+        # --- FRAG_CONTRACT statistic: field energy of the committed block vs. the mean field
+        #     energy of the unit's random fragment sample, on the SAME rows / field parameters --
+        frag_stat: Dict[str, Any] = {"available": False}
+        if self._frag:
+            lev = float(np.median(self.anchor_row_level[idx])) if len(self.anchor_row_level) == unit.J else 0.0
+            rnd = self._fragment_sample_energy(Pc, int(len(idx)), lev)
+            m = rnd.get("mean")
+            frag_stat = {
+                "available": m is not None,
+                "committed_field_energy": e_committed,
+                "random_fragment_sample_field_energy_mean": m,
+                "random_fragment_sample_field_energy_std": rnd.get("std"),
+                "random_fragment_sample_n": rnd.get("n"),
+                "goal_level_group": lev,
+                "difference_committed_minus_random": (None if m is None else float(e_committed - m)),
+                "ratio_committed_over_random": (None if not m else float(e_committed / m)),
+            }
+            self.frag_stats.append(dict(
+                frag_stat, unit=int(unit.index), window_index=int(max(0, self.window_index - 1)),
+                ideal_displacement_per_model_step=float(
+                    (self._win_log.get("time_process") or {}).get("ideal_displacement_per_model_step", 0.0)),
+                ideal_displacement_per_model_step_at_o1=(
+                    (self._win_log.get("time_process") or {}).get("ideal_displacement_per_model_step_at_o1")),
+                drift_noise_ratio=((self._win_log.get("time_process") or {}).get("drift_noise_ratio")),
+                mean_drift_per_model_step=float(
+                    (self._win_log.get("time_process") or {}).get("mean_drift_per_model_step", 0.0)),
+                mean_noise_per_model_step=float(
+                    (self._win_log.get("time_process") or {}).get("mean_noise_per_model_step", 0.0)),
+                net_drift_noise_ratio=((self._win_log.get("time_process") or {}).get("net_drift_noise_ratio"))))
+
         c_rows = np.asarray(parts_rows["c"], dtype=np.float64)
         dc_block = float(np.abs(c_rows[-1] - c_rows[0]).mean()) if len(c_rows) > 1 else 0.0
         summary = {
@@ -887,6 +1341,7 @@ class DiffusionMode(ModeController):
             "v_norm": float(np.linalg.norm(self.v_c)), "v_source": v_src,
             "M_D_kappa": float(self.kappa_eff), "dc_cov_anisotropy": float(self.aniso),
             "field_energy_committed": e_committed,
+            "field_energy_vs_random_fragments": frag_stat,
             "committed_rows": int(len(idx)),
             "committed_mean_abs_dc": dc_block,
             "history_commits": int(getattr(history, "commits", 0)),
@@ -938,6 +1393,8 @@ class DiffusionMode(ModeController):
                                 "evaluations": rst.get("evaluations"),
                                 "accepted": rst.get("accepted")},
             "committed_mean_abs_dc": dc_block,
+            "ideal_time_process": (dict(self._win_log.get("time_process") or {}) if self._frag else None),
+            "field_energy_vs_random_fragments": frag_stat,
             "v_norm": summary["v_norm"], "M_D_kappa": float(self.kappa_eff),
         })
         return {"v_norm": summary["v_norm"], "v_source": v_src,
@@ -946,7 +1403,13 @@ class DiffusionMode(ModeController):
                 "M_D_kappa": float(self.kappa_eff), "dc_cov_anisotropy": float(self.aniso),
                 "window_langevin_iterations": int(self._win_log.get("internal_iterations_this_window", 0)),
                 "window_error_evaluations": int(self._win_evals),
-                "committed_mean_abs_dc": dc_block}
+                "committed_mean_abs_dc": dc_block,
+                "ideal_displacement_per_model_step": float(
+                    (self._win_log.get("time_process") or {}).get("ideal_displacement_per_model_step", 0.0))
+                if self._frag else None,
+                "drift_noise_ratio": ((self._win_log.get("time_process") or {}).get("drift_noise_ratio")
+                                      if self._frag else None),
+                "field_energy_vs_random_fragments": frag_stat}
 
     # ------------------------------------------------------------------ deprecated hook
     def update(self, unit: UnitContext, history, realizations: Sequence[Realization],
@@ -1015,9 +1478,43 @@ class DiffusionMode(ModeController):
             "window_langevin_iterations": int(self.window_steps_used),
             "windows_prepared": int(self.window_index),
             "temperature_T_D": self.T_D,
+            "fragment_mode": bool(self._frag),
+            "fragment_statistics": self._fragment_unit_summary(int(unit.index)),
             "M_D_kappa": float(self.kappa_eff)})
 
     # ------------------------------------------------------------------ signature / trace
+    def _fragment_unit_summary(self, unit_index: int) -> Optional[Dict[str, Any]]:
+        """Per-unit summary of the fragment-mode statistics (FRAG_CONTRACT: mean per-step
+        displacement of the ideal, drift/noise ratio, committed field energy vs. random
+        fragment compositions)."""
+        rows = [s for s in self.frag_stats if int(s.get("unit", -1)) == int(unit_index)]
+        if not rows:
+            return None
+
+        def mean(key):
+            v = [float(s[key]) for s in rows if s.get(key) is not None]
+            return float(np.mean(v)) if v else None
+
+        rat = [float(s["ratio_committed_over_random"]) for s in rows
+               if s.get("ratio_committed_over_random") is not None]
+        below = [s for s in rows if s.get("difference_committed_minus_random") is not None
+                 and float(s["difference_committed_minus_random"]) < 0.0]
+        return {
+            "unit": int(unit_index), "commit_steps": int(len(rows)),
+            "ideal_mean_displacement_per_model_step": mean("ideal_displacement_per_model_step"),
+            "ideal_mean_displacement_per_model_step_at_o1": mean("ideal_displacement_per_model_step_at_o1"),
+            "mean_drift_per_model_step": mean("mean_drift_per_model_step"),
+            "mean_noise_per_model_step": mean("mean_noise_per_model_step"),
+            "drift_noise_ratio_mean": mean("drift_noise_ratio"),
+            "net_drift_noise_ratio_mean": mean("net_drift_noise_ratio"),
+            "committed_field_energy_mean": mean("committed_field_energy"),
+            "random_fragment_field_energy_mean": mean("random_fragment_sample_field_energy_mean"),
+            "committed_minus_random_mean": mean("difference_committed_minus_random"),
+            "committed_over_random_mean": float(np.mean(rat)) if rat else None,
+            "steps_with_committed_below_random": int(len(below)),
+            "units": "displacements are d_xi metric distances (sqrt of analyzer.dist2) per model step",
+        }
+
     def signature(self) -> np.ndarray:
         fm = self.free_rows
         parts = [self.s_ij.ravel(), self.d_bar.ravel(), np.asarray(self.beta, dtype=np.float64),
@@ -1037,6 +1534,11 @@ class DiffusionMode(ModeController):
             "relation_terms": self.relation_traces,
             "realized_mode_error": self.realized_traces,
             "steps": self.step_traces,
+            "fragment_statistics_per_step": list(self.frag_stats),
+            "fragment_statistics_per_unit": [
+                s for s in (self._fragment_unit_summary(u) for u in
+                            sorted({int(x.get("unit", -1)) for x in self.frag_stats}))
+                if s is not None],
             "field_term_breakdown_per_step": [
                 {"unit": s["unit"], "window_index": s["window_index"],
                  "musical_time_seconds": s["musical_time_seconds"],
@@ -1070,6 +1572,40 @@ class DiffusionMode(ModeController):
                 "relation_terms": "supplied from the same eq.(28) coefficients (audit C3)",
                 "unreachable_targets": "recorded as residual, never forced (audit D1.5)",
             },
+            "fragment_revision": {
+                "active": bool(self._frag),
+                "detection": ("analyzer.frag_f is not None AND mode.sources is set by the engine "
+                              "(docs/FRAG_CONTRACT.md)"),
+                "reference": ("time process in musical time over the window rows (see "
+                              "window_reference_preparation[*].time_process); n proposals = n "
+                              "independent noise draws from the same initial condition xi_current"),
+                "anchor": ("mean of random fragment compositions drawn once per unit per "
+                           "goal-exposure group; lambda_phi unchanged, but the anchor now lives in "
+                           "the fragment space (see field_parameters[*].anchor_fragment_sample)"),
+                "pair_and_triple_terms": "unchanged",
+                "window_error": "unchanged (eq. 30 on the window rows)",
+                "relation_terms": "unchanged",
+                "propose": "unchanged (baseline warm start; iteration-time recursion)",
+                "step_tau": float(self.frag_tau),
+                "temperature_per_openness": float(self.frag_T_per_o),
+                "drift_substeps": int(self.frag_substeps),
+                "trust_region_per_model_step": float(self.frag_max_step),
+                "anchor_samples_per_group": int(self.frag_anchor_samples),
+                "anchor_offsets": int(self.frag_anchor_offsets),
+                "inherited_vs_reinitialised": (
+                    "inherited across units: s_ij prior, last realized blocks, v / M_D and the "
+                    "dc_cov anisotropy (history.mode_state['diffusion']); re-initialised per unit: "
+                    "the random fragment anchor sample (own seeded generator), phi_anchor, the "
+                    "unit particles and both internal iteration counters. Re-initialised per "
+                    "window: the field coefficients (from the committed history) and the ideal "
+                    "path, which always restarts from the realized xi_current -- no internal "
+                    "coordinate system (basis) is carried in this mode"),
+                "internal_iterations_vs_musical_time": (
+                    "the fragment reference performs NO dimensionless iterations: its steps ARE "
+                    "model steps (window_langevin_iterations counts them, "
+                    "time_process.model_steps x frag_drift_substeps gradient evaluations each). "
+                    "propose() still counts dimensionless iterations in unit_langevin_iterations"),
+            },
             "equations": {
                 "field_energy": "eq.(28)", "langevin": "eq.(29)", "connection": "eq.(30)",
                 "window_error": "eq.(30) restricted to the commit window rows",
@@ -1078,11 +1614,24 @@ class DiffusionMode(ModeController):
                 "drift_convention": ("the drift uses the row-local gradient d e_t / d xi_t, i.e. the "
                                      "gradient of J * E_D; the factor J is absorbed into the positive "
                                      "definite search matrix so tau does not depend on the window count"),
-                "drift_noise_balance": ("at the default tau=step and T_D=temperature_per_openness*o_bar "
+                "drift_noise_balance": ("iteration-time path (propose / non-fragment prepare_reference): "
+                                        "at the default tau=step and T_D=temperature_per_openness*o_bar "
                                         "the per-step drift is a small fraction of the per-step "
                                         "fluctuation (see particle_summary.mean_abs_drift_per_step vs "
                                         "mean_abs_noise_per_step): the finite search stays in the "
-                                        "transient regime near its initialisation, as spec §7.2 permits"),
+                                        "transient regime near its initialisation, as spec §7.2 permits. "
+                                        "FRAGMENT MODE is deliberately the opposite: frag_step / "
+                                        "frag_temperature_per_openness are tuned so that the drift is at "
+                                        "least as large as the fluctuation per model step and much larger "
+                                        "once accumulated over a window (see fragment_statistics_per_unit: "
+                                        "drift_noise_ratio_mean and net_drift_noise_ratio_mean)"),
+                "fragment_time_process": ("fragment mode integrates eq.(29) as dxi = -tau M_D grad E_D dt + "
+                                          "sqrt(2 tau T dt) L_D dW in MUSICAL time, one step per "
+                                          "analysis.model_step_seconds over the window rows, from xi_current; "
+                                          "rows between the model-step knots are linear interpolations. The "
+                                          "drift of one model step is sub-stepped (frag_drift_substeps) with a "
+                                          "per-sub-step trust region for explicit-Euler stability; the "
+                                          "fluctuation is one Wiener increment per model step"),
             },
             "warnings": list(self.warnings),
             "units": self.unit_traces,

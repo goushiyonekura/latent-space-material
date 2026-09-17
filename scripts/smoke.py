@@ -371,6 +371,23 @@ def check_C(modes, fx, hard):
     curves_h = [TrackCurve.from_list(lst) for lst in th["curve_segments_per_track"]]
     ok(f"{modes[0]} hires: position maps restored from the trace", any(len(cv.clips) > 0 for cv in curves_h[1:]))
     REPORT["C"]["hires"] = {"status": rh["status"], "jumps": hc.get("position_jumps"), "switches": hc.get("switches")}
+    # fragment-vocabulary mode (24 bands, beam over multi-track jumps)
+    fcfg = json.loads(json.dumps(hcfg))
+    fcfg["hires"].update({"fragment_vocabulary": True, "jump_candidates": 3})
+    fcfg["analysis"] = {"spectral_bands": 24, "band_edges_hz": [0.0] + [float(round(x, 1)) for x in np.geomspace(40.0, 11025.0, 24)[:-1]],
+                        "model_step_seconds": 0.5}
+    fpath = os.path.join(DEV, "frag.json")
+    json.dump(fcfg, open(fpath, "w"))
+    jf = Job(load_config(fpath, modes[0]), os.path.join(DEV, "out", f"frag_{modes[0]}"), config_path=fpath, mode_override=modes[0])
+    t0 = time.time()
+    rf = jf.run()
+    tf = json.load(open(os.path.join(jf.output_dir, "state_trace.json")))
+    hcf = tf.get("hard_checks", {})
+    multi = any(len(st.get("jumps", {})) >= 2 for u in tf.get("units", []) for st in u.get("steps", []))
+    ok(f"{modes[0]} fragment mode: legal output, 24 bands, multi-track jumps examined",
+       rf["status"] in ("BEST_EFFORT", "VALID_APPROXIMATION") and hcf.get("all_passed") and tf["analysis"]["d_xi"] > 30,
+       f"{rf['status']} jumps={hcf.get('position_jumps')} multi-track steps={multi} {time.time() - t0:.0f}s")
+    REPORT["C"]["fragment"] = {"status": rf["status"], "jumps": hcf.get("position_jumps"), "multi_track_jump_steps": multi}
     # poor-approximation fixture: must still output BEST_EFFORT/VALID within bounded time
     mode = modes[0]
     job, cfg = job_for(hard, mode, "hard")

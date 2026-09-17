@@ -9,14 +9,16 @@ gain / position choices are improved against them, and committed blocks feed the
 Per commit step (commit_seconds):
   1. the actual material features at the *played* positions are written into the unit context
      rows of the window, then the mode prepares references; one is frozen (hash);
-  2. jump candidates per material: positions of its own source whose solo band profile is closest
-     to the reference mixture profile (plus one random exploration position), subject to a
-     minimum clip length; a small set of combinations (no jump, one track jumps) is examined;
-  3. for each combination the window Gram matrices are computed once from the actual PCM at
-     those positions (exact for the summed PCM under the window-centre gain hold); the end
+  2. jump candidates per material: fragment positions whose clip-averaged band profile (what
+     will sound for min_clip_seconds after the jump) is closest to the reference mixture
+     profile, plus one random exploration position, subject to the minimum clip length;
+     fragment mode: a beam search over tracks (multi-track jumps) scored on exact mixtures of a
+     row subset; v1 mode: no-jump plus single-track jumps;
+  3. for each surviving combination the window Gram matrices are computed once from the actual
+     PCM at those positions (exact for the summed PCM under the window-centre gain hold); the end
      levels of the materials (reached by a Q5 ramp of ramp_seconds) are improved by a
      finite-difference coordinate search on the joint objective; the best combination wins;
-  4. the first commit block is committed (history, mode observation, events).
+  4. the first commit block is committed (history, mode observation, events with positions).
 The goal track follows the exposure policy deterministically (0 in INTRO/OPEN, smooth rise over
 goal_rise_seconds at the end of CONTRACT, exact 1 in GOAL_HOLD, smooth descent in REOPEN).
 """
@@ -72,6 +74,9 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     max_sweeps = int(hz["max_sweeps"])
     n_ref = int(hz["n_reference_proposals"])
     w_rel = float(hz["w_relation"])
+    frag = bool(hz.get("fragment_vocabulary", False))
+    beam_width = max(1, int(hz.get("beam_width", 3)))
+    cand_rows = max(2, int(hz.get("candidate_rows", 8)))
     ge = cfg["form"]["goal_exposure"]
     goal_free = ge["policy"] == "free"
     open_cap = float(ge["open_max"]) if not goal_free else 1.0
@@ -80,7 +85,11 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     centers = unit.centers
     starts_all = centers - half
 
+    _src = getattr(mode, "sources", None)
+    mode.sources = None                        # do not deep-copy the PCM with the mode snapshot
     pre_mode = copy.deepcopy(mode)
+    mode.sources = _src
+    pre_mode.sources = _src
     pre_rng_state = copy.deepcopy(rng.bit_generator.state)
     mode.extra_candidate_evaluations = 0
     mode.begin_unit(unit, history)
@@ -111,9 +120,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             goal_segs.append(Segment("HOLD", cur, unit.end, g0, g0, "ZERO_HOLD" if g0 <= 1e-12 else "LEVEL_HOLD"))
     goal_curve = TrackCurve(goal_segs)
 
-    def gains_for(levels_end: np.ndarray, t: int, rows: np.ndarray, level_now: np.ndarray, curves_prev: List[TrackCurve]):
-        """Gains at the window rows: materials ramp from level_now to levels_end over [t, t+ramp) then hold;
-        the goal follows its schedule."""
+    def gains_for(levels_end: np.ndarray, t: int, rows: np.ndarray, level_now: np.ndarray):
         c = centers[rows]
         s = np.clip((c - t) / float(ramp), 0.0, 1.0)
         q = s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
@@ -121,7 +128,6 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         g[:, 0] = goal_curve.values(c)
         return g
 
-    # ---- search loop
     search_end = rise_start if rise_start is not None else unit.end
     t = unit.start
     level = state.level.copy()
@@ -136,12 +142,12 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     jumps_made = 0
     mat = [i for i in range(1, M)]
 
-    def positions_for(starts: np.ndarray, extra_jump: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    def positions_for(starts: np.ndarray, jumps: Optional[Dict[int, int]] = None) -> np.ndarray:
         pos = np.zeros((len(starts), M), dtype=np.int64)
         for i in range(M):
             cv = state.curve(i)
-            if extra_jump is not None and extra_jump[0] == i:
-                cv = TrackCurve([], [], list(state.clips[i]) + [Clip(int(t), int(extra_jump[1]))])
+            if jumps and i in jumps:
+                cv = TrackCurve([], [], list(state.clips[i]) + [Clip(int(t), int(jumps[i]))])
             pos[:, i] = cv.positions(starts, sources[i].shape[0])
         return pos
 
@@ -152,7 +158,6 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             t = w_end
             continue
         st = starts_all[rows]
-        # current materials at the played positions -> unit context rows (what the mode sees)
         pos_now = positions_for(st)
         f, S, chi = an.material_features_at(pos_now)
         unit.f_mat[rows] = f
@@ -165,50 +170,88 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             G0c, Gbc = an.grams_at_positions(sources, st[:1], pos_now[:1])
             xi_current = an.composition_from_grams(level[None, :], G0c, Gbc, S[:1])[0][0]
         props = mode.prepare_reference(unit, history, rows, xi_current, n_ref) or [R0]
-        # evaluate the current tail (levels held) against each proposal to pick the reference, then freeze
         G0n, Gbn = an.grams_at_positions(sources, st, pos_now)
-        g_hold = gains_for(level.copy(), t, rows, level, [])
+        g_hold = gains_for(level.copy(), t, rows, level)
         xi_hold, parts_hold = an.composition_from_grams(g_hold, G0n, Gbn, S)
 
-        def J_of(xi_w, parts_w, ref):
-            em = float(mode.window_error(unit, xi_w, rows, ref))
-            fm = unit.free_mask[rows]
-            fit = float(an.dist2(xi_w, ref.xi_hat[rows])[fm].mean()) if fm.any() else 0.0
-            ef = objective.e_form_rows(unit, xi_w, parts_w, rows)
-            jr = objective.j_relation(unit, parts_w, rows, rel_terms)
+        def J_of(xi_w, parts_w, ref, rws):
+            em = float(mode.window_error(unit, xi_w, rws, ref))
+            fm = unit.free_mask[rws]
+            fit = float(an.dist2(xi_w, ref.xi_hat[rws])[fm].mean()) if fm.any() else 0.0
+            ef = objective.e_form_rows(unit, xi_w, parts_w, rws)
+            jr = objective.j_relation(unit, parts_w, rws, rel_terms)
             J = objective.w_mode * objective.normalize_mode_error(job.mode_name, em) + objective.w_form * ef + w_rel * jr
             return {"J": J, "mode_error": em, "fit": fit, "penalty": em - fit, "e_form": ef, "j_rel": jr}
 
-        ev0 = [J_of(xi_hold, parts_hold, tg) for tg in props]
+        ev0 = [J_of(xi_hold, parts_hold, tg, rows) for tg in props]
         k_ref = int(np.argmin([e["J"] for e in ev0]))
         ref = props[k_ref]
         ref_hash = _hash_array(ref.xi_hat[rows])
         init = ev0[k_ref]
         evals = len(props)
-        # ---- combinations: no jump + one-track jumps toward the reference profile
-        combos: List[Tuple[Optional[Tuple[int, int]], np.ndarray, np.ndarray, np.ndarray]] = [(None, G0n, Gbn, S)]
+        ratios_t = ref.xi_hat[rows][:, 1:1 + an.nb].mean(axis=0)
+        # ---- jump candidates per material (clip-averaged fragment features in fragment mode)
+        cands: Dict[int, List[int]] = {}
         if bool(hz["position_jumps"]):
-            ratios_t = ref.xi_hat[rows][:, 1:1 + an.nb].mean(axis=0)     # normalized band profile of the reference
             for i in mat:
                 if t - state.last_jump[i] < min_clip:
                     continue
-                fbank = an.solo_f[i]
-                d = ((fbank[:, 1:1 + an.nb] - ratios_t[None, :]) ** 2).sum(axis=1)
-                d = d + 4.0 * (an.solo_E[i] < an.silence_energy)          # avoid silent positions
-                order = np.argsort(d)
-                cands = [int(an.solo_pos[i][k]) for k in order[: max(1, n_jump - 1)]]
-                cands.append(int(rng.integers(0, sources[i].shape[0])))   # exploration
-                for p in cands:
-                    pos_j = positions_for(st, (i, p))
-                    fj, Sj, _chij = an.material_features_at(pos_j)
-                    G0j, Gbj = an.grams_at_positions(sources, st, pos_j)
-                    combos.append(((i, p), G0j, Gbj, Sj))
+                cur_pos = int(pos_now[0, i])
+                if frag:
+                    lst = an.fragment_candidates(i, ratios_t, max(1, n_jump - 1), exclude_near=cur_pos,
+                                                 exclude_frames=int(2 * min_clip))
+                else:
+                    fbank = an.solo_f[i]
+                    d = ((fbank[:, 1:1 + an.nb] - ratios_t[None, :]) ** 2).sum(axis=1) + 4.0 * (an.solo_E[i] < an.silence_energy)
+                    lst = [int(an.solo_pos[i][k]) for k in np.argsort(d)[: max(1, n_jump - 1)]]
+                lst.append(int(rng.integers(0, sources[i].shape[0])))
+                cands[i] = lst
+        # ---- combinations
+        combos: List[Dict[int, int]] = [{}]
+        if frag and cands:
+            sub = rows[np.linspace(0, len(rows) - 1, min(cand_rows, len(rows))).astype(int)]
+            st_sub = starts_all[sub]
+
+            def score(jumps: Dict[int, int]) -> float:
+                pos_s = positions_for(st_sub, jumps)
+                _f, S_s, _c = an.material_features_at(pos_s)
+                G0s, Gbs = an.grams_at_positions(sources, st_sub, pos_s)
+                g = gains_for(level.copy(), t, sub, level)
+                xi_s, parts_s = an.composition_from_grams(g, G0s, Gbs, S_s)
+                return J_of(xi_s, parts_s, ref, sub)["J"]
+
+            beam: List[Tuple[Dict[int, int], float]] = [({}, score({}))]
+            evals += 1
+            for i in mat:
+                if i not in cands:
+                    continue
+                new_beam = list(beam)
+                for (jumps, _J) in beam:
+                    for p in cands[i]:
+                        j2 = dict(jumps)
+                        j2[i] = p
+                        new_beam.append((j2, score(j2)))
+                        evals += 1
+                new_beam.sort(key=lambda x: x[1])
+                beam = new_beam[:beam_width]
+            combos = [b[0] for b in beam]
+        elif cands:
+            for i, lst in cands.items():
+                for p in lst:
+                    combos.append({i: p})
+        # ---- level search on each surviving combination (full window rows)
         best = None
-        for (jump, G0w, Gbw, Sw) in combos:
+        for jumps in combos:
+            if jumps:
+                pos_j = positions_for(st, jumps)
+                _fj, S_w, _cj = an.material_features_at(pos_j)
+                G0w, Gbw = an.grams_at_positions(sources, st, pos_j)
+            else:
+                G0w, Gbw, S_w = G0n, Gbn, S
             lv = level.copy()
-            g = gains_for(lv, t, rows, level, [])
-            xi_w, parts_w = an.composition_from_grams(g, G0w, Gbw, Sw)
-            cur_ev = J_of(xi_w, parts_w, ref)
+            g = gains_for(lv, t, rows, level)
+            xi_w, parts_w = an.composition_from_grams(g, G0w, Gbw, S_w)
+            cur_ev = J_of(xi_w, parts_w, ref, rows)
             evals += 1
             step = level_step
             for _sweep in range(max_sweeps):
@@ -219,9 +262,9 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                         trial[i] = float(np.clip(trial[i] + sign * step, 0.0, 1.0))
                         if abs(trial[i] - lv[i]) < 1e-9:
                             continue
-                        g = gains_for(trial, t, rows, level, [])
-                        xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, Sw)
-                        ev = J_of(xi_t, parts_t, ref)
+                        g = gains_for(trial, t, rows, level)
+                        xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w)
+                        ev = J_of(xi_t, parts_t, ref, rows)
                         evals += 1
                         if ev["J"] < cur_ev["J"] - 1e-6:
                             cur_ev, lv, xi_w, parts_w = ev, trial, xi_t, parts_t
@@ -231,13 +274,12 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                     if step < 0.02:
                         break
             if best is None or cur_ev["J"] < best[0]["J"]:
-                best = (cur_ev, lv, jump, xi_w, parts_w, Sw)
-        fin, lv_best, jump, xi_w, parts_w, S_w = best
+                best = (cur_ev, lv, jumps, xi_w, parts_w)
+        fin, lv_best, jumps, xi_w, parts_w = best
         total_evals += evals
-        # ---- apply: clip jump, segments for [t, t+commit)
+        # ---- apply: clip jumps, segments for [t, t+commit)
         c_end = min(t + commit, search_end)
-        if jump is not None:
-            i, p = jump
+        for i, p in jumps.items():
             state.clips[i].append(Clip(int(t), int(p)))
             state.last_jump[i] = t
             jumps_made += 1
@@ -262,23 +304,27 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         c_committed[rows_c] = parts_c["c"]
         ref_store[rows_c] = ref.xi_hat[rows_c]
         ref_used[rows_c] = True
+        pos_end = positions_for(np.array([c_end - 1]), jumps)[0]
         events = []
         for i in mat:
-            if abs(lv_best[i] - level[i]) >= 0.02:
+            if abs(lv_best[i] - level[i]) >= 0.02 or i in jumps:
                 j1 = int(rows_c[-1])
                 j0 = int(prev_rows[-1]) if len(prev_rows) else int(rows_c[0])
+                xi0 = xi_committed[j0] if ref_used[j0] else xi_c[0]
                 events.append({"unit": unit.index, "track": i, "start_frame": int(t), "end_frame": int(min(t + ramp, c_end)),
                                "start_seconds": t / fs, "end_seconds": min(t + ramp, c_end) / fs,
                                "direction": int(np.sign(lv_best[i] - level[i])), "start_gain": float(level[i]),
                                "end_gain": float(lv_best[i]), "phase": str(unit.phase_names[j1]),
-                               "xi_start": xi_committed[j0].copy() if ref_used[j0] else xi_c[0].copy(),
-                               "xi_end": xi_c[-1].copy(), "dxi": (xi_c[-1] - (xi_committed[j0] if ref_used[j0] else xi_c[0])).copy(),
-                               "c_end": c_committed[j1].copy()})
+                               "xi_start": xi0.copy(), "xi_end": xi_c[-1].copy(), "dxi": (xi_c[-1] - xi0).copy(),
+                               "c_end": c_committed[j1].copy(), "jump": bool(i in jumps),
+                               "src_position": int(pos_end[i])})
         dt = (c_end - t) / float(fs)
         hlog = history.observe_committed(unit, rows_c, xi_c, parts_c, dt, events)
         mstat = mode.observe_committed(unit, history, rows_c, xi_c, parts_c, ref,
                                        {"refinement": {"initial": init, "final": fin}, "reference_hash": ref_hash,
-                                        "k_ref": k_ref, "n_proposals": len(props), "proposal_initial_J": [e["J"] for e in ev0]})
+                                        "k_ref": k_ref, "n_proposals": len(props), "proposal_initial_J": [e["J"] for e in ev0],
+                                        "positions": pos_end.tolist(), "jumps": {int(k): int(v) for k, v in jumps.items()},
+                                        "levels": lv_best.tolist(), "commit_end_frame": int(c_end)})
         n_commits += 1
         step_logs.append({"t_seconds": t / fs, "window_seconds": [t / fs, w_end / fs], "rows": int(len(rows)),
                           "committed_rows": int(len(rows_c)), "reference_id": ref.id, "reference_hash": ref_hash,
@@ -286,9 +332,10 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                           "reference_chosen_index": k_ref, "initial_joint_objective": init["J"], "final_joint_objective": fin["J"],
                           "initial_fixed_target_error": init["fit"], "final_fixed_target_error": fin["fit"],
                           "mode_term_breakdown": {"initial": init, "final": fin}, "evaluations": evals,
-                          "accepted_changes": int(np.sum(np.abs(lv_best - level) > 1e-9)), "jump": (list(jump) if jump else None),
-                          "combos": len(combos), "levels": lv_best.tolist(), "history_rho": hlog.get("rho"),
-                          "events_committed": len(events), "mode_observe": mstat})
+                          "accepted_changes": int(np.sum(np.abs(lv_best - level) > 1e-9)),
+                          "jumps": {int(k): int(v) for k, v in jumps.items()}, "combos": len(combos),
+                          "levels": lv_best.tolist(), "history_rho": hlog.get("rho"), "events_committed": len(events),
+                          "mode_observe": mstat})
         level = lv_best.copy()
         level[0] = float(goal_curve.values(np.array([c_end - 1]))[0]) if c_end > unit.start else level[0]
         t = c_end
@@ -323,7 +370,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     G0a, Gba = an.grams_at_positions(sources, starts_all, pos_all)
     xi, parts = an.composition_from_grams(gains, G0a, Gba, S_all)
     final = Candidate(id=20_000 + unit.index, plan=[], curves=curves, gains=gains, xi=xi, parts=parts,
-                      origin="hires:level+position search", parent_ids=[])
+                      origin=("hires:fragment beam + level search" if frag else "hires:level+position search"), parent_ids=[])
     final.e_form = objective.e_form(unit, xi, parts)
     final.e_hist = objective.e_hist(unit, xi, history)
     final.e_motion = 0.0
@@ -345,16 +392,17 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         "candidates_evaluated": 0, "budget": 0,
         "unit_reference": {"id": R0.id, "hash": _hash_array(R0.xi_hat), "proposals": len(props0)},
         "steps": step_logs, "commits": n_commits, "history_updates": n_commits, "step_evaluations": total_evals,
-        "jumps": jumps_made,
+        "jumps": jumps_made, "fragment_vocabulary": frag,
         "realization_summary": {
             "mean_initial_joint_objective": float(np.mean(J0s)) if J0s else None,
             "mean_final_joint_objective": float(np.mean(J1s)) if J1s else None,
             "mean_initial_fixed_target_error": float(np.mean(f0s)) if f0s else None,
             "mean_final_fixed_target_error": float(np.mean(f1s)) if f1s else None,
-            "steps_with_accepted_changes": int(sum(1 for sl in step_logs if sl["accepted_changes"] > 0 or sl["jump"])),
+            "steps_with_accepted_changes": int(sum(1 for sl in step_logs if sl["accepted_changes"] > 0 or sl["jumps"])),
             "total_accepted_changes": int(sum(sl["accepted_changes"] for sl in step_logs)),
             "full_grid_fixed_target_residual": full_resid,
-            "note": "hires: end levels and playback positions improved against frozen window references",
+            "note": ("fragment mode: multi-track jump beam on exact mixtures + level search against frozen window references"
+                     if frag else "hires: end levels and playback positions improved against frozen window references"),
         },
         "tolerance_met": bool(job._tolerance_quantity(chosen) <= float(cfg["search"]["normalized_mode_tolerance"])),
         "tolerance_applies_to": cfg["search"]["tolerance_applies_to"], "tolerance": float(cfg["search"]["normalized_mode_tolerance"]),

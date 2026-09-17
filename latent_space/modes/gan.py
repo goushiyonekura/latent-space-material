@@ -31,6 +31,19 @@ RE-INITIALISED (mu = 0, sigma = sigma_init) whenever the basis hash changes.  Wh
 and what was re-initialised is recorded in the trace and in `history.mode_state['gan']`.
 Coordinate transport (option 2 of the audit) is deliberately not implemented.
 
+Fragment-vocabulary revision (docs/FRAG_CONTRACT.md, 2026-09-16, user-authorised).  When the
+analyzer carries the fragment bank (`hires.fragment_vocabulary`) and the engine has handed the PCM
+to the mode (`engine.setup: mode.sources = job.sources`), the reference distribution of eq. (40) is
+no longer a set of Bank gain plans but a set of random FRAGMENT COMPOSITION TRAJECTORIES: a new
+random fragment composition (positions + material levels) every `min_clip_seconds` along the unit,
+built with `Analyzer.random_fragment_composition` on hop-spaced offsets, the goal level following
+the form's exposure policy per phase, GOAL_HOLD rows pinned to xi_goal.  Every reference is
+therefore an *exact* mixture of clips the realizer can actually play (its jump rate is the same
+`min_clip_seconds`), so the ideal side lives inside the enlarged reachable set instead of being
+tethered to continuous-clock probes.  Everything else - basis, parents, generator, discriminator,
+REINFORCE, the basis-change re-initialisation - is unchanged; with no fragment bank the mode falls
+back to the private Bank reference distribution (baseline configs behave exactly as before).
+
 The discriminator only ever sees *realized* compositions (computed from the actual summed PCM) and
 the reference compositions; ideal proposals are never scored by D.  Positive and negative examples
 come from the same unit, the same rows, the same phase grid and the same analysis scales, and only
@@ -116,8 +129,36 @@ class GANMode(ModeController):
 
         self.lim = MotionLimits.from_config(cfg["motion"], cfg["numerics"])
         self.hop_seconds = analyzer.hop / float(fs)
+        self.hop_frames = int(analyzer.hop)
         self.commit_seconds = float(cfg["realization"]["commit_seconds"])
+        if bool(cfg.get("hires", {}).get("enabled", False)):
+            # the engine commits in hires steps when the hires realizer is active, so the blocks D
+            # is standardised on are the blocks D is actually applied to (audit §8.1 intent)
+            self.commit_seconds = float(cfg["hires"].get("commit_seconds", self.commit_seconds))
         self.block_rows = max(1, int(round(self.commit_seconds / max(1e-9, self.hop_seconds))))
+        # ---------------------------------------------------------------- fragment vocabulary
+        # FRAG_CONTRACT: none of these keys exist in config.py DEFAULTS (a shared file that is not
+        # edited here), so they are read with .get and the chosen default is documented in the
+        # trace; a project file cannot set them until they are added to DEFAULTS (reported).
+        hz = dict(cfg.get("hires", {}) or {})
+        self.frag_n_refs = max(12, int(g("frag_references", 12)))       # contract: >= 12 per unit
+        self.frag_segment_seconds = float(g("frag_segment_seconds", float(hz.get("min_clip_seconds", 2.0))))
+        self.frag_offset_rows = int(g("frag_offset_rows", 0))           # 0 = the whole segment
+        self.frag_d_samples = max(1, int(g("frag_discriminator_samples", 2)))
+        # the D statistic is a measurement, not part of the generation: it draws from its own
+        # seeded stream so that recording it (or changing how many draws it takes) cannot move the
+        # job rng and therefore cannot change the music
+        self._stat_rng = np.random.default_rng(int(cfg.get("seed", 0)) + 977)
+        self.sources: Optional[Sequence[np.ndarray]] = None   # engine.setup: mode.sources = job.sources
+        self.goal_rise_seconds = float(hz.get("goal_rise_seconds", 12.0))
+        ge = dict(cfg["form"]["goal_exposure"])
+        self.goal_free = (ge.get("policy") == "free")
+        self.goal_open_cap = 1.0 if self.goal_free else float(ge.get("open_max", 0.0))
+        self.model_step_seconds = float(cfg["analysis"].get("model_step_seconds", self.hop_seconds))
+        self.model_step_rows = max(1, int(round(self.model_step_seconds / max(1e-9, self.hop_seconds))))
+        self.reference_source = "uninitialised"
+        self._frag_goal_levels: Optional[np.ndarray] = None
+        self._frag_bounds: List[Tuple[int, int]] = []
         # psi layout (eq. 42): fixed for the whole job, so phi carries over between units
         oi, oj = [], []
         for i in range(self.M):
@@ -164,6 +205,8 @@ class GANMode(ModeController):
         self.discriminator_traces: List[Dict[str, Any]] = []
         self.update_counts: List[Dict[str, Any]] = []
         self.reference_summaries: List[Dict[str, Any]] = []
+        self.statistics: List[Dict[str, Any]] = []       # per-unit D / displacement statistics
+        self._unit_stats: List[Dict[str, Any]] = []      # per-committed-step statistics
         self.lineage: List[Dict[str, Any]] = []
         self._g_buffer: List[Dict[str, Any]] = []
         self._pending: List[Dict[str, Any]] = []
@@ -237,7 +280,112 @@ class GANMode(ModeController):
         return pos + neg + self.l2 * float(phi @ phi), D_ref, D_gen
 
     # ================================================================== 10.2 reference set
-    def _draw_references(self, unit: UnitContext, history) -> List[Candidate]:
+    def fragment_mode(self) -> bool:
+        """True when the fragment vocabulary is available: the analyzer carries the fragment bank
+        (`hires.fragment_vocabulary`) and the engine has handed the PCM to the mode
+        (`engine.setup`: `mode.sources = job.sources`; FRAG_CONTRACT)."""
+        return (getattr(self.analyzer, "frag_f", None) is not None
+                and getattr(self, "sources", None) is not None)
+
+    def _goal_levels(self, unit: UnitContext) -> np.ndarray:
+        """The goal track's level on this unit's rows under the form's exposure policy - the same
+        deterministic schedule the hires realizer plays (hires.run_unit_hires): descend from the
+        inherited 1.0 to `open_max` over goal_rise_seconds when the unit opens in REOPEN, hold,
+        rise smoothly (Q5) to 1 over the last goal_rise_seconds before the goal arrival, 1 inside
+        GOAL_HOLD.  A reference must not expose the goal where the realizer cannot."""
+        c = unit.centers.astype(np.float64)
+        rise = max(1.0, self.goal_rise_seconds * float(self.fs))
+
+        def q5(s: np.ndarray) -> np.ndarray:
+            s = np.clip(s, 0.0, 1.0)
+            return s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
+
+        reopen = unit.phase_frames.get("REOPEN")
+        if reopen is not None and int(reopen[0]) <= int(unit.start):
+            # the unit inherits the goal at 1.0 from the preceding GOAL_HOLD and descends
+            desc = max(1.0, min(rise, float(reopen[1] - reopen[0])))
+            gl = 1.0 + (self.goal_open_cap - 1.0) * q5((c - float(unit.start)) / desc)
+        else:
+            gl = np.full(unit.J, 0.0 if not self.goal_free else float(self.goal_open_cap))
+        if unit.goal_arrival is not None:
+            t1 = float(unit.goal_arrival)
+            r0 = t1 - rise
+            up = c >= r0
+            if up.any():
+                gl[up] = gl[up] + (1.0 - gl[up]) * q5((c[up] - r0) / rise)
+        gl[unit.hold_mask] = 1.0
+        return np.clip(gl, 0.0, 1.0)
+
+    def _segment_bounds(self, unit: UnitContext) -> List[Tuple[int, int]]:
+        """The unit cut into clip-length row blocks: one new random fragment composition per block
+        (the realizer may jump a track once per `min_clip_seconds`, so this is its own time grid)."""
+        n = max(1, int(round(self.frag_segment_seconds / max(1e-9, self.hop_seconds))))
+        return [(a, min(a + n, unit.J)) for a in range(0, unit.J, n)]
+
+    def _fragment_reference(self, unit: UnitContext, bounds: List[Tuple[int, int]],
+                            gl: np.ndarray) -> Dict[str, Any]:
+        """One reference trajectory: a sequence of random fragment compositions along the unit.
+
+        Per block the exact mixture rows of "every track plays from its sampled position at its
+        sampled level" are computed for `k` hop-spaced offsets after the position (what actually
+        sounds after a jump); the remaining rows of the block are filled by linear interpolation
+        toward the next block's first sampled row (held after the last one).  GOAL_HOLD rows are
+        pinned to xi_goal.  Returns the (J, d) trajectory, the parts E_form needs and the record of
+        what was sampled."""
+        an = self.analyzer
+        xi = np.zeros((unit.J, self.d_xi))
+        E = np.zeros(unit.J)
+        filled = np.zeros(unit.J, dtype=bool)
+        segs: List[Dict[str, Any]] = []
+        for (a, b) in bounds:
+            k = (b - a) if self.frag_offset_rows <= 0 else min(b - a, self.frag_offset_rows)
+            k = max(1, k)
+            offsets = np.arange(k, dtype=np.int64) * self.hop_frames
+            xi_s, parts_s, meta = an.random_fragment_composition(
+                self.sources, self.rng, offsets, goal_level=float(gl[a]))
+            xi[a:a + k] = xi_s
+            E[a:a + k] = np.asarray(parts_s["E"], dtype=np.float64)
+            filled[a:a + k] = True
+            segs.append({"rows": [int(a), int(b)], "sampled_rows": int(k),
+                         "positions": [int(p) for p in meta["positions"]],
+                         "levels": [round(float(v), 4) for v in meta["levels"]],
+                         "goal_level": round(float(gl[a]), 4)})
+        idx = np.where(filled)[0]
+        miss = np.where(~filled)[0]
+        if len(miss) and len(idx):
+            for d in range(self.d_xi):
+                xi[miss, d] = np.interp(miss, idx, xi[idx, d])
+            E[miss] = np.interp(miss, idx, E[idx])
+        xi = fix_hold_rows(unit, xi)
+        gp = getattr(an, "goal_parts_all", None)
+        if gp is not None and unit.hold_mask.any():
+            E[unit.hold_mask] = np.asarray(gp["E"])[unit.idx][unit.hold_mask]
+        parts = {"c": an.split(xi)[1], "E": E}
+        return {"xi": xi, "parts": parts, "segments": segs, "sampled_rows": int(filled.sum()),
+                "interpolated_rows": int(len(miss))}
+
+    def _draw_references(self, unit: UnitContext, history) -> List[Dict[str, Any]]:
+        """The reference distribution of eq. (40).
+
+        Fragment mode: >= `frag_references` random fragment composition trajectories (seeded from
+        the job rng, recorded).  Otherwise: the private Bank reference distribution of the baseline
+        (legal random gain plans) - unchanged."""
+        if self.fragment_mode():
+            gl = self._goal_levels(unit)
+            bounds = self._segment_bounds(unit)
+            out: List[Dict[str, Any]] = []
+            for b in range(self.frag_n_refs):
+                r = self._fragment_reference(unit, bounds, gl)
+                r["e_form"] = float(self.objective.e_form(unit, r["xi"], r["parts"]))
+                r["e_hist"] = float(self.objective.e_hist(unit, r["xi"], history))
+                r["origin"] = "random_fragment_composition_sequence"
+                r["index"] = int(b)
+                out.append(r)
+            self._frag_goal_levels = gl
+            self._frag_bounds = bounds
+            # one reference = one fragment composition per block: that is what was evaluated
+            self.extra_candidate_evaluations = int(sum(len(r["segments"]) for r in out))
+            return out
         bank = Bank(unit, self.lim, self.cfg, self.rng, self.objective, history)
         refs: List[Candidate] = []
         attempts = 0
@@ -257,7 +405,28 @@ class GANMode(ModeController):
             self.warnings.append(
                 f"unit {unit.index}: only {len(refs)} legal reference trajectories "
                 f"(target {self.n_ref_target}); proceeding with a small reference distribution")
-        return refs
+        self._frag_goal_levels = None
+        self._frag_bounds = []
+        self.extra_candidate_evaluations = len(refs)
+        return [{"xi": c.xi, "e_form": float(c.e_form), "e_hist": float(c.e_hist),
+                 "origin": "bank_random_legal_plan", "index": int(k), "segments": [],
+                 "sampled_rows": int(unit.J), "interpolated_rows": 0} for k, c in enumerate(refs)]
+
+    def _reference_motion(self, unit: UnitContext) -> Dict[str, Any]:
+        """How fast the reference distribution itself moves, in d_xi units (eq. 22 per row pair):
+        mean d_xi^2 between free rows one model step apart and one analysis hop apart."""
+        fm = unit.free_mask
+        out: Dict[str, Any] = {"model_step_seconds": self.model_step_seconds,
+                               "model_step_rows": int(self.model_step_rows)}
+        for tag, s in (("step", int(self.model_step_rows)), ("hop", 1)):
+            vals = []
+            if unit.J > s:
+                m = fm[s:] & fm[:-s]
+                if m.any():
+                    vals = [float(self.analyzer.dist2(x[s:], x[:-s])[m].mean()) for x in self.ref_xi]
+            out[f"reference_{tag}_dist2_mean"] = float(np.mean(vals)) if vals else None
+            out[f"reference_{tag}_displacement_mean"] = float(np.mean(np.sqrt(vals))) if vals else None
+        return out
 
     # ================================================================== conditioning
     def begin_unit(self, unit: UnitContext, history) -> None:
@@ -273,9 +442,10 @@ class GANMode(ModeController):
 
         # ---------------------------------------------------------- (40) reference distribution
         refs = self._draw_references(unit, history)
-        self.extra_candidate_evaluations = len(refs)
-        self.ref_xi = np.stack([c.xi for c in refs])                      # (B, J, d)
-        j_ref = np.array([float(c.e_form) + 0.2 * float(c.e_hist) for c in refs])
+        self.reference_source = ("random_fragment_composition_trajectories" if self.fragment_mode()
+                                 else "bank_random_legal_gain_plans")
+        self.ref_xi = np.stack([r["xi"] for r in refs])                   # (B, J, d)
+        j_ref = np.array([float(r["e_form"]) + 0.2 * float(r["e_hist"]) for r in refs])
         z = -(j_ref - j_ref.min()) / self.tau_ref
         w = np.exp(z - z.max())
         self.ref_w = w / w.sum()
@@ -292,12 +462,41 @@ class GANMode(ModeController):
             self.warnings.append(f"unit {unit.index}: reference distribution has very low acoustic "
                                  f"diversity (mean pair dist2 {div:.2e}); proceeding")
         ent = float(-(self.ref_w * np.log(np.clip(self.ref_w, 1e-12, 1.0))).sum())
-        self.reference_summaries.append({
+        summary = {
             "unit": unit.index, "n_references": len(refs), "weights": self.ref_w.tolist(),
             "J_ref": j_ref.tolist(), "J_ref_definition": "E_form + 0.2 * E_hist (no discriminator)",
             "temperature": self.tau_ref, "weight_entropy_nats": ent,
-            "diversity_mean_pair_dist2": div,
-            "e_form": [float(c.e_form) for c in refs], "e_hist": [float(c.e_hist) for c in refs]})
+            "diversity_mean_pair_dist2": div, "source": self.reference_source,
+            "compositions_evaluated": int(self.extra_candidate_evaluations),
+            "e_form": [float(r["e_form"]) for r in refs], "e_hist": [float(r["e_hist"]) for r in refs]}
+        summary.update(self._reference_motion(unit))
+        if self.fragment_mode():
+            summary["fragment_sampling"] = {
+                "rule": ("one random fragment composition (positions + material levels) per "
+                         f"{self.frag_segment_seconds} s block; "
+                         + ("every row of a block is the exact mixture at hop-spaced offsets after "
+                            "the sampled positions (no interpolation)" if self.frag_offset_rows <= 0
+                            else f"the first {self.frag_offset_rows} rows of a block are the exact "
+                                 "mixture at hop-spaced offsets after the sampled positions, the "
+                                 "rest are linearly interpolated toward the next block's first row")),
+                "helper": "Analyzer.random_fragment_composition(sources, rng, offsets, goal_level)",
+                "rng": "the job rng (config.seed); the draws below are the record of this unit",
+                "segment_seconds": self.frag_segment_seconds,
+                "segment_rows": int(round(self.frag_segment_seconds / max(1e-9, self.hop_seconds))),
+                "offsets": f"arange(k) * {self.hop_frames} frames (hop {self.hop_seconds:.3f} s)",
+                "sampled_rows_per_reference": int(refs[0]["sampled_rows"]),
+                "interpolated_rows_per_reference": int(refs[0]["interpolated_rows"]),
+                "goal_level_policy": ("form.goal_exposure: REOPEN descent from 1 to "
+                                      f"{self.goal_open_cap}, Q5 rise to 1 over the last "
+                                      f"{self.goal_rise_seconds} s before the goal arrival, 1 in "
+                                      "GOAL_HOLD (held constant inside a block)"),
+                "goal_levels_per_block": [round(float(self._frag_goal_levels[a]), 4)
+                                          for (a, _b) in self._frag_bounds],
+                "hold_rows": "pinned to xi_goal (fix_hold_rows)",
+                "references": [{"index": int(r["index"]), "J_ref": float(j_ref[k]),
+                                "weight": float(self.ref_w[k]), "blocks": r["segments"]}
+                               for k, r in enumerate(refs)]}
+        self.reference_summaries.append(summary)
 
         # ---------------------------------------------------------- (41) joint basis B_ref
         self._build_basis(unit)
@@ -309,6 +508,7 @@ class GANMode(ModeController):
         self._g_buffer = []
         self._pending = []
         self._commit_records = []
+        self._unit_stats = []
         self._step_index = 0
         self._unit_counts = {"D": 0, "G": 0, "D_rejected": 0, "update_units": 0, "skipped_blocks": 0}
 
@@ -658,6 +858,8 @@ class GANMode(ModeController):
         # ------------------------------------------------ (44) loss of the committed composition
         d_act = float(_sigmoid(float(self.phi @ Psi_gen[0])))
         ell = float(-np.log(max(d_act, 1e-12)) + self.lambda_fit * fit + self.lambda_f * e_form)
+        # ------------------------------------------------ statistics (FRAG_CONTRACT)
+        stat = self._commit_statistics(unit, all_rows, d_act, reference, xi_all)
         b_i = int(last["meta"].get("b", 0)) if last["meta"] else 0
         w_i = np.asarray(last["meta"].get("w", np.zeros(self.r)), dtype=np.float64)
         if w_i.shape != (self.r,):
@@ -706,13 +908,70 @@ class GANMode(ModeController):
             "phi_norm": float(np.linalg.norm(self.phi)),
             "alpha": self.alphas().tolist(), "sigma_mean": float(np.exp(self.log_sigma).mean()),
             "order": "D step(s) then G step(s), reference and candidate fixed; never during realization",
+            "statistics": stat,
         }
         self._commit_records.append(dict(out, unit=int(unit.index)))
         self.step_traces.append({"unit": int(unit.index), "rows": [int(all_rows[0]), int(all_rows[-1])],
                                  "D_loss_before": out["D_loss_before"], "D_loss_after": out["D_loss_after"],
                                  "D_mean_ref": out["D_mean_ref"], "D_mean_actual": out["D_mean_actual"],
                                  "G_loss": ell, "baseline": float(baseline),
-                                 "updates_D": out["updates_D"], "updates_G": out["updates_G"]})
+                                 "updates_D": out["updates_D"], "updates_G": out["updates_G"],
+                                 "D_committed": stat.get("D_committed"),
+                                 "D_random_fragment_mean": stat.get("D_random_fragment_mean"),
+                                 "ideal_displacement_per_step": stat.get("ideal_displacement_per_step")})
+        return out
+
+    # ------------------------------------------------------------------ statistics (FRAG_CONTRACT)
+    def _commit_statistics(self, unit: UnitContext, all_rows: np.ndarray, d_act: float,
+                           reference: Optional[Target], xi_all: np.ndarray) -> Dict[str, Any]:
+        """Per committed step, with the discriminator as it stands after this step's D update:
+
+          * D of the committed realized composition vs D of FRESH random fragment compositions
+            drawn at the same rows (the contract's GAN statistic).  The fresh draws are new
+            samples of the reference distribution, never seen by D, and they are not used for any
+            update - a pure read-out of what D has learned to separate;
+          * the mean per-step displacement of the ideal: d_xi^2 (eq. 22) between the frozen
+            reference's rows one model step apart, starting at this block's first row, and the
+            same quantity per analysis hop, plus the realized composition's hop displacement.
+        """
+        out: Dict[str, Any] = {"D_committed": float(d_act), "rows": int(len(all_rows))}
+        j0 = int(all_rows[0])
+        if reference is not None:
+            xi_hat = np.asarray(reference.xi_hat, dtype=np.float64)
+            s = int(self.model_step_rows)
+            j1 = j0 + s
+            if j1 <= unit.J - 1:            # a full model step only, so the mean is not biased low
+                d2 = float(self.analyzer.dist2(xi_hat[j1], xi_hat[j0]))
+                out["ideal_step_dist2"] = d2
+                out["ideal_displacement_per_step"] = float(np.sqrt(max(d2, 0.0)))
+            rmeta = reference.meta or {}
+            rr = rmeta.get("rows")
+            if rr and int(rr[1]) > int(rr[0]):
+                w0, w1 = int(rr[0]), int(rr[1]) + 1
+                fmw = unit.free_mask[w0:w1]
+                if fmw[1:].any():
+                    dh = self.analyzer.dist2(xi_hat[w0 + 1:w1], xi_hat[w0:w1 - 1])
+                    out["ideal_hop_dist2_window"] = float(dh[fmw[1:]].mean())
+        if len(xi_all) > 1:
+            fmc = unit.free_mask[all_rows]
+            dh = self.analyzer.dist2(xi_all[1:], xi_all[:-1])
+            if fmc[1:].any():
+                out["realized_hop_dist2"] = float(dh[fmc[1:]].mean())
+        if self.fragment_mode():
+            gl = self._frag_goal_levels
+            level = float(gl[j0]) if gl is not None else 0.0
+            offsets = np.arange(len(all_rows), dtype=np.int64) * self.hop_frames
+            d_rand: List[float] = []
+            for _ in range(self.frag_d_samples):
+                xi_r, _p, _m = self.analyzer.random_fragment_composition(
+                    self.sources, self._stat_rng, offsets, goal_level=level)
+                d_rand.append(float(self.discriminator_score(xi_r, all_rows)))
+            out["D_random_fragment"] = [float(x) for x in d_rand]
+            out["D_random_fragment_mean"] = float(np.mean(d_rand))
+            out["D_gap_committed_minus_random"] = float(d_act - np.mean(d_rand))
+            out["n_random_fragment_draws"] = int(len(d_rand))
+            out["random_fragment_goal_level"] = level
+        self._unit_stats.append(dict(out, unit=int(unit.index), row0=j0))
         return out
 
     def _d_steps(self, Psi_ref: np.ndarray, w_ref: np.ndarray, Psi_gen: np.ndarray,
@@ -843,6 +1102,49 @@ class GANMode(ModeController):
         return {"skipped": "mode.update() is not called; the GAN D/G update unit runs in "
                            "observe_committed on the committed composition"}
 
+    def _unit_statistics(self, unit: UnitContext, chosen: Realization) -> Dict[str, Any]:
+        """Per-unit summary of the committed-step statistics (contract: D of the committed
+        composition vs D of fresh random fragment compositions; mean per-step displacement of the
+        ideal in d_xi units)."""
+        st = self._unit_stats
+
+        def col(key: str) -> List[float]:
+            return [float(s[key]) for s in st if isinstance(s.get(key), (int, float))]
+
+        d_c, d_r = col("D_committed"), col("D_random_fragment_mean")
+        disp, d2 = col("ideal_displacement_per_step"), col("ideal_step_dist2")
+        hop_i, hop_r = col("ideal_hop_dist2_window"), col("realized_hop_dist2")
+        paired = [(float(s["D_committed"]), float(s["D_random_fragment_mean"])) for s in st
+                  if isinstance(s.get("D_random_fragment_mean"), float)]
+        out: Dict[str, Any] = {
+            "unit": int(unit.index), "steps": len(st),
+            "mode": ("fragment" if self.fragment_mode() else "baseline_bank"),
+            "reference_source": self.reference_source,
+            # --- contract statistic: D(committed) vs D(fresh random fragment compositions)
+            "D_committed_mean": float(np.mean(d_c)) if d_c else None,
+            "D_random_fragment_mean": float(np.mean(d_r)) if d_r else None,
+            "D_gap_committed_minus_random_mean": (float(np.mean([a - b for a, b in paired]))
+                                                  if paired else None),
+            "D_committed_above_random_fraction": (float(np.mean([1.0 if a > b else 0.0 for a, b in paired]))
+                                                  if paired else None),
+            "D_random_fragment_draws_per_step": (int(self.frag_d_samples) if self.fragment_mode() else 0),
+            # --- contract statistic: movement of the ideal
+            "mean_ideal_displacement_per_step": float(np.mean(disp)) if disp else None,
+            "mean_ideal_dist2_per_step": float(np.mean(d2)) if d2 else None,
+            "mean_ideal_dist2_per_hop": float(np.mean(hop_i)) if hop_i else None,
+            "mean_realized_dist2_per_hop": float(np.mean(hop_r)) if hop_r else None,
+            "displacement_units": "d_xi^2 (eq. 22, free rows); *_displacement = sqrt of it",
+            "model_step_seconds": self.model_step_seconds,
+            "D_chosen_block_mean": float(self._d_block_mean(chosen.candidate.xi)),
+            "D_reference_block_mean": float(np.mean([self._d_block_mean(x) for x in self.ref_xi])),
+        }
+        rs = self.reference_summaries[-1] if self.reference_summaries else {}
+        for k in ("reference_step_dist2_mean", "reference_hop_dist2_mean",
+                  "reference_step_displacement_mean"):
+            if k in rs:
+                out[k] = rs[k]
+        return out
+
     # ================================================================== 10.6 lineage
     def end_unit(self, unit: UnitContext, history, chosen: Realization, alternatives) -> None:
         meta = chosen.target.meta or {}
@@ -878,6 +1180,9 @@ class GANMode(ModeController):
                              "alternatives_kept": len(alts)})
         for k in self._total_counts:
             self._total_counts[k] += self._unit_counts[k]
+        stats = self._unit_statistics(unit, chosen)
+        self.statistics.append(dict(stats, per_step=[
+            {k: v for k, v in s.items() if k != "D_random_fragment"} for s in self._unit_stats]))
         gen = [{"parent_id": str(pid), "origin": str(org), "mu": self.mu[b].tolist(),
                 "log_sigma": self.log_sigma[b].tolist(),
                 "sigma": np.exp(self.log_sigma[b]).tolist(),
@@ -905,7 +1210,9 @@ class GANMode(ModeController):
                 "unit": int(unit.index), "n": int(rs["n_references"]),
                 "max_weight": float(max(rs["weights"])), "entropy_nats": float(rs["weight_entropy_nats"]),
                 "mean_J_ref": float(np.mean(rs["J_ref"])),
+                "source": str(rs.get("source", "")),
                 "diversity_mean_pair_dist2": float(rs["diversity_mean_pair_dist2"])},
+            "statistics": {k: v for k, v in stats.items() if k != "per_step"},
             "lineage": [{"unit": int(l["unit"]), "chosen_parent_id": str(l["chosen_parent_id"]),
                          "chosen_candidate_id": int(l["chosen_candidate_id"]),
                          "new_parent_id": str(l["new_parent_id"])} for l in self.lineage][-8:],
@@ -955,11 +1262,13 @@ class GANMode(ModeController):
             "updates_D": int(self._unit_counts["D"]), "updates_G": int(self._unit_counts["G"]),
             "skipped_blocks": int(self._unit_counts["skipped_blocks"]),
             "n_references": int(rs["n_references"]),
+            "reference_source": self.reference_source,
             "history_parents_used": int(self.n_history_parents_used),
             "inheritance": dict(self.inheritance),
             "hints": [list(h) for h in getattr(self, "_last_hints", [])],
             "history_parent_realization_gap_mean_dist2": (float(np.mean(gaps)) if gaps else None),
-            "history_parent_windows": len(gaps)})
+            "history_parent_windows": len(gaps),
+            "statistics": {k: v for k, v in stats.items() if k != "per_step"}})
         self._pending = []
 
     # ================================================================== checks / trace
@@ -975,6 +1284,43 @@ class GANMode(ModeController):
             "update_counts": self.update_counts,
             "lineage": self.lineage,
             "reference_summary": self.reference_summaries,
+            "statistics": self.statistics,
+            "reference_distribution": {
+                "source": self.reference_source,
+                "fragment_vocabulary_available": bool(self.fragment_mode()),
+                "rule": ("eq. 40 over random FRAGMENT composition trajectories: a new random "
+                         "fragment composition (positions + material levels) every "
+                         f"{self.frag_segment_seconds} s along the unit, exact mixture rows at "
+                         "hop-spaced offsets after the sampled positions (what sounds after a "
+                         "jump)"
+                         + ("" if self.frag_offset_rows <= 0 else
+                            f", only the first {self.frag_offset_rows} rows of a block sampled and "
+                            "the rest linearly interpolated")
+                         + ", goal level from the form's exposure policy per phase, GOAL_HOLD "
+                           "rows = xi_goal"
+                         if self.fragment_mode() else
+                         "eq. 40 over the private Bank reference distribution (random legal gain "
+                         "plans) - the baseline behaviour when no fragment bank exists"),
+                "n_references_per_unit": (int(self.frag_n_refs) if self.fragment_mode()
+                                          else int(self.n_ref_target)),
+                "weights": "r_b ∝ exp(-J_ref/tau_ref), J_ref = E_form + 0.2 E_hist on the "
+                           "reference trajectory (E_form from the sampled compositions' c / E)",
+                "config_defaults_used": {
+                    "frag_references": int(self.frag_n_refs),
+                    "frag_segment_seconds": float(self.frag_segment_seconds),
+                    "frag_offset_rows": int(self.frag_offset_rows),
+                    "frag_discriminator_samples": int(self.frag_d_samples),
+                    "note": "read from mode_defaults.gan with .get; not present in config.py "
+                            "DEFAULTS (shared file not edited), so a project file cannot set them "
+                            "until they are added there"},
+                "statistic": "D of the committed composition vs D of fresh random fragment "
+                             "compositions drawn at the same rows (per step, summarised per unit); "
+                             "the fresh draws come from a separate seeded stream (config seed + "
+                             "977) so that the measurement never moves the job rng, are never used "
+                             "for a D or G update, and are not a goal test",
+                "ideal_motion": "mean per-step displacement of the frozen ideal, d_xi^2 (eq. 22) "
+                                f"between rows {self.model_step_rows} apart "
+                                f"({self.model_step_seconds} s model step)"},
             "update_unit": {
                 "when": "once per committed block (engine commit step), never during realization",
                 "fixed_during_the_update": ["reference set r_b", "frozen window reference",

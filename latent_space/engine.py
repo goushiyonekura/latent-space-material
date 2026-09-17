@@ -153,10 +153,13 @@ class Job:
         self.objective = Objective(cfg, self.lim, self.fs)
         self.history = History(self.M, self.analyzer.d_xi, cfg)
         self.mode = make_mode(self.mode_name, cfg, self.analyzer, self.fs, self.rng, self.objective)
+        self.mode.sources = self.sources          # fragment helpers need the PCM (FRAG_CONTRACT)
         self.hires = bool(cfg["hires"]["enabled"])
         if self.hires:
             t1 = time.time()
             self.analyzer.build_solo_bank(self.sources, float(cfg["analysis"]["hop_seconds"]))
+            if cfg["hires"].get("fragment_vocabulary", False):
+                self.analyzer.build_fragment_bank(float(cfg["hires"].get("clip_feature_seconds", cfg["hires"]["min_clip_seconds"])))
             self.solo_bank_seconds = time.time() - t1
             self.hires_state = HiresState(self.M, 0)
         w_ms = self.analyzer.W / self.fs * 1000.0
@@ -329,7 +332,11 @@ class Job:
         tol = float(s["normalized_mode_tolerance"])
         t_unit = time.time()
 
+        _src = getattr(self.mode, "sources", None)
+        self.mode.sources = None
         pre_mode = copy.deepcopy(self.mode)
+        self.mode.sources = _src
+        pre_mode.sources = _src
         pre_rng_state = copy.deepcopy(self.rng.bit_generator.state)
         self.mode.extra_candidate_evaluations = 0
         self.mode.begin_unit(unit, self.history)
