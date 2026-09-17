@@ -11,3 +11,6 @@ latent_space_code_002.zip
 output_hires/*/result.wav
 output_hires_v1_backup/
 output_frag/*/result.wav
+output_hold/*/result.wav
+output_hold_v1_backup/
+output_fid/*/result.wav

@@ -125,6 +125,95 @@ Configuration keys added by this revision are read with `.get()` only and are NO
 `frag_anchor_offsets`, `frag_anchor_seed`, `frag_energy_probe_samples` (all under
 `mode_defaults.diffusion`).  They therefore cannot be set from a project JSON without adding
 them to `config.DEFAULTS` first (`load_config` rejects unknown keys).
+
+Held realizable ideals (docs/HOLD_CONTRACT.md, 2026-09-16), what changed
+-----------------------------------------------------------------------
+Active only in HOLD MODE, i.e. when the engine publishes `unit.realizer_state` before
+`prepare_reference` (`hires.reference_hold_seconds > commit_seconds`; the engine then prepares
+ONE ideal per 2 s hold and chases it for every commit of that hold).  When `realizer_state` is
+missing or None -- every existing configuration -- the branch is taken before any random draw and
+this module behaves exactly as before, bit for bit (`dev/compare_legacy.py diffusion`).
+
+* H1  MEASURED PROBLEM.  The time process of F1 integrates the field freely in xi-space: it asks
+      for directions that no gain / position choice can produce (measured achieved fraction of
+      the requested move: -0.56, direction cosine at chance).  The field law is kept; what
+      changes is the SET the chain moves in.
+* H2  The chain is now a Langevin / Metropolis chain over REALIZABLE moves.  Its state is a PLAN:
+      one step per commit frame of the hold, each step = the end levels of the material tracks
+      (reached by the realizer's own Q5 ramp) + optional playback-position jumps.  Per commit
+      frame the proposals are "stay", `hold_level_candidates` Gaussian level perturbations of the
+      material tracks (sigma = 1.20 * `hold_move_scale` * o) and, for every track the minimum clip
+      length allows, jumps to `hold_jump_candidates` fragment positions whose clip-averaged band
+      profile is closest to the BAND PROFILE OF THE DRIFT TARGET `xi - tau M_D grad E_D(xi)`
+      (eq. 29, one drift step of commit_seconds, trust region `frag_max_displacement_per_step`)
+      plus one random position.  Every candidate is turned into EXACT rows by the engine's
+      `plan_rows` and scored by the SAME field energy E_D of eq. (28) -- anchor / pair / triple /
+      ridge / goal with the coefficients of the committed history, frozen for the hold -- on the
+      rows the move can still change.  One candidate is drawn with p ~ exp(-E_D / T(o)),
+      T(o) = `hold_temperature_scale` * o * spread(E_D over the candidates): the drift is the
+      preference for lower energy, the noise is the thermal spread of the draw.  The finished plan
+      is then refined by `hold_refine_sweeps` Metropolis sweeps (fresh level proposals, accepted
+      with min(1, exp(-dE/T))).  Openness 0 proposes nothing: the ideal is then the exact
+      composition of doing nothing.
+* H2b LANGEVIN DRIFT IN THE REALIZABLE COORDINATES (2026-09-16, follow-up).  Blind Gaussian level
+      draws give the chain thermal noise but no drift: even a greedy choice among them finds
+      almost nothing to gain (measured on the real materials: chosen-minus-stay field energy
+      +0.005 / +0.020 / -0.035, lower_than_stay_rate 0.48-0.55).  At every commit frame the
+      gradient of E_D with respect to the material END LEVELS is therefore estimated by one-sided
+      finite differences THROUGH `plan_rows` (step `_HOLD_FD_H` = 0.1, base point = the current
+      plan, M-1 extra exact evaluations), and the level candidates become
+        drift      levels - eta grad                      (two step sizes)
+        Langevin   levels - eta grad + sqrt(2 eta T) eps  (eps AR(1)-correlated along the frames)
+      next to the blind perturbations and "stay".  `eta` is normalised so that the drift step has
+      a level-space RMS of `_HOLD_DRIFT_LVL` * `hold_move_scale` * o (the raw |grad| varies by
+      orders of magnitude), and T is the local energy scale from the same finite differences.
+      Every jump position is scored with the CURRENT levels (so the exact field energy, not the
+      band-profile ranking alone, chooses the fragment) and the field's best position of each
+      track is offered once more with the DRIFTED levels.  Effect on the fixture: committed field
+      energy 0.431/0.426/0.570 -> 0.400/0.403/0.514, lower_than_stay_rate 0.50/0.49/0.55 ->
+      0.70/0.65/0.75, achieved +0.90 -> +0.94, in-hold change correlation +0.55 -> +0.74.
+* H2c ANNEALED COARSE-TO-FINE PLAN GENERATION (docs/FIDELITY_CONTRACT.md, 2026-09-17).  The plan
+      is no longer built in one forward pass.  `hold_anneal_iterations` denoising sweeps run over
+      the commit frames at a decreasing temperature T_m = `hold_anneal_ratio`^(n-1-m) * T(o) (the
+      last sweep is at T(o) > 0: thermal at o = 1, greedy only as o -> 0), and every sweep is
+      coarse-to-fine inside a frame: first WHICH FRAGMENTS (for up to `hold_tracks_per_step` tracks,
+      a random subset scaled by openness, `an.fragment_candidates_mix` ranks EVERY fragment of the
+      track by the predicted MIXTURE against the drift target and the short list is evaluated
+      exactly), then THE LEVELS by the finite-difference Langevin drift of H2b.  The plan state is
+      a trajectory of level INCREMENTS, so a move made at one frame carries on to the end of the
+      hold.  `hold_law_version` = 1 restores the previous single-pass chain unchanged.
+      Fidelity figures per hold / per unit: `energy_fidelity` = (E_stay - E_plan) /
+      (E_stay - E_best_seen) on the hold rows (E_best_seen = the lowest energy of any FULL plan the
+      hold evaluated: the stay plan, the plan after each sweep, every Metropolis trial; holds with
+      less than `_HOLD_FID_MIN_SPAN` to win carry no figure), `greedy_gap`, `lower_than_stay_rate`
+      (per visit; in an annealed chain the later visits start from an already good plan, so this is
+      NOT comparable with the single-pass chain), `fragment_visits` / `fragment_moves`.
+* H3  The published ideal is EXACT: `xi_hat[rows] = plan_rows(chosen plan, rows)` evaluated once
+      on all prepared rows, the plan itself in `Target.meta["plan"]` (the engine offers its jumps
+      as candidates and starts the level search from its levels).  Rows outside the prepared ones
+      keep the unit-level ideal; GOAL_HOLD rows stay pinned (`fix_hold_rows`).
+* H4  `window_error` is unchanged in form (eq. 30) but is now called with SUB-WINDOWS of the
+      prepared rows and many times per prepared reference; the field parameters of a sub-window
+      are built from the frozen coefficients and cached per hold.  `observe_committed` is called
+      once per commit of the hold: the per-commit evaluation record (first / best evaluated tail,
+      evaluation count) is reset after every commit, while the chain statistics belong to the hold
+      (`reference_age_steps` tells which commit of the hold it is).
+* H5  Statistics (mode trace): `hold_plan_chain_per_hold` (candidate plans evaluated, chain
+      selections, move / Metropolis acceptance rates, the energy path of the chosen plan, its
+      field energy vs the anchor and vs the "stay" plan, the requested move, the plan frames and
+      jumps) and `hold_plan_chain_per_unit`.  The FRAG statistic (field energy of the committed
+      composition vs random fragment compositions) keeps working unchanged.
+* H6  Keys read with `.get()` (only `hold_move_scale` is registered in `config.DEFAULTS`):
+      `hold_move_scale` (1.0, scales the proposal sigma and hence the requested move roughly
+      linearly), `hold_level_candidates` (6), `hold_jump_candidates` (3 fragment positions per
+      allowed track, plus one random), `hold_temperature_scale` (1.0), `hold_refine_sweeps` (1),
+      `hold_eval_rows` (6, rows used to score a candidate during the chain) and
+      `hold_multi_jump_candidates` (3, joint all-track jump proposals).  All of them are now
+      registered in `config.DEFAULTS`, so the value in the resolved config always wins over the
+      in-code default: the calibrated sizes live in the module constants `_HOLD_SIGMA0` (blind
+      level sigma), `_HOLD_DRIFT` (xi-space drift target of a jump), `_HOLD_DRIFT_LVL` (level-space
+      drift step), `_HOLD_FD_H` (finite-difference step) and `_HOLD_T0` (base temperature), each
+      multiplied by the corresponding registered key.
 """
 from __future__ import annotations
 
@@ -135,6 +224,27 @@ import numpy as np
 
 from ..types import Candidate, Realization, Target, UnitContext
 from .base import ModeController, ar1_noise, fix_hold_rows
+
+
+# Base size of one level perturbation of the hold-mode chain at openness 1 and
+# `hold_move_scale` = 1 (in gain units; a material's full level change is 1.0).  Measured on
+# dev/fixture_hold.json: it puts `hold_summary.requested_over_flutter_open` inside the 3-6 band
+# the contract asks for.  `hold_move_scale` multiplies it, so the requested move scales roughly
+# linearly in d_xi DISTANCE (quadratically in the d_xi^2 the reports print).
+_HOLD_SIGMA0 = 1.20
+# d_xi distance the drift target of a jump proposal is placed at (at openness 1 and
+# `hold_move_scale` = 1).  Scale: one material's full level change ~ 0.33, one playback jump
+# ~ 0.36, a complete redraw of the fragment composition ~ 0.88 on the fixture.
+_HOLD_DRIFT = 1.50
+# Langevin drift in the realizable coordinates (hold mode): finite-difference step of the level
+# gradient of E_D, level-space RMS of one drift step at openness 1 / `hold_move_scale` = 1, and the
+# in-code base of the selection temperature (the registered key `hold_temperature_scale` multiplies
+# it).  Calibrated on dev/fixture_hold.json and project.hold.diffusion.json.
+_HOLD_FD_H = 0.10
+_HOLD_DRIFT_LVL = 0.35
+_HOLD_T0 = 0.30
+# holds in which the whole hold could win less than this much field energy carry no fidelity figure
+_HOLD_FID_MIN_SPAN = 5e-3
 
 
 # ---------------------------------------------------------------------------- field parameters
@@ -338,6 +448,39 @@ class DiffusionMode(ModeController):
         self.anchor_meta: Dict[str, Any] = {}
         self.frag_stats: List[Dict[str, Any]] = []
 
+        # ---------------- hold revision (docs/HOLD_CONTRACT.md, Diffusion section) --------------
+        # Active ONLY when the engine publishes `unit.realizer_state` before `prepare_reference`
+        # (hires.reference_hold_seconds > commit_seconds).  Without it every code path below is
+        # skipped and the module behaves exactly as before, bit for bit (R5).
+        # All keys are read with .get() and in-code defaults; only `hold_move_scale` is registered
+        # in config.DEFAULTS, so the others cannot be set from a project JSON (the loader rejects
+        # unknown keys) -- they are reported instead, for the main session to register.
+        self.hold_move_scale = float(p.get("hold_move_scale", 1.0))
+        self.hold_level_candidates = max(0, int(p.get("hold_level_candidates", 6)))
+        self.hold_jump_candidates = max(0, int(p.get("hold_jump_candidates", 3)))
+        self.hold_multi_jump_candidates = max(0, int(p.get("hold_multi_jump_candidates", 3)))
+        # fidelity revision (docs/FIDELITY_CONTRACT.md): annealed coarse-to-fine plan generation.
+        # NEW keys, read with .get and in-code defaults (not registered in config.DEFAULTS yet).
+        self.hold_anneal_iterations = max(1, int(p.get("hold_anneal_iterations", 3)))
+        self.hold_anneal_ratio = max(1.0, float(p.get("hold_anneal_ratio", 2.0)))
+        self.hold_tracks_per_step = max(1, int(p.get("hold_tracks_per_step", 2)))
+        self.hold_gradient_tracks = max(1, int(p.get("hold_gradient_tracks", 4)))
+        self.hold_mix_ranking = bool(p.get("hold_mix_ranking", True))
+        # temperature of the LAST annealing sweep as a fraction of T(o) (> 0: the chain stays
+        # thermal; the hot sweeps are this times hold_anneal_ratio^(n-1-m))
+        self.hold_final_temperature = max(1e-3, float(p.get("hold_final_temperature", 0.4)))
+        # 1 = the single-pass chain of docs/HOLD_CONTRACT.md (kept so the earlier outputs stay
+        # reproducible in behaviour), 2 = the annealed coarse-to-fine generation
+        self.hold_law_version = int(p.get("hold_law_version", 2))
+        self.hold_temperature_scale = max(0.0, float(p.get("hold_temperature_scale", 1.0)))
+        self.hold_refine_sweeps = max(0, int(p.get("hold_refine_sweeps", 1)))
+        self.hold_eval_rows = max(2, int(p.get("hold_eval_rows", 6)))
+        self._hold = False                  # hold mode active for the current reference
+        self._hold_log: Dict[str, Any] = {}
+        self.hold_stats: List[Dict[str, Any]] = []      # one record per prepared hold
+        self.hold_chain_steps_total = 0     # internal: Metropolis/Glauber selections, whole job
+        self.hold_plans_evaluated_total = 0  # internal: candidate plans scored with plan_rows
+
         self.A = max(1, int(md.get("diffusion_particles", 4)))
         self.steps_max = max(1, int(md.get("diffusion_internal_steps_max", 8)))
         self.max_rounds = max(1, int(cfg["search"]["max_search_rounds"]))
@@ -385,6 +528,7 @@ class DiffusionMode(ModeController):
         self._win_rows: Optional[np.ndarray] = None
         self._win_P: Optional[FieldParams] = None
         self._win_coef: Optional[Dict[str, Any]] = None
+        self._sub_P_cache: Dict[tuple, FieldParams] = {}   # hold mode only (sub-windows of a hold)
         self._win_log: Dict[str, Any] = {}
         self._win_evals = 0
         self._win_first_bd: Optional[Dict[str, float]] = None
@@ -809,6 +953,846 @@ class DiffusionMode(ModeController):
         }
         return Xr, log
 
+    # ------------------------------------------------------------------ hold mode (HOLD_CONTRACT)
+    # A free SDE in xi-space asks for directions no gain / position choice can produce (measured
+    # achieved fraction -0.56).  In hold mode the SAME field E_D therefore runs as a Langevin /
+    # Metropolis chain over REALIZABLE moves: the state of the chain is a PLAN (one step per commit
+    # frame of the 2 s hold; each step = end levels of the material tracks + optional playback
+    # jumps), proposals are Gaussian level perturbations and jumps to fragment candidates, and the
+    # exact rows of every candidate plan are produced by the engine's own `plan_rows` and scored by
+    # the field energy at the openness temperature.  Drift = the preference for lower energy in the
+    # acceptance, noise = the thermal spread of the selection.
+    def _sub_params(self, P: FieldParams, sel: np.ndarray) -> FieldParams:
+        """`P` restricted to the positions `sel` of its own row set (used to score a candidate plan
+        on a few rows).  All per-row coefficients are sliced; s / beta / triples / W are shared."""
+        sel = np.asarray(sel, dtype=np.int64)
+        ev = P.rows[sel]
+        if not ev.any():
+            ev = np.ones(len(sel), dtype=bool)
+        return FieldParams(P.d_phi, P.M, P.d_xi, P.phi_anchor[sel], P.cG[sel], P.w[sel], P.s,
+                           P.d[sel], P.beta, np.stack([P.ti, P.tj, P.tl], axis=1), P.o[sel],
+                           P.xi_goal[sel], P.W, ev, P.lam_phi, P.lam_2, P.lam_3, P.lam_G, P.eps_D)
+
+    def _hold_commit_frames(self, rs: Dict[str, Any], centers: np.ndarray) -> List[int]:
+        """The commit frames of one hold: frame + k * commit_frames, k = 0 .. hold/commit - 1,
+        truncated at the search end and at the last prepared row."""
+        t0, commit = int(rs["frame"]), max(1, int(rs["commit_frames"]))
+        K = max(1, int(round(float(rs["hold_frames"]) / float(commit))))
+        end, last = int(rs["search_end_frame"]), int(centers[-1])
+        out = [t0 + k * commit for k in range(K)]
+        out = [int(f) for f in out if f < end and f <= last]
+        return out or [t0]
+
+    def _hold_eval_sel(self, centers: np.ndarray, f: int, span: int) -> np.ndarray:
+        """Positions (into the prepared rows) used to score a candidate move made at frame `f`:
+        the rows the move can still change, i.e. [f, f + span), sub-sampled to `hold_eval_rows`."""
+        sel = np.where((centers >= f) & (centers < f + span))[0]
+        if len(sel) == 0:
+            sel = np.where(centers >= f)[0][:1]
+        if len(sel) == 0:
+            sel = np.array([len(centers) - 1], dtype=np.int64)
+        if len(sel) > self.hold_eval_rows:
+            sel = sel[np.linspace(0, len(sel) - 1, self.hold_eval_rows).astype(np.int64)]
+        return np.asarray(sel, dtype=np.int64)
+
+    def _hold_drift_target(self, P_sel: FieldParams, xi_sel: np.ndarray, o: float,
+                           dt: float) -> Tuple[np.ndarray, float]:
+        """xi - tau M_D grad E_D(xi) of eq. (29): one drift step of `dt` seconds at openness `o`,
+        averaged over the scored rows.  Only its BAND block is used -- as the profile the fragment
+        candidates of a jump are matched to -- so what matters is the DIRECTION the field pulls in
+        and how far the move may reach: the step is therefore rescaled to the d_xi distance
+        `_HOLD_DRIFT * hold_move_scale * o` (capped by the trust region
+        `frag_max_displacement_per_step`).  Without the rescaling the target sits on top of the
+        current composition whenever the gradient is small, the nearest fragments are the ones
+        that sound like what is already playing, and the ideal cannot move at all.
+        Returns (target, realized drift distance)."""
+        g = field_row_gradient(P_sel, xi_sel)
+        step = (-self.frag_tau * float(dt)) * self._apply_M_D(g)
+        step = step.mean(axis=0)
+        z = np.zeros_like(step)
+        sn = float(np.sqrt(max(0.0, float(self.analyzer.dist2(step[None, :], z[None, :])[0]))))
+        want = _HOLD_DRIFT * self.hold_move_scale * float(o)
+        if sn > 1e-12:
+            step = step * (want / sn)
+        return xi_sel.mean(axis=0) + step, float(want if sn > 1e-12 else 0.0)
+
+    def _hold_positions(self, track: int, ratios: np.ndarray, cur_pos: int, min_clip: int) -> List[int]:
+        """Jump candidates of one track: the fragment positions whose clip-averaged band profile is
+        closest to the drift target's profile, plus one random position (exploration)."""
+        n = max(1, self.hold_jump_candidates)
+        an = self.analyzer
+        if getattr(an, "frag_f", None) is not None:
+            lst = an.fragment_candidates(track, ratios, n, exclude_near=int(cur_pos),
+                                         exclude_frames=int(2 * min_clip))
+        else:                                   # hires without the fragment vocabulary
+            fb = an.solo_f[track]
+            d = ((fb[:, 1:1 + an.nb] - np.asarray(ratios)[None, :]) ** 2).sum(axis=1)
+            d = d + 4.0 * (an.solo_E[track] < an.silence_energy)
+            lst = [int(an.solo_pos[track][k]) for k in np.argsort(d)[:n]]
+        lst = list(lst)
+        lst.append(int(self.rng.integers(0, self.sources[track].shape[0])))
+        return lst
+
+    def _hold_select(self, e: np.ndarray, o: float, mult: float = 1.0) -> Tuple[int, float]:
+        """Glauber selection among the candidate plans: p ~ exp(-E / T(o)) with
+        T(o) = _HOLD_T0 * hold_temperature_scale * o * spread(E).  The temperature is proportional
+        to the openness (o = 0 -> greedy, and no move is proposed at all) and to the spread of the
+        candidate energies, so the acceptance behaviour does not depend on the absolute scale of
+        E_D.  `_HOLD_T0` is the in-code base (the registered key scales it): at 1.0 * spread the
+        chain was thermal but not field-driven (lower_than_stay_rate ~ 0.5).  Returns (index, T)."""
+        spread = float(np.std(e))
+        T = _HOLD_T0 * self.hold_temperature_scale * float(mult) * float(o) * spread
+        if not np.isfinite(T) or T <= 1e-12:
+            return int(np.argmin(e)), 0.0
+        w = np.exp(-(e - float(e.min())) / T)
+        s = float(w.sum())
+        if not np.isfinite(s) or s <= 0.0:
+            return int(np.argmin(e)), float(T)
+        return int(self.rng.choice(len(e), p=w / s)), float(T)
+
+    def _hold_chain(self, unit: UnitContext, idx: np.ndarray, rs: Dict[str, Any],
+                    chain: int) -> Dict[str, Any]:
+        """`hold_law_version` 1 = the chain of docs/HOLD_CONTRACT.md (one pass over the commit
+        frames), 2 = the annealed coarse-to-fine generation of docs/FIDELITY_CONTRACT.md."""
+        if int(self.hold_law_version) <= 1:
+            out = self._hold_chain_v1(unit, idx, rs, chain)
+            out.update({"anneal_iterations": 1, "frame_visits": int(len(out["path"])),
+                        "fragment_visits": 0, "fragment_moves": int(out["n_jumps"]),
+                        "sweep_energies": [], "energy_stay_hold": None,
+                        "energy_best_seen": None, "energy_fidelity": None, "greedy_gap": None})
+            return out
+        return self._hold_chain_v2(unit, idx, rs, chain)
+
+    def _hold_chain_v1(self, unit: UnitContext, idx: np.ndarray, rs: Dict[str, Any],
+                    chain: int) -> Dict[str, Any]:
+        """hold_law_version 1: the previous chain -- ONE pass over the commit frames of the hold
+        with drift / Langevin / blind level candidates and jump candidates per frame.
+
+        Forward pass: the plan is built frame by frame.  At each commit frame the candidate moves
+        are "stay", `hold_level_candidates` Gaussian level perturbations of the material tracks
+        (sigma = 1.20 * hold_move_scale * o) and, for every track that may jump, jumps to
+        `hold_jump_candidates` fragment positions matched to the band profile of the drift target
+        xi - tau M_D grad E_D plus one random position (each jump carries one shared level draw of
+        its track, so the energy judges the position with the level move held fixed).  Every
+        candidate is turned into EXACT rows by the engine's `plan_rows` and scored by the field
+        energy on the rows the move can still change.  One candidate is then drawn with
+        p ~ exp(-E / T(o)).
+        Refinement: `hold_refine_sweeps` Metropolis sweeps over the steps of the finished plan
+        (fresh Gaussian level proposal, accepted with min(1, exp(-dE / T)) on the hold rows).
+        """
+        an = self.analyzer
+        prows = rs["plan_rows"]
+        P_full = self._win_P
+        centers = unit.centers[idx]
+        commit = max(1, int(rs["commit_frames"]))
+        hold_f = max(commit, int(rs["hold_frames"]))
+        min_clip = int(rs["min_clip_frames"])
+        dt = commit / float(unit.fs)
+        M = unit.M
+        lv = np.asarray(rs["levels"], dtype=np.float64).copy()
+        pos0 = np.asarray(rs["positions"], dtype=np.int64)
+        njf = [int(x) for x in rs["next_jump_frame"]]
+        jumps_on = (bool(rs.get("jumps_enabled", False)) and self.hold_jump_candidates > 0
+                    and getattr(self, "sources", None) is not None)
+        frames = self._hold_commit_frames(rs, centers)
+        sigma0 = _HOLD_SIGMA0 * self.hold_move_scale   # in-code base size of one level perturbation
+
+        # The level perturbations of successive commit frames are AR(1)-correlated with the same
+        # `time_correlation` coefficient eq. (29) uses for its noise in ITERATION time: independent
+        # draws per frame cancel over the four steps of a hold (measured: 0.22 d_xi^2 per step but
+        # only 0.15 at the hold end), so the ideal would ask for four unrelated small moves instead
+        # of one move the sound can be heard to follow.
+        rho = float(np.clip(self.rho_t, 0.0, 0.99))
+        s_in = float(np.sqrt(max(1e-12, 1.0 - rho * rho)))
+        eps_prev = np.zeros(M - 1, dtype=np.float64)
+        steps: List[Dict[str, Any]] = []
+        jumped_at: Dict[int, int] = {}
+        evals = 0
+        moves = 0
+        lower = 0
+        drift_informed = 0
+        drift_steps: List[float] = []
+        thermal_steps: List[float] = []
+        path: List[Dict[str, Any]] = []
+        for f in frames:
+            r_at = int(min(max(np.searchsorted(centers, f), 0), len(centers) - 1))
+            o_f = float(unit.o[idx[r_at]])
+            sel = self._hold_eval_sel(centers, int(f), hold_f)
+            P_sel = self._sub_params(P_full, sel)
+            rws = idx[sel]
+            stay = {"frame": int(f), "jumps": {}, "levels": lv.copy()}
+            xi_stay, _p, _i = prows(steps + [stay], rws)
+            evals += 1
+            e_stay = field_energy(P_sel, xi_stay)
+            if o_f <= 1e-9 or (self.hold_level_candidates == 0 and not jumps_on):
+                # openness 0: the field asks for no move at all
+                steps.append(stay)
+                path.append({"frame": int(f), "openness": o_f, "candidates": 1, "kind": "stay",
+                             "energy": float(e_stay), "energy_minus_stay": 0.0, "temperature": 0.0})
+                continue
+            cands: List[Tuple[Dict[int, int], np.ndarray, str]] = [({}, lv.copy(), "stay")]
+            energies: List[float] = [float(e_stay)]
+            dstay: List[float] = [0.0]
+
+            def add(jm_: Dict[int, int], nl_: np.ndarray, kind_: str) -> float:
+                """Evaluate one candidate plan exactly (plan_rows) and keep its field energy."""
+                nonlocal evals
+                xi_c, _pc, _ic = prows(steps + [{"frame": int(f), "jumps": dict(jm_),
+                                                 "levels": nl_}], rws)
+                ec = float(field_energy(P_sel, xi_c))
+                cands.append((dict(jm_), np.asarray(nl_, dtype=np.float64), kind_))
+                energies.append(ec)
+                dstay.append(float(an.dist2(xi_c, xi_stay).mean()))
+                evals += 1
+                return ec
+
+            # ---- Langevin DRIFT in the realizable coordinates -------------------------------
+            # grad_i = d E_D / d (end level of material i), by one-sided finite differences
+            # THROUGH plan_rows (exact rows), base point = the current plan ("stay").  Without it
+            # the chain has thermal noise but no drift: blind Gaussian level draws leave the field
+            # almost nothing to gain, and the selection is a coin flip (measured on the real
+            # materials: chosen minus stay energy +0.005 / +0.020 / -0.035, lower_than_stay 0.48-0.55).
+            grad = np.zeros(M - 1, dtype=np.float64)
+            e_fd = [float(e_stay)]
+            for i_ in range(1, M):
+                lv_h = lv.copy()
+                sgn = 1.0
+                if lv[i_] + _HOLD_FD_H <= 1.0:
+                    lv_h[i_] = lv[i_] + _HOLD_FD_H
+                else:
+                    lv_h[i_] = lv[i_] - _HOLD_FD_H
+                    sgn = -1.0
+                xi_fd, _pf, _if = prows(steps + [{"frame": int(f), "jumps": {}, "levels": lv_h}], rws)
+                evals += 1
+                e_h = float(field_energy(P_sel, xi_fd))
+                e_fd.append(e_h)
+                grad[i_ - 1] = sgn * (e_h - e_stay) / _HOLD_FD_H
+            g_rms = float(np.sqrt(np.mean(grad * grad)))
+            spread_fd = float(np.std(e_fd))
+            # local energy scale of the neighbourhood -> the temperature of a Langevin proposal
+            T_est = max(0.0, _HOLD_T0 * self.hold_temperature_scale * o_f * spread_fd)
+            # the drift step is normalised to a level-space RMS of _HOLD_DRIFT_LVL * scale * o, so
+            # its size is predictable while its DIRECTION is the field's (the raw |grad| varies by
+            # orders of magnitude between holds)
+            d_lvl = _HOLD_DRIFT_LVL * self.hold_move_scale * o_f
+            n_drift = min(2, max(1, self.hold_level_candidates // 3)) if g_rms > 1e-12 else 0
+            n_lang = n_drift
+            n_blind = max(1, self.hold_level_candidates - n_drift - n_lang)
+            etas: List[float] = []
+            lv_drift = lv.copy()
+            drift_step = 0.0
+            thermal_step = 0.0
+            for k_ in range(n_drift):
+                eta = (1.0 + k_) * d_lvl / max(g_rms, 1e-12)
+                etas.append(eta)
+                nl = lv.copy()
+                nl[1:] = np.clip(lv[1:] - eta * grad, 0.0, 1.0)
+                if k_ == 0:
+                    lv_drift = nl.copy()
+                    drift_step = float(np.abs(nl[1:] - lv[1:]).mean())
+                add({}, nl, "drift")
+            for k_ in range(n_lang):
+                eta = etas[k_]
+                # Langevin proposal: drift + sqrt(2 eta T) noise, the noise AR(1)-correlated along
+                # the commit frames (eq. 29 uses the same correlation in iteration time)
+                s_l = min(float(np.sqrt(2.0 * eta * T_est)), 2.0 * sigma0 * o_f)
+                ep = rho * eps_prev + s_in * self.rng.standard_normal(M - 1)
+                nl = lv.copy()
+                nl[1:] = np.clip(lv[1:] - eta * grad + s_l * ep, 0.0, 1.0)
+                if k_ == 0:
+                    thermal_step = float(s_l * np.abs(ep).mean())
+                add({}, nl, "langevin")
+            for _c in range(n_blind):
+                ep = rho * eps_prev + s_in * self.rng.standard_normal(M - 1)
+                nl = lv.copy()
+                nl[1:] = np.clip(lv[1:] + (sigma0 * o_f) * ep, 0.0, 1.0)
+                add({}, nl, "level")
+            n_jump_tracks = 0
+            pool: Dict[int, List[int]] = {}
+            d_drift = 0.0
+            if jumps_on:
+                tgt, d_drift = self._hold_drift_target(P_sel, xi_stay, o_f, dt)
+                ratios = tgt[1:1 + an.nb]
+                for i in range(1, M):
+                    if f < njf[i] or (i in jumped_at and f - jumped_at[i] < min_clip):
+                        continue
+                    if float(self.rng.random()) >= o_f:
+                        # a jump is a structural move: like the level perturbations it is offered
+                        # in proportion to the openness, so that near the goal (o -> 0) the field
+                        # has nothing large left to choose from (R4) -- otherwise the vanishing
+                        # temperature there turns the selection greedy on the (1-o)^2 goal term
+                        # and the ideal jumps hardest exactly where it should be calming down
+                        continue
+                    cur = int((int(pos0[i]) + (int(f) - int(centers[0]))) % self.sources[i].shape[0])
+                    n_jump_tracks += 1
+                    lst = self._hold_positions(i, ratios, cur, min_clip)
+                    pool[int(i)] = [int(p) for p in lst]
+                    # every position of the track is scored with the CURRENT levels, so the exact
+                    # field energy of the resulting rows -- not the band-profile ranking alone --
+                    # decides which fragment is proposed ...
+                    e_i = [add({int(i): int(p)}, lv, "jump") for p in lst]
+                    # ... and the field's best position is offered once more with the DRIFTED
+                    # levels, so a jump can be taken together with the level move the drift asks for
+                    if n_drift:
+                        add({int(i): int(lst[int(np.argmin(e_i))])}, lv_drift, "jump_drift")
+                # joint moves: the field lives on the whole composition, so the chain must be able
+                # to propose a simultaneous change of several materials (the realizer's beam does
+                # multi-track jumps).  Each joint candidate draws one position per allowed track.
+                if len(pool) > 1:
+                    for _m in range(self.hold_multi_jump_candidates):
+                        ep_m = rho * eps_prev + s_in * self.rng.standard_normal(M - 1)
+                        lv_m = (lv_drift if (n_drift and _m % 2 == 0) else lv).copy()
+                        lv_m[1:] = np.clip(lv_m[1:] + (sigma0 * o_f) * ep_m, 0.0, 1.0)
+                        jm_m = {int(i): int(ps[int(self.rng.integers(0, len(ps)))])
+                                for i, ps in pool.items()}
+                        add(jm_m, lv_m, "multi")
+            e = np.asarray(energies, dtype=np.float64)
+            ds = np.asarray(dstay, dtype=np.float64)
+            a, T = self._hold_select(e, o_f)
+            jm, nl, kind = cands[a]
+            steps.append({"frame": int(f), "jumps": {int(i): int(p) for i, p in jm.items()},
+                          "levels": np.asarray(nl, dtype=np.float64).copy()})
+            for i in jm:
+                jumped_at[int(i)] = int(f)
+            # the AR(1) state follows the level increment the chain actually took (in units of the
+            # blind proposal size), so drift, Langevin and blind moves all keep their direction
+            eps_prev = np.clip((np.asarray(nl, dtype=np.float64)[1:] - lv[1:])
+                               / max(1e-9, sigma0 * o_f), -3.0, 3.0)
+            lv = np.asarray(nl, dtype=np.float64).copy()
+            moves += int(a != 0)
+            lower += int(e[a] < e[0] - 1e-15)
+            drift_informed += int(kind in ("drift", "langevin", "jump_drift"))
+            drift_steps.append(drift_step)
+            thermal_steps.append(thermal_step)
+            self.hold_chain_steps_total += 1
+            path.append({"frame": int(f), "openness": o_f, "candidates": int(len(e)), "kind": kind,
+                         "jump_tracks_allowed": int(n_jump_tracks), "energy": float(e[a]),
+                         "energy_minus_stay": float(e[a] - e[0]), "energy_min": float(e.min()),
+                         "energy_mean": float(e.mean()), "temperature": float(T),
+                         "drift_target_distance": float(d_drift),
+                         "level_gradient_rms": g_rms, "fd_energy_spread": spread_fd,
+                         "langevin_temperature": float(T_est),
+                         "drift_step_levels": float(drift_step),
+                         "thermal_step_levels": float(thermal_step),
+                         "chosen_dist2_to_stay": float(ds[a]), "max_cand_dist2_to_stay": float(ds.max()),
+                         "mean_cand_dist2_to_stay": float(ds[1:].mean()) if len(ds) > 1 else 0.0,
+                         "jumps": {int(i): int(p) for i, p in jm.items()}})
+
+        # ---- Metropolis refinement of the finished plan (level proposals, whole-plan energy) ----
+        sel_h = self._hold_eval_sel(centers, int(frames[0]), hold_f + commit)
+        P_h = self._sub_params(P_full, sel_h)
+        rws_h = idx[sel_h]
+        xi_h, _p, _i = prows(steps, rws_h)
+        e_cur = float(field_energy(P_h, xi_h))
+        evals += 1
+        e_forward = e_cur
+        proposed = accepted = 0
+        o_h = float(np.mean([p["openness"] for p in path])) if path else 0.0
+        T_h = max(0.0, self.hold_temperature_scale * o_h * abs(e_cur) * 0.05)
+        for _sweep in range(self.hold_refine_sweeps):
+            for k in range(len(steps)):
+                o_k = float(path[k]["openness"]) if k < len(path) else o_h
+                if o_k <= 1e-9:
+                    continue
+                # local symmetric proposal around the step's own levels (it must not destroy the
+                # direction the forward pass found, only polish it)
+                nl = np.asarray(steps[k]["levels"], dtype=np.float64).copy()
+                nl[1:] = np.clip(nl[1:] + (0.5 * sigma0 * o_k) * self.rng.standard_normal(M - 1), 0.0, 1.0)
+                trial = [dict(s) for s in steps]
+                trial[k]["levels"] = nl
+                xi_t, _p, _i = prows(trial, rws_h)
+                e_t = float(field_energy(P_h, xi_t))
+                evals += 1
+                proposed += 1
+                ok = e_t <= e_cur
+                if not ok and T_h > 1e-12:
+                    ok = bool(self.rng.random() < float(np.exp(-(e_t - e_cur) / T_h)))
+                if ok:
+                    steps = trial
+                    e_cur = e_t
+                    accepted += 1
+        self.hold_plans_evaluated_total += evals
+
+        # ---- the chosen plan, evaluated once on ALL prepared rows -> the published ideal --------
+        xi_p, _parts, info = prows(steps, idx)
+        dropped = list(info.get("dropped_jumps") or [])
+        if dropped:                              # keep meta["plan"] and the published rows identical
+            drop = {(int(a), int(b)) for a, b in dropped}
+            for s_ in steps:
+                s_["jumps"] = {i: p for i, p in s_["jumps"].items()
+                               if (int(s_["frame"]), int(i)) not in drop}
+            xi_p, _parts, info = prows(steps, idx)
+        plan = [{"frame": int(s_["frame"]), "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
+                 "levels": [float(v) for v in np.asarray(s_["levels"], dtype=np.float64)]}
+                for s_ in steps]
+        return {"plan": plan, "steps": steps, "xi": xi_p, "path": path, "evaluations": int(evals),
+                "chain": int(chain), "moves": int(moves), "lower_than_stay": int(lower),
+                "drift_informed": int(drift_informed),
+                "drift_step_levels": float(np.mean(drift_steps)) if drift_steps else 0.0,
+                "thermal_step_levels": float(np.mean(thermal_steps)) if thermal_steps else 0.0,
+                "selections": int(len(path)), "dropped_jumps": [[int(a), int(b)] for a, b in dropped],
+                "refine_proposed": int(proposed), "refine_accepted": int(accepted),
+                "energy_after_forward_pass": float(e_forward), "energy_after_refinement": float(e_cur),
+                "refine_temperature": float(T_h), "n_jumps": int(sum(len(s_["jumps"]) for s_ in steps)),
+                "frames": [int(f) for f in frames]}
+
+    def _hold_chain_v2(self, unit: UnitContext, idx: np.ndarray, rs: Dict[str, Any],
+                    chain: int) -> Dict[str, Any]:
+        """Annealed, coarse-to-fine generation of one realizable plan (docs/FIDELITY_CONTRACT.md).
+
+        The state is a plan TRAJECTORY: per commit frame of the hold a level INCREMENT of the
+        material tracks (the levels of a step are the clipped accumulation of the increments up to
+        it, so a move made at one frame carries on to the end of the hold) plus at most one
+        playback jump per track (the minimum clip length is the hold length).
+        `hold_anneal_iterations` denoising sweeps run over the frames at a decreasing temperature
+        T_m = `hold_anneal_ratio`^(n-1-m) * T(o); the last sweep is at T(o) > 0, so the chain stays
+        thermal at o = 1 and becomes greedy only as o -> 0.  Inside a frame the sweep is
+        coarse-to-fine:
+
+          fragments  for up to `hold_tracks_per_step` tracks (random subset, scaled by openness):
+                     `an.fragment_candidates_mix` ranks EVERY fragment of the track by the
+                     predicted MIXTURE (what the other tracks play + this fragment at its level)
+                     against the drift target xi - tau M_D grad E_D; the short list is evaluated
+                     EXACTLY with plan_rows and one option is drawn with p ~ exp(-E/T_m);
+          levels     the finite-difference Langevin drift (gradient of E_D with respect to the
+                     level increment of up to `hold_gradient_tracks` tracks, measured through
+                     plan_rows), then drift / Langevin / blind candidates, drawn the same way.
+
+        Nothing assumes a number of materials: every track i >= 1 is treated alike, the caps above
+        bound the candidates per frame, and no combination is ever enumerated, so the cost per hold
+        is linear in the number of tracks (through plan_rows itself).
+        """
+        an = self.analyzer
+        prows = rs["plan_rows"]
+        P_full = self._win_P
+        centers = unit.centers[idx]
+        commit = max(1, int(rs["commit_frames"]))
+        hold_f = max(commit, int(rs["hold_frames"]))
+        min_clip = int(rs["min_clip_frames"])
+        dt = commit / float(unit.fs)
+        M = unit.M
+        mats = list(range(1, M))
+        lv0 = np.asarray(rs["levels"], dtype=np.float64)
+        njf = [int(x) for x in rs["next_jump_frame"]]
+        jumps_on = (bool(rs.get("jumps_enabled", False)) and self.hold_jump_candidates > 0
+                    and getattr(self, "sources", None) is not None)
+        frames = self._hold_commit_frames(rs, centers)
+        K = len(frames)
+        sigma0 = _HOLD_SIGMA0 * self.hold_move_scale
+        rho = float(np.clip(self.rho_t, 0.0, 0.99))
+        s_in = float(np.sqrt(max(1e-12, 1.0 - rho * rho)))
+        mix_ok = bool(self.hold_mix_ranking) and hasattr(an, "fragment_candidates_mix")
+
+        # ---- plan state: level increments per frame + at most one jump per track ---------------
+        deltas = [np.zeros(M, dtype=np.float64) for _ in range(K)]
+        jumps: List[Dict[int, int]] = [{} for _ in range(K)]
+
+        def build() -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            lv = lv0.copy()
+            for k_ in range(K):
+                nl = lv.copy()
+                nl[1:] = np.clip(lv[1:] + deltas[k_][1:], 0.0, 1.0)
+                out.append({"frame": int(frames[k_]), "jumps": dict(jumps[k_]), "levels": nl})
+                lv = nl
+            return out
+
+        evals = 0
+
+        def ev(steps_, rws_, P_):
+            """Exact rows of a candidate plan and its field energy (one internal iteration)."""
+            nonlocal evals
+            xi_, _p_, info_ = prows(steps_, rws_)
+            evals += 1
+            return float(field_energy(P_, xi_)), xi_, info_
+
+        # rows each frame is scored on (the rows its move can still change) and the hold rows
+        sels = [self._hold_eval_sel(centers, int(f), hold_f) for f in frames]
+        Ps = [self._sub_params(P_full, s_) for s_ in sels]
+        rwss = [idx[s_] for s_ in sels]
+        o_fs = [float(unit.o[idx[int(min(max(np.searchsorted(centers, f), 0), len(centers) - 1))]])
+                for f in frames]
+        sel_h = self._hold_eval_sel(centers, int(frames[0]), hold_f + commit)
+        P_h = self._sub_params(P_full, sel_h)
+        rws_h = idx[sel_h]
+        e_stay_hold, _xs, _is = ev(build(), rws_h, P_h)       # the plan that changes nothing
+        e_best_seen = float(e_stay_hold)
+
+        n_iter = max(1, self.hold_anneal_iterations)
+        path: List[Dict[str, Any]] = []
+        eps_run = np.zeros(M - 1, dtype=np.float64)
+        moves = lower = drift_informed = 0
+        lower_final = visits_final = 0
+        frag_visits = frag_moves = 0
+        drift_steps: List[float] = []
+        thermal_steps: List[float] = []
+        greedy_gaps: List[float] = []
+        sweep_energies: List[float] = []
+        for m in range(n_iter):
+            T_mult = self.hold_final_temperature * float(self.hold_anneal_ratio) ** float(n_iter - 1 - m)
+            # every sweep is coarse-to-fine: a fragment chosen at a high temperature must be
+            # re-selectable at the low one, otherwise the cold sweeps can only polish levels around
+            # a randomly chosen material
+            do_frag = jumps_on
+            for k in range(K):
+                o_f = o_fs[k]
+                if o_f <= 1e-9:
+                    continue                      # openness 0: the field asks for no move at all
+                P_sel, rws = Ps[k], rwss[k]
+                steps_cur = build()
+                e_base, xi_base, info_base = ev(steps_cur, rws, P_sel)
+                d_drift = 0.0
+                n_elig = 0
+                # ---------------- coarse: which fragments each moving track plays ---------------
+                if do_frag:
+                    tgt, d_drift = self._hold_drift_target(P_sel, xi_base, o_f, dt)
+                    target_phi = tgt[:1 + an.nb]
+                    elig = [i for i in mats if int(frames[k]) >= njf[i]
+                            and not any(i in jumps[j] for j in range(K) if j != k)]
+                    n_elig = len(elig)
+                    n_move = max(1, int(round(self.hold_tracks_per_step * o_f)))
+                    if len(elig) > n_move:
+                        pick = self.rng.choice(len(elig), size=n_move, replace=False)
+                        elig = [elig[int(x)] for x in sorted(pick)]
+                    for i in elig:
+                        frag_visits += 1
+                        gains0 = np.asarray(info_base["gains"][0], dtype=np.float64)
+                        pos0r = np.asarray(info_base["positions"][0], dtype=np.int64)
+                        lvl_i = max(float(steps_cur[k]["levels"][i]), 1e-3)
+                        n_short = max(1, self.hold_jump_candidates)
+                        if mix_ok:
+                            # mixture-aware ranking of EVERY fragment of the track against the
+                            # drift target (the solo band profile ignores what the others play)
+                            others = an.mixture_band_energy(pos0r, gains0, skip=i)
+                            pool = an.fragment_candidates_mix(
+                                i, target_phi, others, lvl_i, n_short + 1,
+                                exclude_near=int(pos0r[i]), exclude_frames=int(2 * min_clip))
+                        else:
+                            pool = self._hold_positions(i, target_phi[1:1 + an.nb], int(pos0r[i]), min_clip)
+                        opts: List[Optional[int]] = [None]          # None = leave this track as it is
+                        opts += [int(p) for p in pool]
+                        opts.append(int(self.rng.integers(0, self.sources[i].shape[0])))
+                        had = jumps[k].get(i)
+                        es = [e_base]
+                        xs = [(xi_base, info_base)]
+                        for p_ in opts[1:]:
+                            jumps[k][i] = int(p_)
+                            e_c, x_c, i_c = ev(build(), rws, P_sel)
+                            es.append(e_c)
+                            xs.append((x_c, i_c))
+                        if had is None:
+                            jumps[k].pop(i, None)
+                        else:
+                            jumps[k][i] = int(had)
+                        e_arr = np.asarray(es, dtype=np.float64)
+                        a_, T_ = self._hold_select(e_arr, o_f, T_mult)
+                        greedy_gaps.append(float((e_arr[a_] - e_arr.min())
+                                                 / max(1e-12, float(np.std(e_arr)))))
+                        if a_ > 0:
+                            jumps[k][i] = int(opts[a_])
+                            frag_moves += 1
+                        e_base = float(e_arr[a_])
+                        xi_base, info_base = xs[a_]
+                        steps_cur = build()
+                # ---------------- fine: the levels, by the finite-difference Langevin drift -----
+                probe = list(mats)
+                if len(probe) > self.hold_gradient_tracks:
+                    pk = self.rng.choice(len(probe), size=self.hold_gradient_tracks, replace=False)
+                    probe = [probe[int(x)] for x in sorted(pk)]
+                d_save = deltas[k].copy()
+                grad = np.zeros(M - 1, dtype=np.float64)
+                e_fd = [e_base]
+                for i in probe:
+                    sgn = 1.0 if float(steps_cur[k]["levels"][i]) + _HOLD_FD_H <= 1.0 else -1.0
+                    deltas[k] = d_save.copy()
+                    deltas[k][i] += sgn * _HOLD_FD_H
+                    e_h, _xh, _ih = ev(build(), rws, P_sel)
+                    e_fd.append(e_h)
+                    grad[i - 1] = sgn * (e_h - e_base) / _HOLD_FD_H
+                deltas[k] = d_save.copy()
+                g_rms = float(np.sqrt(np.mean(grad * grad)))
+                spread_fd = float(np.std(e_fd))
+                T_est = max(0.0, _HOLD_T0 * self.hold_temperature_scale * T_mult * o_f * spread_fd)
+                d_lvl = _HOLD_DRIFT_LVL * self.hold_move_scale * o_f
+                n_drift = min(2, max(1, self.hold_level_candidates // 3)) if g_rms > 1e-12 else 0
+                n_lang = n_drift
+                n_blind = max(1, self.hold_level_candidates - n_drift - n_lang)
+                cand_d: List[np.ndarray] = [d_save]                 # index 0 = leave the levels
+                kinds: List[str] = ["stay"]
+                etas: List[float] = []
+                drift_step = thermal_step = 0.0
+                for c_ in range(n_drift):
+                    eta = (1.0 + c_) * d_lvl / max(g_rms, 1e-12)
+                    etas.append(eta)
+                    dn = d_save.copy()
+                    dn[1:] = d_save[1:] - eta * grad
+                    cand_d.append(dn)
+                    kinds.append("drift")
+                    if c_ == 0:
+                        drift_step = float(np.abs(eta * grad).mean())
+                for c_ in range(n_lang):
+                    eta = etas[c_]
+                    s_l = min(float(np.sqrt(2.0 * eta * T_est)), 2.0 * sigma0 * o_f)
+                    ep = rho * eps_run + s_in * self.rng.standard_normal(M - 1)
+                    dn = d_save.copy()
+                    dn[1:] = d_save[1:] - eta * grad + s_l * ep
+                    cand_d.append(dn)
+                    kinds.append("langevin")
+                    if c_ == 0:
+                        thermal_step = float(s_l * np.abs(ep).mean())
+                for _c in range(n_blind):
+                    ep = rho * eps_run + s_in * self.rng.standard_normal(M - 1)
+                    dn = d_save.copy()
+                    dn[1:] = d_save[1:] + (sigma0 * o_f) * ep
+                    cand_d.append(dn)
+                    kinds.append("level")
+                es = [e_base]
+                for dn in cand_d[1:]:
+                    deltas[k] = dn
+                    e_c, _xc, _ic = ev(build(), rws, P_sel)
+                    es.append(e_c)
+                deltas[k] = d_save.copy()
+                e_arr = np.asarray(es, dtype=np.float64)
+                a_, T_ = self._hold_select(e_arr, o_f, T_mult)
+                greedy_gaps.append(float((e_arr[a_] - e_arr.min()) / max(1e-12, float(np.std(e_arr)))))
+                lv_before = np.asarray(steps_cur[k]["levels"], dtype=np.float64)
+                deltas[k] = cand_d[a_].copy()
+                lv_after = np.asarray(build()[k]["levels"], dtype=np.float64)
+                # the AR(1) state follows the level increment the chain actually took (in units of
+                # the blind proposal size), so drift, Langevin and blind moves keep their direction
+                eps_run = np.clip((lv_after[1:] - lv_before[1:]) / max(1e-9, sigma0 * o_f), -3.0, 3.0)
+                moves += int(a_ != 0)
+                lower += int(e_arr[a_] < e_arr[0] - 1e-15)
+                if m == n_iter - 1:
+                    visits_final += 1
+                    lower_final += int(e_arr[a_] < e_arr[0] - 1e-15)
+                drift_informed += int(kinds[a_] in ("drift", "langevin"))
+                drift_steps.append(drift_step)
+                thermal_steps.append(thermal_step)
+                self.hold_chain_steps_total += 1
+                path.append({"iteration": int(m), "frame": int(frames[k]), "openness": o_f,
+                             "temperature_multiplier": float(T_mult), "fragment_stage": bool(do_frag),
+                             "eligible_jump_tracks": int(n_elig), "candidates": int(len(e_arr)),
+                             "kind": kinds[a_], "energy": float(e_arr[a_]),
+                             "energy_minus_stay": float(e_arr[a_] - e_arr[0]),
+                             "energy_min": float(e_arr.min()), "temperature": float(T_),
+                             "drift_target_distance": float(d_drift), "level_gradient_rms": g_rms,
+                             "fd_energy_spread": spread_fd, "langevin_temperature": float(T_est),
+                             "drift_step_levels": float(drift_step),
+                             "thermal_step_levels": float(thermal_step),
+                             "jumps": {int(i_): int(p_) for i_, p_ in jumps[k].items()}})
+            e_sw, _xw, _iw = ev(build(), rws_h, P_h)
+            sweep_energies.append(float(e_sw))
+            e_best_seen = min(e_best_seen, float(e_sw))
+
+        # ---- Metropolis polish of the finished plan (level proposals, whole-plan energy) -------
+        steps = build()
+        e_cur = float(sweep_energies[-1]) if sweep_energies else float(e_stay_hold)
+        e_forward = e_cur
+        proposed = accepted = 0
+        o_h = float(np.mean(o_fs)) if o_fs else 0.0
+        T_h = max(0.0, _HOLD_T0 * self.hold_temperature_scale * o_h * abs(e_cur) * 0.05)
+        for _sweep in range(self.hold_refine_sweeps):
+            for k in range(len(steps)):
+                o_k = o_fs[k] if k < len(o_fs) else o_h
+                if o_k <= 1e-9:
+                    continue
+                # local symmetric proposal around the step's own levels (it must not destroy the
+                # direction the sweeps found, only polish it)
+                nl = np.asarray(steps[k]["levels"], dtype=np.float64).copy()
+                nl[1:] = np.clip(nl[1:] + (0.5 * sigma0 * o_k) * self.rng.standard_normal(M - 1), 0.0, 1.0)
+                trial = [dict(s) for s in steps]
+                trial[k]["levels"] = nl
+                e_t, _xt, _it = ev(trial, rws_h, P_h)
+                proposed += 1
+                e_best_seen = min(e_best_seen, float(e_t))
+                ok = e_t <= e_cur
+                if not ok and T_h > 1e-12:
+                    ok = bool(self.rng.random() < float(np.exp(-(e_t - e_cur) / T_h)))
+                if ok:
+                    steps = trial
+                    e_cur = float(e_t)
+                    accepted += 1
+        self.hold_plans_evaluated_total += evals
+        # law -> plan fidelity: how much of the energy the hold could have won was won
+        span = float(e_stay_hold - e_best_seen)
+        fidelity = (float((e_stay_hold - e_cur) / span) if span > _HOLD_FID_MIN_SPAN else None)
+
+        # ---- the chosen plan, evaluated once on ALL prepared rows -> the published ideal --------
+        xi_p, _parts, info = prows(steps, idx)
+        dropped = list(info.get("dropped_jumps") or [])
+        if dropped:                              # keep meta["plan"] and the published rows identical
+            drop = {(int(a), int(b)) for a, b in dropped}
+            for s_ in steps:
+                s_["jumps"] = {i: p for i, p in s_["jumps"].items()
+                               if (int(s_["frame"]), int(i)) not in drop}
+            xi_p, _parts, info = prows(steps, idx)
+        plan = [{"frame": int(s_["frame"]), "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
+                 "levels": [float(v) for v in np.asarray(s_["levels"], dtype=np.float64)]}
+                for s_ in steps]
+        return {"plan": plan, "steps": steps, "xi": xi_p, "path": path, "evaluations": int(evals),
+                "chain": int(chain), "moves": int(moves), "lower_than_stay": int(lower),
+                "drift_informed": int(drift_informed),
+                "drift_step_levels": float(np.mean(drift_steps)) if drift_steps else 0.0,
+                "thermal_step_levels": float(np.mean(thermal_steps)) if thermal_steps else 0.0,
+                "selections": int(len(path)), "dropped_jumps": [[int(a), int(b)] for a, b in dropped],
+                "refine_proposed": int(proposed), "refine_accepted": int(accepted),
+                "energy_after_forward_pass": float(e_forward), "energy_after_refinement": float(e_cur),
+                "refine_temperature": float(T_h), "n_jumps": int(sum(len(s_["jumps"]) for s_ in steps)),
+                "frames": [int(f) for f in frames],
+                "anneal_iterations": int(n_iter), "frame_visits": int(len(path)),
+                "lower_than_stay_final_sweep": (float(lower_final) / visits_final) if visits_final else None,
+                "fragment_visits": int(frag_visits), "fragment_moves": int(frag_moves),
+                "sweep_energies": [float(x) for x in sweep_energies],
+                "energy_stay_hold": float(e_stay_hold), "energy_best_seen": float(e_best_seen),
+                "energy_fidelity": fidelity,
+                "greedy_gap": float(np.mean(greedy_gaps)) if greedy_gaps else 0.0}
+
+    def _hold_reference(self, unit: UnitContext, idx: np.ndarray, coef: Dict[str, Any],
+                        xi_anchor: np.ndarray, n_prop: int, rs: Dict[str, Any]) -> List[Target]:
+        """`prepare_reference` in hold mode: run `n_prop` independent chains over realizable plans
+        and publish the EXACT rows of the chosen plan (R2), with the plan in `Target.meta["plan"]`."""
+        an = self.analyzer
+        P_full = self._win_P
+        centers = unit.centers[idx]
+        t0, commit = int(rs["frame"]), max(1, int(rs["commit_frames"]))
+        hold_f = max(commit, int(rs["hold_frames"]))
+        xa = np.asarray(xi_anchor, dtype=np.float64).ravel()
+        runs = [self._hold_chain(unit, idx, rs, c) for c in range(max(1, int(n_prop)))]
+        for r in runs:
+            r["field_energy"] = float(field_energy(P_full, r["xi"]))
+        order = np.argsort([r["field_energy"] for r in runs])   # the field decides which plan leads
+        e_anchor = float(field_energy(P_full, np.repeat(xa[None, :], len(idx), axis=0)))
+        stay0 = [{"frame": t0, "jumps": {}, "levels": np.asarray(rs["levels"], dtype=np.float64)}]
+        xi_stay, _p, _i = rs["plan_rows"](stay0, idx)
+        e_stay = float(field_energy(P_full, xi_stay))
+        self.hold_plans_evaluated_total += 1
+
+        base_full = self._unit_ideal(unit)
+        targets: List[Target] = []
+        for k in range(len(runs)):
+            r = runs[int(order[k])]
+            xi_hat = np.array(base_full, dtype=np.float64, copy=True)
+            xi_hat[idx] = r["xi"]
+            xi_hat = fix_hold_rows(unit, xi_hat)
+            targets.append(Target(
+                id=f"diffusion:u{unit.index}:h{self.window_index}:c{r['chain']}", xi_hat=xi_hat,
+                meta={"scope": "hold", "plan": r["plan"], "chain": int(r["chain"]),
+                      "window_rows": int(len(idx)), "field_energy": float(r["field_energy"]),
+                      "field_energy_terms": field_breakdown(P_full, r["xi"]),
+                      "field_energy_anchor": e_anchor, "field_energy_stay": e_stay,
+                      "internal_iterations": int(r["selections"]),
+                      "candidate_plans_evaluated": int(r["evaluations"]),
+                      "realizable": ("exact plan_rows of the plan in meta['plan'] on the prepared "
+                                     "rows; rows outside them keep the unit-level ideal, GOAL_HOLD "
+                                     "rows are pinned (fix_hold_rows)")}))
+        best = runs[int(order[0])]
+        # requested move of the published ideal: anchor -> its mean over the last commit block
+        e_rows = np.where((centers >= t0 + hold_f - commit) & (centers < t0 + hold_f))[0]
+        if len(e_rows) == 0:
+            e_rows = np.array([len(centers) - 1], dtype=np.int64)
+        fm = unit.free_mask[idx][e_rows]
+        e_rows = e_rows[fm] if fm.any() else e_rows
+        req = float(an.dist2(best["xi"][e_rows].mean(axis=0)[None, :], xa[None, :])[0])
+        # the part of the requested move that is NOT the mode's doing: where the composition
+        # arrives if nothing is changed at all (the materials and the goal schedule move by
+        # themselves over 2 s), and how far the chosen plan is from that
+        req_stay = float(an.dist2(xi_stay[e_rows].mean(axis=0)[None, :], xa[None, :])[0])
+        d_stay = float(an.dist2(best["xi"][e_rows].mean(axis=0)[None, :],
+                                xi_stay[e_rows].mean(axis=0)[None, :])[0])
+        jumps_now = int(sum(len(s["jumps"]) for s in best["plan"]))
+        log = {
+            "unit": int(unit.index), "hold_index": int(self.window_index),
+            "musical_time_seconds": float(unit.seconds[idx[0]]),
+            "hold_seconds": hold_f / float(unit.fs), "commit_seconds": commit / float(unit.fs),
+            "prepared_rows": int(len(idx)), "plan_steps": int(len(best["plan"])),
+            "plan_frames": best["frames"], "openness_at_hold_start": float(unit.o[idx[0]]),
+            "chains": int(len(runs)),
+            "candidate_plans_evaluated": int(sum(r["evaluations"] for r in runs)) + 1,
+            "chain_selections": int(sum(r["selections"] for r in runs)),
+            "move_acceptance_rate": (float(sum(r["moves"] for r in runs))
+                                     / max(1, sum(r["selections"] for r in runs))),
+            "lower_than_stay_rate": (float(sum(r["lower_than_stay"] for r in runs))
+                                     / max(1, sum(r["selections"] for r in runs))),
+            "drift_informed_rate": (float(sum(r["drift_informed"] for r in runs))
+                                    / max(1, sum(r["selections"] for r in runs))),
+            "mean_drift_step_levels": float(np.mean([r["drift_step_levels"] for r in runs])),
+            "mean_thermal_step_levels": float(np.mean([r["thermal_step_levels"] for r in runs])),
+            "mean_energy_gain_vs_stay": float(np.mean([p["energy_minus_stay"] for p in best["path"]])),
+            "energy_fidelity": best.get("energy_fidelity"),
+            "lower_than_stay_final_sweep": best.get("lower_than_stay_final_sweep"),
+            "energy_stay_hold": best.get("energy_stay_hold"),
+            "energy_best_seen": best.get("energy_best_seen"),
+            "greedy_gap": best.get("greedy_gap"),
+            "anneal_iterations": int(best.get("anneal_iterations", 1)),
+            "frame_visits": int(best.get("frame_visits", len(best["path"]))),
+            "fragment_visits": int(best.get("fragment_visits", 0)),
+            "fragment_moves": int(best.get("fragment_moves", 0)),
+            "sweep_energies": [float(x) for x in (best.get("sweep_energies") or [])],
+            "law_version": int(self.hold_law_version),
+            "metropolis_proposed": int(sum(r["refine_proposed"] for r in runs)),
+            "metropolis_accepted": int(sum(r["refine_accepted"] for r in runs)),
+            "metropolis_acceptance_rate": (float(sum(r["refine_accepted"] for r in runs))
+                                           / max(1, sum(r["refine_proposed"] for r in runs))),
+            "energy_path": best["path"],
+            "field_energy_chosen_plan": float(best["field_energy"]),
+            "field_energy_anchor": e_anchor, "field_energy_stay_plan": e_stay,
+            "field_energy_chosen_minus_anchor": float(best["field_energy"] - e_anchor),
+            "field_energy_chosen_minus_stay": float(best["field_energy"] - e_stay),
+            "field_energy_all_chains": [float(r["field_energy"]) for r in runs],
+            "energy_after_forward_pass": float(best["energy_after_forward_pass"]),
+            "energy_after_refinement": float(best["energy_after_refinement"]),
+            "jumps_in_plan": jumps_now, "dropped_jumps": best["dropped_jumps"],
+            "plan_levels": [[round(float(v), 4) for v in s["levels"]] for s in best["plan"]],
+            "levels_at_hold_start": [round(float(v), 4) for v in np.asarray(rs["levels"], dtype=np.float64)],
+            "plan_level_change_abs_mean": float(np.abs(
+                np.asarray(best["plan"][-1]["levels"], dtype=np.float64)[1:]
+                - np.asarray(rs["levels"], dtype=np.float64)[1:]).mean()),
+            "requested_dist2_at_hold_end": req,
+            "requested_distance_at_hold_end": float(np.sqrt(max(0.0, req))),
+            "requested_dist2_at_hold_end_of_stay_plan": req_stay,
+            "chosen_minus_stay_dist2_at_hold_end": d_stay,
+            "mean_chosen_dist2_to_stay_per_step": float(np.mean([p.get("chosen_dist2_to_stay", 0.0)
+                                                                 for p in best["path"]])),
+            "mean_max_candidate_dist2_to_stay_per_step": float(np.mean([p.get("max_cand_dist2_to_stay", 0.0)
+                                                                        for p in best["path"]])),
+            "level_sigma_at_o1": float(_HOLD_SIGMA0 * self.hold_move_scale),
+            "hold_move_scale": float(self.hold_move_scale),
+            "temperature_scale": float(self.hold_temperature_scale),
+            "coefficients": coef["info"],
+            "law": ("Langevin/Metropolis chain over realizable plans scored by the SAME field "
+                    "energy E_D (anchor/pair/triple/ridge/goal, coefficients from the committed "
+                    "history) at the openness temperature T(o)"),
+        }
+        self._hold_log = log
+        self.hold_stats.append(log)
+        self._win_log = {
+            "unit": int(unit.index), "window_index": int(self.window_index),
+            "musical_time_seconds": float(unit.seconds[idx[0]]),
+            "window_seconds": [float(unit.seconds[idx[0]]), float(unit.seconds[idx[-1]])],
+            "window_rows": int(len(idx)), "free_rows": int(P_full.rows.sum()),
+            "internal_iterations_this_window": int(best["selections"]),
+            "internal_iterations_unit_cumulative": int(self.window_steps_used),
+            "particles": int(len(runs)), "fragment_mode": bool(self._frag), "hold_mode": True,
+            "particle_field_energy_initial": [e_stay],
+            "particle_field_energy_after": [float(r["field_energy"]) for r in runs],
+            "particle_field_energy_spread": float(max(r["field_energy"] for r in runs)
+                                                  - min(r["field_energy"] for r in runs)),
+            "hold_chain": {k: v for k, v in log.items() if k != "energy_path"},
+            "coefficients": coef["info"], "proposals": [t.id for t in targets],
+        }
+        self.window_traces.append(dict(self._win_log))
+        self.window_index += 1
+        self.window_steps_used += int(best["selections"])
+        self.window_steps_total += int(best["selections"])
+        self._sub_P_cache = {}
+        self._win_evals = 0
+        self._win_first_bd = None
+        self._win_first_val = None
+        self._win_best_bd = None
+        self._win_best_val = None
+        return targets
+
     # ------------------------------------------------------------------ conditioning (§7.1)
     def begin_unit(self, unit: UnitContext, history) -> None:
         J, M = unit.J, unit.M
@@ -821,6 +1805,9 @@ class DiffusionMode(ModeController):
         self._win_coef = None
         self._unit_ideal_cache = None
         self.w_particles = None
+        self._hold = False                  # set by prepare_reference when the engine holds ideals
+        self._hold_log = {}
+        self._sub_P_cache = {}
         st = history.mode_state.get(self.state_key) or {}
 
         fm = unit.free_mask
@@ -1114,6 +2101,12 @@ class DiffusionMode(ModeController):
         of Langevin iterations *here*, and everything is then frozen: neither the coefficients
         nor the particles move while the engine improves the gain trajectory against the chosen
         reference.
+
+        HOLD MODE (docs/HOLD_CONTRACT.md): when the engine has published `unit.realizer_state`
+        (once per 2 s hold) the field is not integrated freely in xi-space any more -- it runs as
+        a Langevin / Metropolis chain over REALIZABLE plans and the exact rows of the chosen plan
+        are published (`_hold_reference`).  Without `realizer_state` (every legacy config) the
+        code below is reached unchanged, including every RNG draw (R5).
         """
         idx = np.asarray(rows, dtype=np.int64)
         coef = self._coefficients(unit, history, idx)
@@ -1123,6 +2116,11 @@ class DiffusionMode(ModeController):
         self._set_M_D(coef["v"], coef["aniso"] if coef["info"]["has_history"] else None)
 
         n = max(1, min(int(n_proposals), self.A))
+        rs = getattr(unit, "realizer_state", None)
+        if rs is not None and callable(rs.get("plan_rows")) and getattr(self, "sources", None) is not None:
+            self._hold = True
+            return self._hold_reference(unit, idx, coef, xi_current, n, rs)
+        self._hold = False
         if self._frag:
             # ---- fragment mode: the field is integrated as a TIME PROCESS over the window ----
             X, tlog = self._frag_time_process(unit, idx, coef, xi_current, n)
@@ -1199,11 +2197,24 @@ class DiffusionMode(ModeController):
         """Eq. (30) restricted to the commit window: mean d_xi^2 on the free rows of the window
         against the FROZEN reference + kappa_E * field energy of the realized composition on the
         same rows.  The per-term breakdown (anchor / pair / triple / ridge / goal) is kept for
-        the step traces (audit D1.3)."""
+        the step traces (audit D1.3).
+
+        In hold mode this is called with SUB-WINDOWS of the prepared rows (one window per commit
+        of the hold, plus the row subsets of the jump beam) and many times per prepared reference;
+        the field parameters of a sub-window are built from the frozen window coefficients and
+        cached for the hold (the cache is cleared by every `prepare_reference`)."""
         idx = np.asarray(rows, dtype=np.int64)
         P = self._win_P
         if P is None or self._win_rows is None or not np.array_equal(self._win_rows, idx):
-            P = self._params_for(unit, self._coef_on(unit, idx), idx)
+            if self._hold:
+                key = (int(idx[0]), int(idx[-1]), int(len(idx)))
+                P = self._sub_P_cache.get(key)
+                if P is None:
+                    P = self._params_for(unit, self._coef_on(unit, idx), idx)
+                    if len(self._sub_P_cache) < 256:
+                        self._sub_P_cache[key] = P
+            else:
+                P = self._params_for(unit, self._coef_on(unit, idx), idx)
         m = unit.free_mask[idx]
         d = unit.analyzer.dist2(xi_rows, target.xi_hat[idx])
         fit = float(d[m].mean()) if m.any() else 0.0
@@ -1305,6 +2316,36 @@ class DiffusionMode(ModeController):
 
         # --- FRAG_CONTRACT statistic: field energy of the committed block vs. the mean field
         #     energy of the unit's random fragment sample, on the SAME rows / field parameters --
+        # hold mode: several commits share one prepared reference, so the per-commit records are
+        # the ones of THIS commit (they are reset at the end of this call) while the chain
+        # statistics belong to the hold the reference was prepared for.
+        hstats = (stats or {})
+        hold_info: Optional[Dict[str, Any]] = None
+        if self._hold and self._hold_log:
+            hl = self._hold_log
+            hold_info = {
+                "hold_index": int(hl.get("hold_index", -1)),
+                "reference_age_steps": int(hstats.get("reference_age_steps", 0)),
+                "reference_is_new": bool(hstats.get("reference_is_new", False)),
+                "reference_t0_frame": hstats.get("reference_t0_frame"),
+                "reference_hold_seconds": hstats.get("reference_hold_seconds"),
+                "candidate_plans_evaluated": int(hl.get("candidate_plans_evaluated", 0)),
+                "chain_selections": int(hl.get("chain_selections", 0)),
+                "move_acceptance_rate": hl.get("move_acceptance_rate"),
+                "lower_than_stay_rate": hl.get("lower_than_stay_rate"),
+                "metropolis_acceptance_rate": hl.get("metropolis_acceptance_rate"),
+                "field_energy_chosen_plan": hl.get("field_energy_chosen_plan"),
+                "field_energy_anchor": hl.get("field_energy_anchor"),
+                "field_energy_stay_plan": hl.get("field_energy_stay_plan"),
+                "field_energy_chosen_minus_anchor": hl.get("field_energy_chosen_minus_anchor"),
+                "field_energy_committed_minus_anchor": (
+                    None if hl.get("field_energy_anchor") is None
+                    else float(e_committed - float(hl["field_energy_anchor"]))),
+                "plan_steps": int(hl.get("plan_steps", 0)), "jumps_in_plan": int(hl.get("jumps_in_plan", 0)),
+                "requested_dist2_at_hold_end": hl.get("requested_dist2_at_hold_end"),
+                "jumps_committed_now": len((hstats.get("jumps") or {})),
+            }
+
         frag_stat: Dict[str, Any] = {"available": False}
         if self._frag:
             lev = float(np.median(self.anchor_row_level[idx])) if len(self.anchor_row_level) == unit.J else 0.0
@@ -1322,6 +2363,7 @@ class DiffusionMode(ModeController):
             }
             self.frag_stats.append(dict(
                 frag_stat, unit=int(unit.index), window_index=int(max(0, self.window_index - 1)),
+                hold=hold_info,
                 ideal_displacement_per_model_step=float(
                     (self._win_log.get("time_process") or {}).get("ideal_displacement_per_model_step", 0.0)),
                 ideal_displacement_per_model_step_at_o1=(
@@ -1393,10 +2435,20 @@ class DiffusionMode(ModeController):
                                 "evaluations": rst.get("evaluations"),
                                 "accepted": rst.get("accepted")},
             "committed_mean_abs_dc": dc_block,
-            "ideal_time_process": (dict(self._win_log.get("time_process") or {}) if self._frag else None),
+            "ideal_time_process": (dict(self._win_log.get("time_process") or {})
+                                   if (self._frag and not self._hold) else None),
+            "hold_plan_chain": hold_info,
             "field_energy_vs_random_fragments": frag_stat,
             "v_norm": summary["v_norm"], "M_D_kappa": float(self.kappa_eff),
         })
+        if self._hold:
+            # one prepared reference is chased for several commits: the "first / best evaluated
+            # tail" record and the evaluation counter belong to ONE commit, not to the hold
+            self._win_evals = 0
+            self._win_first_bd = None
+            self._win_first_val = None
+            self._win_best_bd = None
+            self._win_best_val = None
         return {"v_norm": summary["v_norm"], "v_source": v_src,
                 "field_energy_committed": e_committed,
                 "field_energy_anchor": anchor, "field_energy_pair": pair,
@@ -1406,9 +2458,10 @@ class DiffusionMode(ModeController):
                 "committed_mean_abs_dc": dc_block,
                 "ideal_displacement_per_model_step": float(
                     (self._win_log.get("time_process") or {}).get("ideal_displacement_per_model_step", 0.0))
-                if self._frag else None,
+                if (self._frag and not self._hold) else None,
                 "drift_noise_ratio": ((self._win_log.get("time_process") or {}).get("drift_noise_ratio")
-                                      if self._frag else None),
+                                      if (self._frag and not self._hold) else None),
+                "hold_plan_chain": hold_info,
                 "field_energy_vs_random_fragments": frag_stat}
 
     # ------------------------------------------------------------------ deprecated hook
@@ -1479,10 +2532,76 @@ class DiffusionMode(ModeController):
             "windows_prepared": int(self.window_index),
             "temperature_T_D": self.T_D,
             "fragment_mode": bool(self._frag),
+            "hold_mode": bool(self._hold),
             "fragment_statistics": self._fragment_unit_summary(int(unit.index)),
+            "hold_statistics": self._hold_unit_summary(int(unit.index)),
             "M_D_kappa": float(self.kappa_eff)})
 
     # ------------------------------------------------------------------ signature / trace
+    def _hold_unit_summary(self, unit_index: int) -> Optional[Dict[str, Any]]:
+        """Per-unit summary of the hold-mode chain (HOLD_CONTRACT: candidate plans evaluated per
+        hold, acceptance rate, field energy of the chosen plan vs the anchor, requested move)."""
+        rows = [h for h in self.hold_stats if int(h.get("unit", -1)) == int(unit_index)]
+        if not rows:
+            return None
+
+        def mean(key, src=None):
+            v = [float(h[key]) for h in (src or rows) if h.get(key) is not None]
+            return float(np.mean(v)) if v else None
+
+        op = [h for h in rows if float(h.get("openness_at_hold_start", 0.0)) >= 0.8]
+        sel = int(sum(int(h.get("chain_selections", 0)) for h in rows))
+        mv = int(sum(round(float(h.get("move_acceptance_rate", 0.0)) * int(h.get("chain_selections", 0)))
+                     for h in rows))
+        mp = int(sum(int(h.get("metropolis_proposed", 0)) for h in rows))
+        ma = int(sum(int(h.get("metropolis_accepted", 0)) for h in rows))
+        return {
+            "unit": int(unit_index), "holds": int(len(rows)), "holds_open": int(len(op)),
+            "candidate_plans_evaluated_total": int(sum(int(h["candidate_plans_evaluated"]) for h in rows)),
+            "candidate_plans_evaluated_per_hold": mean("candidate_plans_evaluated"),
+            "chain_selections_total": sel,
+            "move_acceptance_rate": (float(mv) / sel) if sel else None,
+            "lower_than_stay_rate": mean("lower_than_stay_rate"),
+            "drift_informed_rate": mean("drift_informed_rate"),
+            "mean_drift_step_levels": mean("mean_drift_step_levels"),
+            "mean_thermal_step_levels": mean("mean_thermal_step_levels"),
+            "mean_energy_gain_vs_stay": mean("mean_energy_gain_vs_stay"),
+            "mean_energy_gain_vs_stay_open": mean("mean_energy_gain_vs_stay", op),
+            "energy_fidelity": mean("energy_fidelity"),
+            "energy_fidelity_median": (float(np.median([float(h["energy_fidelity"]) for h in rows
+                                                        if h.get("energy_fidelity") is not None]))
+                                      if [h for h in rows if h.get("energy_fidelity") is not None] else None),
+            "lower_than_stay_final_sweep": mean("lower_than_stay_final_sweep"),
+            "energy_fidelity_open": mean("energy_fidelity", op),
+            "energy_stay_minus_best_seen": (
+                None if not [h for h in rows if h.get("energy_best_seen") is not None]
+                else float(np.mean([float(h["energy_stay_hold"]) - float(h["energy_best_seen"])
+                                    for h in rows if h.get("energy_best_seen") is not None]))),
+            "greedy_gap": mean("greedy_gap"),
+            "anneal_iterations": int(rows[-1].get("anneal_iterations", 1)),
+            "frame_visits_per_hold": mean("frame_visits"),
+            "fragment_visits_per_hold": mean("fragment_visits"),
+            "fragment_moves_per_hold": mean("fragment_moves"),
+            "law_version": int(self.hold_law_version),
+            "metropolis_proposals": mp, "metropolis_acceptance_rate": (float(ma) / mp) if mp else None,
+            "field_energy_chosen_plan_mean": mean("field_energy_chosen_plan"),
+            "field_energy_anchor_mean": mean("field_energy_anchor"),
+            "field_energy_stay_plan_mean": mean("field_energy_stay_plan"),
+            "chosen_minus_anchor_mean": mean("field_energy_chosen_minus_anchor"),
+            "chosen_minus_stay_mean": mean("field_energy_chosen_minus_stay"),
+            "holds_with_chosen_below_anchor": int(sum(1 for h in rows if h.get("field_energy_chosen_minus_anchor") is not None
+                                                      and float(h["field_energy_chosen_minus_anchor"]) < 0.0)),
+            "holds_with_chosen_below_stay": int(sum(1 for h in rows if h.get("field_energy_chosen_minus_stay") is not None
+                                                    and float(h["field_energy_chosen_minus_stay"]) < 0.0)),
+            "requested_dist2_at_hold_end_mean": mean("requested_dist2_at_hold_end"),
+            "requested_dist2_at_hold_end_mean_open": mean("requested_dist2_at_hold_end", op),
+            "jumps_in_plan_total": int(sum(int(h.get("jumps_in_plan", 0)) for h in rows)),
+            "plan_steps_total": int(sum(int(h.get("plan_steps", 0)) for h in rows)),
+            "hold_move_scale": float(self.hold_move_scale),
+            "units": ("requested_* are d_xi metric squared distances; 'open' = holds that start at "
+                      "openness >= 0.8; acceptance rates are shares of chain selections / "
+                      "Metropolis proposals (internal iterations, not musical time)"),
+        }
     def _fragment_unit_summary(self, unit_index: int) -> Optional[Dict[str, Any]]:
         """Per-unit summary of the fragment-mode statistics (FRAG_CONTRACT: mean per-step
         displacement of the ideal, drift/noise ratio, committed field energy vs. random
@@ -1539,6 +2658,67 @@ class DiffusionMode(ModeController):
                 s for s in (self._fragment_unit_summary(u) for u in
                             sorted({int(x.get("unit", -1)) for x in self.frag_stats}))
                 if s is not None],
+            "hold_plan_chain_per_hold": list(self.hold_stats),
+            "hold_plan_chain_per_unit": [
+                s for s in (self._hold_unit_summary(u) for u in
+                            sorted({int(x.get("unit", -1)) for x in self.hold_stats}))
+                if s is not None],
+            "hold_revision": {
+                "active": bool(self.hold_stats),
+                "detection": ("unit.realizer_state published by the engine before prepare_reference "
+                              "(hires.reference_hold_seconds > commit_seconds); absent / None = legacy, "
+                              "and then this module is bit-identical to the pre-hold code"),
+                "law": ("the free SDE in xi-space is replaced by a Langevin / Metropolis chain over "
+                        "REALIZABLE plans: state = a plan (one step per commit frame of the hold, "
+                        "each step = end levels + optional playback jumps), proposals = Gaussian "
+                        "level perturbations (sigma = 1.20 * hold_move_scale * o) and jumps to the "
+                        "fragment candidates of the band profile of the drift target "
+                        "xi - tau M_D grad E_D (plus a random position), exact rows from the "
+                        "engine's plan_rows, selection p ~ exp(-E_D / T(o)) with "
+                        "T(o) = hold_temperature_scale * o * spread(E_D over the candidates), then "
+                        "hold_refine_sweeps Metropolis sweeps over the plan"),
+                "field": ("unchanged eq.(28): anchor (fragment sample) / pair / triple / ridge / goal "
+                          "with the coefficients of the committed history, frozen per hold"),
+                "openness": ("o scales the proposal size and the temperature; o = 0 proposes nothing "
+                             "(the plan then holds the current levels and the ideal is the exact "
+                             "composition of doing nothing)"),
+                "published": ("xi_hat[rows] = plan_rows(chosen plan, rows) exactly; the plan is in "
+                              "Target.meta['plan']; rows outside the prepared ones keep the "
+                              "unit-level ideal; GOAL_HOLD rows pinned by fix_hold_rows"),
+                "internal_iterations_vs_musical_time": (
+                    "hold_plan_chain_per_hold[*].candidate_plans_evaluated and .chain_selections are "
+                    "INTERNAL iterations (plan_rows evaluations and Glauber selections) of one hold; "
+                    "musical time is hold_seconds / commit_seconds / musical_time_seconds. No chain "
+                    "step is performed while a reference is frozen"),
+                "keys": {"hold_move_scale": float(self.hold_move_scale),
+                         "hold_level_candidates": int(self.hold_level_candidates),
+                         "hold_jump_candidates": int(self.hold_jump_candidates),
+                         "hold_temperature_scale": float(self.hold_temperature_scale),
+                         "hold_refine_sweeps": int(self.hold_refine_sweeps),
+                         "hold_eval_rows": int(self.hold_eval_rows)},
+                "candidate_plans_evaluated_job_total": int(self.hold_plans_evaluated_total),
+                "chain_selections_job_total": int(self.hold_chain_steps_total),
+                "law_version": int(self.hold_law_version),
+                "fidelity_keys": {"hold_law_version": int(self.hold_law_version),
+                                  "hold_anneal_iterations": int(self.hold_anneal_iterations),
+                                  "hold_anneal_ratio": float(self.hold_anneal_ratio),
+                                  "hold_tracks_per_step": int(self.hold_tracks_per_step),
+                                  "hold_gradient_tracks": int(self.hold_gradient_tracks),
+                                  "hold_mix_ranking": bool(self.hold_mix_ranking),
+                                  "hold_final_temperature": float(self.hold_final_temperature)},
+                "energy_fidelity_note": (
+                    "energy_fidelity = (E_stay - E_plan) / (E_stay - E_best_seen) on the hold rows; "
+                    "E_best_seen is the lowest energy of any FULL plan evaluated during that hold "
+                    "(stay plan, the plan after each annealing sweep, every Metropolis trial), so "
+                    "1.0 means the published plan is the best plan the hold found and a negative "
+                    "value means it ended above the stay plan"),
+                "scaling_note": (
+                    "no code path assumes a number of materials: every track i >= 1 is treated "
+                    "alike, the tracks that may move per frame are capped by hold_tracks_per_step "
+                    "and the finite-difference gradient by hold_gradient_tracks (random subsets), "
+                    "and no combination of tracks is ever enumerated, so the cost per hold grows "
+                    "only through plan_rows itself, i.e. linearly in the number of tracks"),
+            },
             "field_term_breakdown_per_step": [
                 {"unit": s["unit"], "window_index": s["window_index"],
                  "musical_time_seconds": s["musical_time_seconds"],

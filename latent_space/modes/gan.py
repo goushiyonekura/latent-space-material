@@ -89,6 +89,11 @@ class GANMode(ModeController):
     cli_name = "gan"
     internal_id = "gan_coadaptive"
 
+    # origin classes of a reference plan (hold mode).  The generator's categorical lives on these
+    # SLOTS, not on the per-hold plan index, so that what it learns carries across holds and units.
+    HOLD_SLOTS = ("levels_only", "committed_positions", "fragment_candidates", "random_positions")
+    HOLD_SLOT_SHARE = (0.2, 0.3, 0.3, 0.2)
+
     # ------------------------------------------------------------------ construction
     def __init__(self, cfg, analyzer, fs, rng, objective):
         super().__init__(cfg, analyzer, fs, rng, objective)
@@ -159,6 +164,82 @@ class GANMode(ModeController):
         self.reference_source = "uninitialised"
         self._frag_goal_levels: Optional[np.ndarray] = None
         self._frag_bounds: List[Tuple[int, int]] = []
+        # ---------------------------------------------------------------- held realizable ideals
+        # HOLD_CONTRACT (2026-09-16, user item c): in hold mode the reference distribution becomes
+        # exact PLANS that continue from the current state and stay close to the committed history.
+        # None of these keys exist in config.py DEFAULTS (shared file, not edited here), so they are
+        # read with .get and the defaults are documented in the trace and in the report.
+        self.hold_move_scale = float(g("hold_move_scale", 1.0))          # R4: scales the requested move
+        self.hold_candidates = max(2, int(g("hold_reference_candidates", 14)))
+        self.hold_band_lo = float(g("hold_band_lo", 0.0))                # band in units of the hold's flutter
+        self.hold_band_hi = float(g("hold_band_hi", 16.0))
+        self.hold_ratio_min = float(g("hold_move_over_flutter_min", 3.0))  # R4: move vs own flicker
+        self.hold_ratio_max = float(g("hold_move_over_flutter_max", 12.0))
+        self.hold_level_move = float(g("hold_level_move", 0.7))          # level gesture (x o x scale x mag)
+        self.hold_level_floor = float(g("hold_level_floor", 0.3))        # lowest drawn target level
+        self.hold_magnitude_range = (float(g("hold_magnitude_min", 0.3)), float(g("hold_magnitude_max", 1.5)))
+        self.hold_jump_probability = float(g("hold_jump_probability", 0.35))
+        self.hold_search_rows = max(2, int(g("hold_search_rows", 4)))    # extra rows used while screening
+        self.hold_keep_min = max(1, int(g("hold_keep_min", 2)))
+        self.hold_keep_max = max(1, int(g("hold_keep_max", 3)))
+        self.hold_fragment_pool = max(1, int(g("hold_fragment_pool", 4)))
+        self.hold_steady_factor = max(1, int(g("hold_steadiness_factor", 4)))
+        self.hold_max_jumps = max(1, int(g("hold_max_jumps_per_plan", 3)))  # cap for M = 9 ... 25
+        self.hold_w_sigma_init = float(g("hold_w_sigma_init", 0.08))     # level-space displacement w
+        self.hold_w_sigma_min = float(g("hold_w_sigma_min", 0.01))
+        self.hold_w_sigma_max = float(g("hold_w_sigma_max", 0.30))
+        self.hold_flutter_floor = float(g("hold_flutter_floor", 1e-3))
+        n_slot, n_w = len(self.HOLD_SLOTS), max(1, self.M - 1)
+        self.h_logits = np.zeros(n_slot)
+        self.h_mu = np.zeros((n_slot, n_w))
+        self.h_log_sigma = np.full((n_slot, n_w), np.log(max(self.hold_w_sigma_init, 1e-9)))
+        self.h_inheritance = "uninitialised"
+        self._hold_seen = False           # hold mode has been active at least once in this job
+        self._hold_active = False         # hold mode is active in this unit
+        self._hold: Optional[Dict[str, Any]] = None
+        self._hold_counter = 0
+        self._hold_records: List[Dict[str, Any]] = []
+        self.hold_traces: List[Dict[str, Any]] = []
+        self._committed_positions: List[List[int]] = [[] for _ in range(self.M)]
+        self._flutter_ema: Optional[float] = None
+        self._realized_flutter: Optional[float] = None
+        # ------------------------------------------------ real data (docs/FIDELITY_CONTRACT.md, C)
+        # The positives of D are no longer plans at all: they are the exact composition rows of
+        # UNMANIPULATED playback - every track plays on continuously from a random position at a
+        # constant level (levels drawn from the committed ones, the goal track on its schedule).
+        # D therefore learns how the actual recordings MOVE, and the feature map carries explicit
+        # block-to-block motion terms.  `hold_positive_source = "plans"` restores the previous law.
+        self.hold_positive_source = str(g("hold_positive_source", "recordings"))
+        if self.hold_positive_source not in ("recordings", "plans"):
+            self.hold_positive_source = "recordings"
+        self.hold_real_positives = max(2, int(g("hold_real_positives", 8)))      # >= 8 windows / hold
+        self.hold_psi_blocks = max(2, int(g("hold_psi_blocks", 4)))              # commit blocks in psi
+        self.hold_psi_scale_samples = max(4, int(g("hold_psi_scale_samples", 24)))
+        # positives are drawn mostly NEAR what is playing, so that "where" (mean spectrum,
+        # contributions) stops giving the answer away and D has to judge how the sound MOVES
+        self.hold_real_near_share = float(g("hold_real_near_share", 0.8))
+        self.hold_real_offset_seconds = float(g("hold_real_offset_seconds", 4.0))
+        self.hold_logit_clip = float(g("hold_logit_clip", 6.0))
+        self.hold_d_l2 = float(g("hold_d_l2", 1e-3))
+        # the hold reward is bounded (a clipped logit, order 1) instead of -log D (order 13),
+        # so the REINFORCE step size of the hold generator is scaled up to stay effective
+        self.hold_lr_G_scale = float(g("hold_lr_G_scale", 20.0))
+        hn = ([f"mean_phi[{k}]" for k in range(self.d_phi)]
+              + [f"sd_phi[{k}]" for k in range(self.d_phi)]
+              + [f"dblock_phi[{k}]" for k in range(self.d_phi)]
+              + [f"mean_c[{i}]" for i in range(self.M)]
+              + [f"dblock_c[{i}]" for i in range(self.M)]
+              + ["mean_R", "sd_R", "n_eff", "hop_dist2", "block_dist2",
+                 "within_block_dist2", "span_dist2", "bias"])
+        self.h_psi_names = hn
+        self.d_psi_hold = len(hn)
+        self.h_phi = np.zeros(self.d_psi_hold)
+        self.h_psi_mean = np.zeros(self.d_psi_hold)
+        self.h_psi_std = np.ones(self.d_psi_hold)
+        self.h_psi_scale_source = "uninitialised"
+        self.h_psi_scale_n = 0
+        self._committed_levels: List[np.ndarray] = []
+        self._hist_blocks: List[Tuple[np.ndarray, np.ndarray]] = []   # rolling committed blocks
         # psi layout (eq. 42): fixed for the whole job, so phi carries over between units
         oi, oj = [], []
         for i in range(self.M):
@@ -271,13 +352,14 @@ class GANMode(ModeController):
                      - float(np.log(sig).sum()) - 0.5 * self.r * np.log(2.0 * np.pi))
 
     def _d_loss(self, Psi_ref: np.ndarray, w_ref: np.ndarray, Psi_gen: np.ndarray,
-                phi: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+                phi: np.ndarray, l2: Optional[float] = None) -> Tuple[float, np.ndarray, np.ndarray]:
         """Eq. (43) with the reference weights r_b on the positive term."""
         D_ref = _sigmoid(Psi_ref @ phi)
         D_gen = _sigmoid(Psi_gen @ phi) if len(Psi_gen) else np.zeros(0)
         pos = -float((w_ref * np.log(np.clip(D_ref, 1e-12, 1.0))).sum())
         neg = -float(np.log(np.clip(1.0 - D_gen, 1e-12, 1.0)).mean()) if len(D_gen) else 0.0
-        return pos + neg + self.l2 * float(phi @ phi), D_ref, D_gen
+        lam = self.l2 if l2 is None else float(l2)
+        return pos + neg + lam * float(phi @ phi), D_ref, D_gen
 
     # ================================================================== 10.2 reference set
     def fragment_mode(self) -> bool:
@@ -428,6 +510,749 @@ class GANMode(ModeController):
             out[f"reference_{tag}_displacement_mean"] = float(np.mean(np.sqrt(vals))) if vals else None
         return out
 
+    # ================================================================== hold mode (HOLD_CONTRACT)
+    # The engine holds one ideal for `hires.reference_hold_seconds` and publishes
+    # `unit.realizer_state` with an exact plan evaluator.  The ideal must then be the exact rows of
+    # a REALIZABLE plan, and (user item c) the reference distribution must be narrowed to
+    # continuations that stay close to the committed history instead of unrelated random mixes.
+    #
+    #   reference plan  = level moves on the commit grid of the hold (scale ∝ hold_move_scale ∝ o)
+    #                     plus, for tracks whose minimum clip length allows it, ONE jump to a
+    #                     position of its origin class (slot);
+    #   narrowing       = keep the plans whose rows lie in a distance band [d_min, d_max] (d_xi²)
+    #                     around the anchor, the mean of the last committed block - i.e. neither
+    #                     the unchanged sound nor an unrelated mix.  The band is expressed in units
+    #                     of the hold's OWN flutter (measured from the unchanged continuation), so
+    #                     it follows the material instead of a hard-coded number;
+    #   weights r_b     = eq. (40) among the kept plans (J_ref = E_form + 0.2 E_hist at tau_ref);
+    #   generator       = p_Theta(b, w): a categorical over the slots (logits carried across holds
+    #                     and units) times the eq. (40) weights inside the drawn slot, and a
+    #                     Gaussian displacement w of the MATERIAL LEVELS of the plan's steps
+    #                     (clipped into [0, 1] - realizable by construction).  The xi-space
+    #                     displacement B_ref w of eq. (41) is NOT added here: it is not realizable.
+    def _restore_hold_generator(self, history) -> None:
+        """Generator parameters of the hold law at the first hold of a unit.
+
+        Unlike the coefficients w of eq. (41) - whose basis B_ref is rebuilt per unit, so they are
+        re-initialised - the hold displacement lives in LEVEL space, which has the same acoustic
+        meaning in every unit (the material gains).  Slot logits, mu and log_sigma are therefore
+        inherited from `history.mode_state['gan']['hold_generator']` when they are usable."""
+        n_slot, n_w = len(self.HOLD_SLOTS), max(1, self.M - 1)
+        self.h_logits = np.zeros(n_slot)
+        self.h_mu = np.zeros((n_slot, n_w))
+        self.h_log_sigma = np.full((n_slot, n_w), np.log(max(self.hold_w_sigma_init, 1e-9)))
+        got: List[str] = []
+        st = history.mode_state.get("gan") if hasattr(history, "mode_state") else None
+        hg = st.get("hold_generator") if isinstance(st, dict) else None
+        if isinstance(hg, dict):
+            lg = np.asarray(hg.get("logits", []), dtype=np.float64)
+            mu = np.asarray(hg.get("mu", []), dtype=np.float64)
+            ls = np.asarray(hg.get("log_sigma", []), dtype=np.float64)
+            if lg.shape == (n_slot,) and np.all(np.isfinite(lg)):
+                self.h_logits = lg
+                got.append("logits")
+            if mu.shape == (n_slot, n_w) and np.all(np.isfinite(mu)):
+                self.h_mu = mu
+                got.append("mu")
+            if ls.shape == (n_slot, n_w) and np.all(np.isfinite(ls)):
+                self.h_log_sigma = np.clip(ls, np.log(self.hold_w_sigma_min), np.log(self.hold_w_sigma_max))
+                got.append("log_sigma")
+        self.h_inheritance = ("inherited: " + ", ".join(got) if got else
+                              "cold (logits 0, mu 0, sigma = hold_w_sigma_init)")
+
+    # ---------------------------------------------------------------- real data / motion features
+    def _hold_psi_raw(self, xi_rows: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        """Hold-mode feature map psi_h: WHERE the sound is and HOW it moves.
+
+        The rows of one update window are cut into commit blocks; besides the usual level of
+        description (band/energy means, contributions, relation and energy scalars) the map carries
+        explicit MOTION terms - the mean absolute block-to-block change of the band features and of
+        the contributions, the hop and block distances, the within-block motion (the flutter that
+        splices and ramps produce) and the span of the window.  Every term is either fixed-length in
+        the bands or linear in the number of tracks, so it survives M = 9 ... 25 unchanged."""
+        an = self.analyzer
+        x = np.asarray(xi_rows, dtype=np.float64)
+        rows = np.asarray(rows)
+        fm = self.unit.free_mask[rows]
+        if fm.any() and not fm.all():
+            x, rows = x[fm], rows[fm]
+        n = len(x)
+        phi, c, Rup = an.split(x)
+        nb_ = max(1, int(self.block_rows))
+        edges = list(range(0, n, nb_))
+        Bm = np.stack([x[a:min(a + nb_, n)].mean(axis=0) for a in edges]) if n else x
+        bphi, bc, _bR = an.split(Bm)
+        if len(Bm) >= 2:
+            dphi = np.abs(np.diff(bphi, axis=0)).mean(axis=0)
+            dc = np.abs(np.diff(bc, axis=0)).mean(axis=0)
+            blk_d2 = float(an.dist2(Bm[1:], Bm[:-1]).mean())
+            span = float(an.dist2(Bm[-1][None, :], Bm[0][None, :])[0])
+        else:
+            dphi = np.zeros(self.d_phi)
+            dc = np.zeros(self.M)
+            blk_d2 = span = 0.0
+        hop_d2 = float(an.dist2(x[1:], x[:-1]).mean()) if n >= 2 else 0.0
+        wit = [float(an.dist2(x[a:min(a + nb_, n)], x[a:min(a + nb_, n)].mean(axis=0)[None, :]).mean())
+               for a in edges if min(a + nb_, n) - a >= 2]
+        within = float(np.mean(wit)) if wit else 0.0
+        nong = c[:, 1:].sum(axis=1)
+        p = c[:, 1:] / (nong[:, None] + 1e-12)
+        n_eff = float(np.where(nong > 1e-9, 1.0 / (np.sum(p * p, axis=1) + 1e-12), 0.0).mean())
+        # (log_energy == mean_phi[0] and goal_c == mean_c[0] were redundant and are gone)
+        return np.concatenate([phi.mean(axis=0), phi.std(axis=0), dphi, c.mean(axis=0), dc,
+                               [float(Rup.mean()), float(Rup.std()), n_eff,
+                                hop_d2, blk_d2, within, span, 1.0]])
+
+    def _hold_psi(self, xi_rows: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        return (self._hold_psi_raw(xi_rows, rows) - self.h_psi_mean) / self.h_psi_std
+
+    def _draw_levels_like_committed(self, rng, levels_now: np.ndarray) -> np.ndarray:
+        """A constant level vector drawn like the committed ones, so that the level alone does not
+        tell a real window from the committed sound (the whole committed vector is re-used, which
+        keeps the joint distribution over the tracks)."""
+        if self._committed_levels:
+            k = int(rng.integers(0, len(self._committed_levels)))
+            lv = np.asarray(self._committed_levels[k], dtype=np.float64).copy()
+            if len(lv) == self.M:
+                return np.clip(lv, 0.0, 1.0)
+        return np.clip(np.asarray(levels_now, dtype=np.float64).copy(), 0.0, 1.0)
+
+    def _hold_real_windows(self, unit: UnitContext, rs: Dict[str, Any], rows: np.ndarray,
+                           n: int, rng, anchor: Optional[np.ndarray] = None) -> List[np.ndarray]:
+        """`n` exact composition trajectories of UNMANIPULATED playback on `rows`: every track plays
+        on continuously from ONE position of its own source at a constant level, the goal track keeps
+        its position and its scheduled gain.  Computed with the analyzer's exact Gram machinery
+        (`grams_at_positions` / `material_features_at` / `composition_from_grams`), exactly as the
+        realized composition is computed - nothing here is a model of the sound.
+
+        The positions are drawn mostly NEAR what is playing (the current position continued, a
+        recently committed position, or a fragment that `fragment_candidates_mix` ranks close to the
+        recent committed mixture - each shifted by a random offset of a few seconds) and only a
+        minority uniformly over the source.  Otherwise D could answer "real or not" from the mean
+        spectrum alone instead of from how the sound moves.  One extra leading row is evaluated and
+        dropped so that the first row carries a real spectral flux and not the 0 of a sequence
+        start - the same artefact the engine now removes on the committed side."""
+        an = self.analyzer
+        src = self.sources
+        rows = np.asarray(rows)
+        pre = int(rows[0]) - 1
+        ext = np.concatenate([[pre], rows]) if pre >= 0 else rows
+        starts = (unit.centers[ext] - an.W // 2).astype(np.int64)
+        d = (starts - starts[0]).astype(np.int64)
+        rs_rows = np.asarray(rs["rows"])
+        gg = np.asarray(rs.get("goal_gains", np.zeros(len(rs_rows))), dtype=np.float64)
+        k = np.searchsorted(rs_rows, ext)
+        goal = (gg[np.clip(k, 0, len(gg) - 1)] if len(gg) == len(rs_rows) else np.zeros(len(ext)))
+        lv_now = np.asarray(rs["levels"], dtype=np.float64)
+        pos_now = np.asarray(rs["positions"], dtype=np.int64)
+        off = max(1, int(round(self.hold_real_offset_seconds * self.fs)))
+        tgt = np.asarray(anchor, dtype=np.float64) if anchor is not None else None
+        mixed = getattr(an, "fragment_candidates_mix", None)
+        out: List[np.ndarray] = []
+        src_counts = {"current": 0, "committed": 0, "mixture_candidate": 0, "random": 0}
+        for _ in range(int(n)):
+            lv = self._draw_levels_like_committed(rng, lv_now)
+            pos = np.zeros((len(ext), self.M), dtype=np.int64)
+            for i in range(self.M):
+                L = int(src[i].shape[0])
+                if i == 0:
+                    pos[:, i] = (int(pos_now[i]) + d) % L
+                    continue
+                kind = "random"
+                if float(rng.random()) < self.hold_real_near_share:
+                    opts = ["current"]
+                    if self._committed_positions[i]:
+                        opts.append("committed")
+                    if mixed is not None and tgt is not None:
+                        opts.append("mixture_candidate")
+                    kind = opts[int(rng.integers(0, len(opts)))]
+                if kind == "current":
+                    base = int(pos_now[i]) + int(rng.integers(-off, off + 1))
+                elif kind == "committed":
+                    pool = self._committed_positions[i]
+                    base = int(pool[int(rng.integers(0, len(pool)))]) + int(rng.integers(-off, off + 1))
+                elif kind == "mixture_candidate":
+                    others = an.mixture_band_energy(pos_now, lv, skip=i)
+                    cands = mixed(i, tgt[: 1 + an.nb], others, float(lv[i]), 4)
+                    base = int(cands[int(rng.integers(0, len(cands)))]) + int(rng.integers(-off, off + 1))
+                else:
+                    base = int(rng.integers(0, L))
+                src_counts[kind] += 1
+                pos[:, i] = (int(base) + d) % L
+            g = np.repeat(lv[None, :], len(ext), axis=0)
+            g[:, 0] = goal
+            _f, S, _c = an.material_features_at(pos)
+            G0, Gb = an.grams_at_positions(src, starts, pos)
+            xi = an.composition_from_grams(g, G0, Gb, S)[0]
+            out.append(xi[1:] if pre >= 0 else xi)
+        self._real_position_sources = src_counts
+        return out
+
+    def _hold_psi_scales(self, history, samples: List[np.ndarray], rows: np.ndarray) -> None:
+        """Standardisation of psi_h: computed ONCE, from a sample of real (unmanipulated) windows of
+        the first hold of the job, then frozen so that the inherited h_phi keeps its meaning."""
+        st = history.mode_state.get("gan") if hasattr(history, "mode_state") else None
+        hd = st.get("hold_discriminator") if isinstance(st, dict) else None
+        if isinstance(hd, dict):
+            m = np.asarray(hd.get("psi_mean", []), dtype=np.float64)
+            s = np.asarray(hd.get("psi_std", []), dtype=np.float64)
+            f = np.asarray(hd.get("phi", []), dtype=np.float64)
+            if m.shape == (self.d_psi_hold,) and s.shape == (self.d_psi_hold,) and np.all(np.isfinite(m)):
+                self.h_psi_mean, self.h_psi_std = m, np.maximum(s, 1e-6)
+                self.h_psi_scale_source = "frozen_from_the_first_hold"
+                self.h_psi_scale_n = int(hd.get("psi_scale_n", 0))
+                if f.shape == (self.d_psi_hold,) and np.all(np.isfinite(f)):
+                    self.h_phi = f
+                return
+        P = np.stack([self._hold_psi_raw(x, rows) for x in samples])
+        m = P.mean(axis=0)
+        s = np.maximum(P.std(axis=0), 1e-3)
+        m[-1] = 0.0
+        s[-1] = 1.0
+        self.h_psi_mean, self.h_psi_std = m, s
+        self.h_psi_scale_source = "real_unmanipulated_windows_of_the_first_hold"
+        self.h_psi_scale_n = int(len(samples))
+
+    def _h_phi_split(self) -> Dict[str, Any]:
+        """How much of the discriminator's weight norm sits on WHERE the sound is and how much on
+        HOW it moves - the honest read-out of what D actually separates on."""
+        motion = ("sd_phi", "dblock_phi", "dblock_c", "hop_dist2", "block_dist2",
+                  "within_block_dist2", "span_dist2", "sd_R")
+        g2: Dict[str, float] = {}
+        for nme, v in zip(self.h_psi_names, self.h_phi):
+            g2[nme.split("[")[0]] = g2.get(nme.split("[")[0], 0.0) + float(v) * float(v)
+        w = float(np.sqrt(sum(v for k, v in g2.items() if k not in motion and k != "bias")))
+        m = float(np.sqrt(sum(v for k, v in g2.items() if k in motion)))
+        return {"where": w, "motion": m, "motion_share": (m / max(1e-12, w + m)),
+                "by_group": {k: round(float(np.sqrt(v)), 3) for k, v in
+                             sorted(g2.items(), key=lambda x: -x[1])},
+                "norm": float(np.linalg.norm(self.h_phi))}
+
+    def _hold_alphas(self) -> np.ndarray:
+        z = self.h_logits - self.h_logits.max()
+        e = np.exp(z)
+        return e / e.sum()
+
+    def _hold_log_p(self, slot: int, w: np.ndarray) -> float:
+        """log p_Theta(slot, w) = log alpha_slot + log N(w; mu_slot, diag sigma_slot²).
+
+        The choice of one kept plan inside the drawn slot uses the eq. (40) weights r_b, which are
+        data and carry no parameter, so they are not part of p_Theta (they cancel in the importance
+        ratio).  Likewise the per-hold restriction to the slots that survived the narrowing is
+        treated as part of the environment, not of p_Theta."""
+        a = self._hold_alphas()
+        sig = np.maximum(np.exp(self.h_log_sigma[int(slot)]), 1e-12)
+        z = (np.asarray(w, dtype=np.float64) - self.h_mu[int(slot)]) / sig
+        return float(np.log(max(float(a[int(slot)]), 1e-300)) - 0.5 * float((z * z).sum())
+                     - float(np.log(sig).sum()) - 0.5 * len(sig) * np.log(2.0 * np.pi))
+
+    def _clip_steadiness(self, track: int, positions: Sequence[int]) -> np.ndarray:
+        """How much the band profile of each candidate fragment moves WITHIN its clip: the summed
+        variance of the normalized band ratios over the solo-bank rows that follow the position.
+
+        Measured on the realized sound, the fast motion the engine divides the requested move by
+        (`hold_summary.realized_flutter_dist2`) sits almost entirely in the band block of xi and is
+        a property of the material at the played positions - level ramps add ~0.  A reference that
+        sends the sound into a fragment whose spectrum flickers therefore raises the denominator of
+        its own move.  The reference distribution prefers steady fragments for that reason."""
+        an = self.analyzer
+        f = getattr(an, "solo_f", None)
+        pos = np.asarray(list(positions), dtype=np.int64)
+        if f is None or not len(pos):
+            return np.zeros(len(pos))
+        fi = f[track]
+        P = len(fi)
+        n = max(2, int(getattr(an, "frag_rows", 2)))
+        k = np.clip(np.round(pos / float(an.solo_hop)).astype(np.int64), 0, P - 1)
+        idx = (k[:, None] + np.arange(n)[None, :]) % P
+        v = fi[idx][:, :, 1:1 + an.nb]
+        return v.var(axis=1).sum(axis=1)
+
+    def _steadiest(self, track: int, positions: Sequence[int], n: int) -> List[int]:
+        pos = list(dict.fromkeys(int(p) for p in positions))
+        if len(pos) <= n:
+            return pos
+        st = self._clip_steadiness(track, pos)
+        return [int(pos[k]) for k in np.argsort(st)[:n]]
+
+    def _hold_position_pools(self, unit: UnitContext, history, anchor: np.ndarray,
+                             positions_now: np.ndarray) -> Dict[str, Any]:
+        """Positions a reference plan may jump to, per origin class (user item c).
+
+        committed  : `src_position` of the committed events and the playback positions the realizer
+                     actually committed earlier in this job (`stats['positions']`) - a jump back to
+                     a fragment the piece has already used;
+        fragment   : `an.fragment_candidates` for the band profile of the RECENT COMMITTED
+                     compositions (history.recent_xi), i.e. fragments that sound like what has just
+                     been committed;
+        random     : fresh uniform positions (the small exploration share)."""
+        an = self.analyzer
+        nb = int(an.nb)
+        committed: List[List[int]] = [[] for _ in range(self.M)]
+        for e in getattr(history, "events", [])[-64:]:
+            i = int(e.get("track", -1))
+            p = e.get("src_position")
+            if 0 < i < self.M and p is not None:
+                committed[i].append(int(p))
+        for i in range(1, self.M):
+            committed[i].extend(int(p) for p in self._committed_positions[i][-24:])
+        rec = [x for x in getattr(history, "recent_xi", [])[-4:] if len(x)]
+        if rec:
+            ratios = np.concatenate(rec, axis=0)[:, 1:1 + nb].mean(axis=0)
+        else:
+            ratios = np.asarray(anchor, dtype=np.float64)[1:1 + nb]
+        frag: List[List[int]] = [[] for _ in range(self.M)]
+        if getattr(an, "frag_f", None) is not None:
+            for i in range(1, self.M):
+                wide = [int(p) for p in an.fragment_candidates(
+                    i, ratios, self.hold_fragment_pool * self.hold_steady_factor,
+                    exclude_near=int(positions_now[i]), exclude_frames=0)]
+                frag[i] = self._steadiest(i, wide, self.hold_fragment_pool)
+        for i in range(1, self.M):
+            committed[i] = self._steadiest(i, committed[i], self.hold_fragment_pool)
+        return {"committed": committed, "fragment": frag, "band_profile_source":
+                ("recent committed rows" if rec else "anchor"),
+                "n_committed": [len(committed[i]) for i in range(self.M)]}
+
+    def _hold_draw_plan(self, unit: UnitContext, slot: int, mag: float, step_frames: List[int],
+                        levels_now: np.ndarray, next_jump: List[int], goal_at, pools: Dict[str, Any],
+                        jumps_on: bool, o0: float) -> Dict[str, Any]:
+        """One candidate reference plan.
+
+        Levels: a smooth gesture from the current levels toward a drawn target
+        `lv + beta (u - lv)`, u ~ U(0,1)^{M-1}, beta = hold_move_scale x mag x hold_level_move x o
+        clipped into [0, 1], distributed evenly over the commit steps of the hold - so each step is
+        one Q5 ramp the realizer can play and the ideal moves at a constant rate through the hold.
+        Jumps: all at the hold start (the plan's first step), each eligible track (minimum clip
+        length) with probability `hold_jump_probability`, from the slot's position pool.  Keeping
+        the cuts on the hold boundary leaves the later commit blocks of the hold free of material
+        discontinuities - the sound's own fast motion (flutter) stays small while the requested
+        move over the hold does not."""
+        rng = self.rng
+        beta = float(np.clip(self.hold_move_scale * float(mag) * self.hold_level_move * float(o0), 0.0, 1.0))
+        jumps0: Dict[int, int] = {}
+        n_fallback = 0
+        f0 = int(step_frames[0])
+        if jumps_on and slot > 0:
+            # which tracks cut at the hold start; capped so that the cost and the number of
+            # simultaneous cuts stay bounded when M grows (2 voices per material, 8-12 materials)
+            elig = [i for i in range(1, self.M)
+                    if f0 >= int(next_jump[i]) and float(rng.random()) < self.hold_jump_probability]
+            if len(elig) > self.hold_max_jumps:
+                elig = [int(x) for x in rng.choice(np.asarray(elig), size=self.hold_max_jumps, replace=False)]
+            for i in elig:
+                pool = pools["committed"][i] if slot == 1 else (pools["fragment"][i] if slot == 2 else [])
+                if pool:
+                    p = int(pool[int(rng.integers(0, len(pool)))])
+                else:
+                    p = int(rng.integers(0, int(self.sources[i].shape[0])))
+                    if slot != 3:
+                        n_fallback += 1
+                jumps0[int(i)] = int(p)
+        lv0 = np.asarray(levels_now, dtype=np.float64)
+        # target levels stay above `hold_level_floor`: a mixture whose materials are all near zero
+        # has a noisy normalized band profile, and that noise lands in the very fast motion the
+        # requested move is measured against (it is also what E_form's energy / N_eff terms guard)
+        u = self.hold_level_floor + (1.0 - self.hold_level_floor) * rng.uniform(0.0, 1.0, max(1, self.M - 1))
+        target = lv0[1:] + beta * (u - lv0[1:])
+        steps: List[Dict[str, Any]] = []
+        n = len(step_frames)
+        for k, f in enumerate(step_frames):
+            lv = lv0.copy()
+            lv[1:] = np.clip(lv0[1:] + (float(k + 1) / float(n)) * (target - lv0[1:]), 0.0, 1.0)
+            lv[0] = float(goal_at(f))
+            steps.append({"frame": int(f), "jumps": (dict(jumps0) if k == 0 else {}),
+                          "levels": [float(x) for x in lv]})
+        return {"steps": steps, "slot": int(slot), "magnitude": float(mag), "beta": beta,
+                "target_levels": [round(float(x), 3) for x in target],
+                "n_jumps": len(jumps0), "pool_fallbacks": int(n_fallback)}
+
+    def _hold_prepare(self, unit: UnitContext, history, rows: np.ndarray, xi_anchor: np.ndarray,
+                      n_proposals: int, rs: Dict[str, Any]) -> List[Target]:
+        """One hold: draw the reference plans, narrow them to the committed history, weight them by
+        eq. (40) and publish the EXACT rows of a plan drawn from p_Theta(b, w)."""
+        an = self.analyzer
+        rng = self.rng
+        plan_eval = rs["plan_rows"]
+        rows = np.asarray(rows)
+        anchor = np.asarray(xi_anchor, dtype=np.float64)
+        if not self._hold_active:
+            self._hold_active = True
+            self._hold_seen = True
+            self._restore_hold_generator(history)
+            self.reference_source = "hold_exact_plans_narrowed_to_the_committed_history"
+        hold_id = int(self._hold_counter)
+        self._hold_counter += 1
+        t0, commit = int(rs["frame"]), max(1, int(rs["commit_frames"]))
+        hold_f = max(commit, int(rs["hold_frames"]))
+        search_end = int(rs["search_end_frame"])
+        levels_now = np.asarray(rs["levels"], dtype=np.float64).copy()
+        next_jump = [int(x) for x in rs["next_jump_frame"]]
+        positions_now = np.asarray(rs["positions"], dtype=np.int64)
+        jumps_on = bool(rs["jumps_enabled"]) and self.M > 1 and getattr(self, "sources", None) is not None
+        centers = unit.centers[rows]
+        free = unit.free_mask[rows]
+        goal_gains = np.asarray(rs.get("goal_gains", np.zeros(len(rows))), dtype=np.float64)
+
+        def goal_at(f: int) -> float:
+            k = int(np.clip(np.searchsorted(centers, int(f)), 0, len(rows) - 1))
+            return float(goal_gains[k]) if len(goal_gains) == len(rows) else 0.0
+
+        step_frames = [t0 + k * commit for k in range(max(1, int(round(hold_f / commit))))
+                       if t0 + k * commit < search_end]
+        if not step_frames:
+            step_frames = [int(t0)]
+        # rows of the last commit block of the hold: where the engine measures the requested move
+        end_m = (centers >= t0 + hold_f - commit) & (centers < t0 + hold_f)
+        if not (end_m & free).any():
+            end_m = np.zeros(len(rows), dtype=bool)
+            end_m[-1] = True
+        end_idx = np.where(end_m & free)[0] if (end_m & free).any() else np.where(end_m)[0]
+        in_hold = np.where(centers < t0 + hold_f)[0]
+        if len(in_hold) == 0:
+            in_hold = np.arange(len(rows))
+        spread = in_hold[np.linspace(0, len(in_hold) - 1, min(self.hold_search_rows, len(in_hold))).astype(int)]
+        pre = np.array([end_idx[0] - 1]) if end_idx[0] > 0 else np.zeros(0, dtype=np.int64)
+        sub_idx = np.unique(np.concatenate([spread, pre, end_idx]).astype(np.int64))
+        sub_rows = rows[sub_idx]
+        end_in_sub = np.searchsorted(sub_idx, end_idx)
+        free_sub = unit.free_mask[sub_rows]
+        n_eval = 0
+        pre_row = int(rows[0]) - 1
+
+        def ev(steps, rws):
+            """`plan_rows` with one extra leading row, so that the spectral flux of the first row of
+            interest is computed from its true predecessor instead of being 0 (the flux of a row is
+            the positive change of the band ratios against the previous row of the evaluated
+            sequence).  Without it every hold would start with an artificial flux step."""
+            rws = np.asarray(rws, dtype=np.int64)
+            if pre_row < 0:
+                return plan_eval(steps, rws)
+            xi_e, parts_e, info_e = plan_eval(steps, np.concatenate([[pre_row], rws]))
+            parts_e = {k: (v[1:] if isinstance(v, np.ndarray) and len(v) == len(rws) + 1 else v)
+                       for k, v in parts_e.items()}
+            return xi_e[1:], parts_e, info_e
+
+        # ---- the unchanged continuation: the material's own flutter over this hold sets the band
+        xi_none, _p_none, _i_none = ev([], rows)
+        n_eval += 1
+        blk = ((centers - t0) // commit).astype(np.int64)
+        fl = [float(an.dist2(xi_none[m], xi_none[m].mean(axis=0)[None, :]).mean())
+              for b_ in np.unique(blk[in_hold]) for m in [free & (blk == b_)] if int(m.sum()) >= 3]
+        flutter_local = float(np.mean(fl)) if fl else self.hold_flutter_floor
+        flutter_local = max(flutter_local, self.hold_flutter_floor)
+        self._flutter_ema = (flutter_local if self._flutter_ema is None
+                             else 0.7 * self._flutter_ema + 0.3 * flutter_local)
+        # The band is set on the sound's OWN fast motion, exactly the quantity the engine divides
+        # by: the mean d_xi² of a committed row to its commit-block mean, as an EMA over the
+        # committed blocks so far.  (Measured: that motion sits almost entirely in the band-ratio
+        # block of xi and is a property of the material at the played positions - level ramps
+        # contribute ~0 and a jump ~25% - so it does not run away with the size of the request.)
+        # Before the first committed block the unchanged continuation of this hold stands in.
+        flutter = max(float(self._realized_flutter if self._realized_flutter is not None
+                            else flutter_local), self.hold_flutter_floor)
+        o0 = float(unit.o[rows[0]])
+        s2 = (self.hold_move_scale * o0) ** 2
+        lo, hi = self.hold_band_lo * flutter * s2, self.hold_band_hi * flutter * s2
+        d_none = float(an.dist2(xi_none[end_idx].mean(axis=0)[None, :], anchor[None, :])[0])
+
+        # ---- B candidate plans, screened on a row subset
+        avail = [0] + ([1, 2, 3] if jumps_on else [])
+        if jumps_on and getattr(an, "frag_f", None) is None:
+            avail = [0, 1, 3]
+        tot = sum(self.HOLD_SLOT_SHARE[s] for s in avail)
+        counts = {s: max(1, int(round(self.hold_candidates * self.HOLD_SLOT_SHARE[s] / tot))) for s in avail}
+        plan_slots: List[int] = []
+        for s in avail:
+            plan_slots.extend([s] * counts[s])
+        plan_slots = plan_slots[: max(len(avail), self.hold_candidates)]
+        while len(plan_slots) < self.hold_candidates:
+            plan_slots.append(avail[len(plan_slots) % len(avail)])
+        pools = self._hold_position_pools(unit, history, anchor, positions_now)
+        m0, m1 = self.hold_magnitude_range
+        cands: List[Dict[str, Any]] = []
+        for slot in plan_slots:
+            mag = float(np.exp(rng.uniform(np.log(max(m0, 1e-6)), np.log(max(m1, m0 + 1e-6)))))
+            pl = self._hold_draw_plan(unit, slot, mag, step_frames, levels_now, next_jump,
+                                      goal_at, pools, jumps_on, o0)
+            xi_s, _ps, info_s = ev(pl["steps"], sub_rows)
+            n_eval += 1
+            pl["xi_sub"] = xi_s
+            pl["d_anchor"] = float(an.dist2(xi_s[end_in_sub].mean(axis=0)[None, :], anchor[None, :])[0])
+            # the plan's OWN fast motion inside the last commit block of the hold.  The realizer
+            # follows a realizable ideal almost exactly, so this is what the engine will measure as
+            # `realized_flutter_dist2`: a plan whose move is not clearly above its own flicker asks
+            # for a gesture that cannot be heard as a gesture (R4).
+            xe = xi_s[end_in_sub]
+            pl["flutter"] = (float(an.dist2(xe, xe.mean(axis=0)[None, :]).mean()) if len(xe) >= 3
+                             else float(flutter))
+            pl["move_over_flutter"] = pl["d_anchor"] / max(pl["flutter"], self.hold_flutter_floor)
+            pl["dropped_jumps"] = len(info_s["dropped_jumps"])
+            cands.append(pl)
+
+        def spread_of(idx: Sequence[int]) -> float:
+            if len(idx) < 2:
+                return 0.0
+            xs = [cands[a]["xi_sub"][free_sub] if free_sub.any() else cands[a]["xi_sub"] for a in idx]
+            return float(np.mean([float(an.dist2(xs[a], xs[b_]).mean())
+                                  for a in range(len(xs)) for b_ in range(a + 1, len(xs))]))
+
+        # ---- NARROWING: keep the plans inside the band around the committed history (the anchor)
+        d_all = np.array([c["d_anchor"] for c in cands])
+        rat_all = np.array([c["move_over_flutter"] for c in cands])
+        in_band = np.where((rat_all >= self.hold_ratio_min) & (rat_all <= self.hold_ratio_max)
+                           & (d_all <= hi))[0]
+        keep = list(in_band)
+        widened = ""
+        if len(keep) < self.hold_keep_min:
+            pen = (np.maximum(self.hold_ratio_min - rat_all, 0.0) / max(self.hold_ratio_min, 1e-9)
+                   + np.maximum(rat_all - self.hold_ratio_max, 0.0) / max(self.hold_ratio_max, 1e-9)
+                   + np.maximum(d_all - hi, 0.0) / max(hi, 1e-9))
+            keep = [int(k) for k in np.argsort(pen)[: self.hold_keep_min]]
+            widened = (f"fewer than {self.hold_keep_min} plans with move/flutter in "
+                       f"[{self.hold_ratio_min}, {self.hold_ratio_max}] and d2 <= {hi:.3f}: "
+                       f"the closest were kept")
+        if len(keep) > self.hold_keep_max:
+            ctr = 0.5 * (self.hold_ratio_min + self.hold_ratio_max)
+            keep = [int(k) for k in np.array(keep)[np.argsort(np.abs(rat_all[np.array(keep)] - ctr))][: self.hold_keep_max]]
+        spread_before, spread_after = spread_of(range(len(cands))), spread_of(keep)
+
+        # ---- exact rows of the kept plans + eq. (40) weights among them
+        kept_xi, j_ref, e_form_k, e_hist_k = [], [], [], []
+        base_full = np.repeat(anchor[None, :], unit.J, axis=0)
+        for k in keep:
+            xi_k, parts_k, info_k = ev(cands[k]["steps"], rows)
+            n_eval += 1
+            kept_xi.append(xi_k)
+            ef = float(self.objective.e_form_rows(unit, xi_k, parts_k, rows))
+            xf = base_full.copy()
+            xf[rows] = xi_k
+            eh = float(self.objective.e_hist(unit, fix_hold_rows(unit, xf), history))
+            e_form_k.append(ef)
+            e_hist_k.append(eh)
+            j_ref.append(ef + 0.2 * eh)
+            cands[k]["d_anchor_rows"] = float(an.dist2(xi_k[end_idx].mean(axis=0)[None, :], anchor[None, :])[0])
+        j_ref = np.asarray(j_ref, dtype=np.float64)
+        z = -(j_ref - j_ref.min()) / self.tau_ref
+        r_b = np.exp(z - z.max())
+        r_b = r_b / r_b.sum()
+        kept_slots = [int(cands[k]["slot"]) for k in keep]
+        kept_arr = np.stack(kept_xi)
+
+        # ---- generator p_Theta(b, w): slot categorical x eq. (40) inside the slot, level-space w
+        a_full = self._hold_alphas()
+        w_in = np.zeros(len(keep))
+        for s in set(kept_slots):
+            m = np.array([x == s for x in kept_slots])
+            w_in[m] = r_b[m] / max(1e-300, float(r_b[m].sum()))
+        p_sel = np.array([a_full[s] for s in kept_slots]) * w_in
+        p_sel = p_sel / max(1e-300, float(p_sel.sum()))
+        out: List[Target] = []
+        draws: List[Dict[str, Any]] = []
+        pub_xi: List[np.ndarray] = []
+        for a in range(max(1, int(n_proposals))):
+            kb = int(rng.choice(len(keep), p=p_sel))
+            slot = kept_slots[kb]
+            w = self.h_mu[slot] + np.exp(self.h_log_sigma[slot]) * rng.standard_normal(max(1, self.M - 1))
+            steps_gen = [{"frame": int(s["frame"]), "jumps": {int(i): int(p) for i, p in s["jumps"].items()},
+                          "levels": ([float(s["levels"][0])]
+                                     + [float(np.clip(s["levels"][i] + w[i - 1], 0.0, 1.0))
+                                        for i in range(1, self.M)])}
+                         for s in cands[keep[kb]]["steps"]]
+            xi_g, _pg, info_g = ev(steps_gen, rows)
+            n_eval += 1
+            pub_xi.append(xi_g)
+            xi_hat = base_full.copy()
+            xi_hat[rows] = xi_g
+            xi_hat = fix_hold_rows(unit, xi_hat)
+            d_pub = float(an.dist2(xi_g[end_idx].mean(axis=0)[None, :], anchor[None, :])[0])
+            logp = self._hold_log_p(slot, w)
+            out.append(Target(
+                f"gan:u{unit.index}:hold{hold_id}:{a}", xi_hat,
+                meta={"hold": True, "b": int(kb), "slot": int(slot), "slot_name": self.HOLD_SLOTS[slot],
+                      "w": [float(x) for x in w], "logp_draw": float(logp),
+                      "alpha": float(a_full[slot]), "select_p": float(p_sel[kb]),
+                      "parent_id": f"gan:u{unit.index}:h{hold_id}:b{int(keep[kb])}",
+                      "parent_origin": self.HOLD_SLOTS[slot], "basis_hash": self.basis_hash,
+                      "hold_id": hold_id, "plan": steps_gen,
+                      "continuity_seconds": 0.0, "continuity_delta_norm": 0.0,
+                      "requested_dist2": d_pub, "dropped_jumps": len(info_g["dropped_jumps"]),
+                      "rows": [int(rows[0]), int(rows[-1])]}))
+            draws.append({"proposal": int(a), "kept_index": int(kb), "slot": self.HOLD_SLOTS[slot],
+                          "w": [round(float(x), 4) for x in w], "requested_dist2": d_pub,
+                          "requested_over_local_flutter": d_pub / max(1e-12, flutter),
+                          "plan_jumps": {str(s["frame"]): s["jumps"] for s in steps_gen if s["jumps"]},
+                          "dropped_jumps": int(len(info_g["dropped_jumps"]))})
+
+        # ---- POSITIVES of D: unmanipulated playback on this hold's psi window (FIDELITY_CONTRACT C)
+        psi_pos: Optional[np.ndarray] = None
+        real_stat: Dict[str, Any] = {}
+        n_psi = min(len(rows), self.hold_psi_blocks * max(1, self.block_rows))
+        psi_rows = rows[:n_psi]
+        if self.hold_positive_source == "recordings" and getattr(self, "sources", None) is not None:
+            n_draw = self.hold_real_positives
+            if self.h_psi_scale_source == "uninitialised":
+                n_draw = max(n_draw, self.hold_psi_scale_samples)
+            real = self._hold_real_windows(unit, rs, psi_rows, n_draw, rng, anchor)
+            if self.h_psi_scale_source == "uninitialised":
+                self._hold_psi_scales(history, real, psi_rows)
+            pos_set = real[: self.hold_real_positives]
+            psi_pos = np.stack([self._hold_psi(x, psi_rows) for x in pos_set])
+            d_real = _sigmoid(psi_pos @ self.h_phi)
+            # D of the candidate plans BEFORE realization, on the same window and feature map
+            d_plan = [float(_sigmoid(float(self._hold_psi(kept_xi[j][:n_psi], psi_rows) @ self.h_phi)))
+                      for j in range(len(keep))]
+            d_none_D = float(_sigmoid(float(self._hold_psi(xi_none[:n_psi], psi_rows) @ self.h_phi)))
+            d_med = float(np.median(d_plan)) if d_plan else None
+            real_stat = {
+                "positive_source": "recordings", "real_windows": int(len(pos_set)),
+                "real_windows_drawn": int(len(real)), "psi_rows": int(n_psi),
+                "psi_blocks": int(max(1, n_psi // max(1, self.block_rows))),
+                "D_real_windows_mean": float(d_real.mean()), "D_real_windows_min": float(d_real.min()),
+                "D_real_windows_max": float(d_real.max()),
+                "D_candidate_plans": [round(float(x), 4) for x in d_plan],
+                "D_candidate_plans_mean": (float(np.mean(d_plan)) if d_plan else None),
+                "D_unchanged_continuation": d_none_D,
+                "D_candidate_plans_median": d_med,
+                "D_published_plan": None, "chosen_above_median": None,
+                "position_sources": dict(getattr(self, "_real_position_sources", {})),
+                "near_share": float(self.hold_real_near_share),
+                "levels_source": ("committed level vectors" if self._committed_levels else "current levels"),
+                "psi_scale_source": self.h_psi_scale_source}
+            # ---- generator reward: the CLIPPED LOGIT of D on the exact PLAN rows of the published
+            # candidate.  -log D(committed) saturates (D -> 0, -log D ~ 13) and then carries no
+            # preference between plans; the logit is linear in psi and bounded here on purpose.
+            for a_, tg in enumerate(out):
+                lg = float(np.clip(float(self._hold_psi(pub_xi[a_][:n_psi], psi_rows) @ self.h_phi),
+                                   -self.hold_logit_clip, self.hold_logit_clip))
+                tg.meta["logit_plan"] = lg
+                tg.meta["D_plan"] = float(_sigmoid(lg))
+                draws[a_]["D_plan"] = float(_sigmoid(lg))
+                draws[a_]["logit_plan"] = lg
+            if out:
+                d_pub0 = float(out[0].meta["D_plan"])
+                real_stat["D_published_plan"] = d_pub0
+                real_stat["chosen_above_median"] = (bool(d_pub0 >= d_med - 1e-9) if d_med is not None else None)
+                # the published plan is parent + displacement w; the parent alone says whether the
+                # SELECTION (slot categorical x eq. 40) prefers the plans D finds more real
+                kb0 = int(out[0].meta.get("b", 0))
+                real_stat["D_chosen_parent"] = (float(d_plan[kb0]) if kb0 < len(d_plan) else None)
+                real_stat["parent_above_median"] = (bool(d_plan[kb0] >= d_med - 1e-9)
+                                                    if (d_med is not None and kb0 < len(d_plan)) else None)
+        rec = {
+            "real_positives": real_stat,
+            "unit": int(unit.index), "hold": hold_id, "t0_seconds": t0 / float(self.fs),
+            "openness": o0, "phase": str(unit.phase_names[rows[0]]), "steps": len(step_frames),
+            "rows": [int(rows[0]), int(rows[-1])],
+            "flutter_local_dist2": flutter_local,
+            "flutter_note": "commit blocks of the UNCHANGED continuation of this hold",
+            "flutter_realized_ema_dist2": float(self._realized_flutter or flutter_local),
+            "band_base_dist2": float(flutter), "band_dist2": [float(lo), float(hi)],
+            "band_rule": f"[{self.hold_band_lo}, {self.hold_band_hi}] x the realized flutter "
+                         f"(EMA over the committed blocks) x (hold_move_scale "
+                         f"{self.hold_move_scale} x openness {o0:.2f})^2",
+            "do_nothing_dist2": d_none,
+            "candidate_plans_drawn": len(cands), "candidate_plans_in_band": int(len(in_band)),
+            "candidate_plans_kept": len(keep),
+            "kept_fraction": float(len(in_band)) / float(max(1, len(cands))),
+            "band_widened": widened,
+            "reference_spread_before_dist2": spread_before, "reference_spread_after_dist2": spread_after,
+            "d_anchor_all": [round(float(x), 4) for x in d_all],
+            "move_over_flutter_all": [round(float(x), 2) for x in rat_all],
+            "move_over_flutter_kept": [round(float(rat_all[k]), 2) for k in keep],
+            "plan_flutter_kept": [round(float(cands[k]["flutter"]), 4) for k in keep],
+            "move_over_flutter_min": float(self.hold_ratio_min),
+            "slot_all": [self.HOLD_SLOTS[c["slot"]] for c in cands],
+            "beta_all": [round(float(c["beta"]), 3) for c in cands],
+            "jumps_all": [int(c["n_jumps"]) for c in cands],
+            "d_anchor_kept": [round(float(cands[k].get("d_anchor_rows", cands[k]["d_anchor"])), 4) for k in keep],
+            "slots_drawn": {self.HOLD_SLOTS[s]: int(sum(1 for c in cands if c["slot"] == s)) for s in avail},
+            "slots_kept": {self.HOLD_SLOTS[s]: int(sum(1 for x in kept_slots if x == s)) for s in avail},
+            "J_ref": [round(float(x), 5) for x in j_ref], "weights_r_b": [round(float(x), 4) for x in r_b],
+            "e_form_kept": [round(float(x), 5) for x in e_form_k],
+            "e_hist_kept": [round(float(x), 5) for x in e_hist_k],
+            "slot_alphas": {n: round(float(v), 4) for n, v in zip(self.HOLD_SLOTS, a_full)},
+            "draws": draws, "position_pool": {"band_profile": pools["band_profile_source"],
+                                              "committed_positions_per_track": pools["n_committed"]},
+            "plan_rows_calls": int(n_eval),
+            "internal_iterations_note": "candidate plans and plan_rows calls are internal iterations, "
+                                        "not musical time",
+        }
+        self._hold_records.append(rec)
+        self._hold = {"id": hold_id, "rows": rows, "kept_xi": kept_arr, "r": r_b,
+                      "slots": kept_slots, "record": rec, "psi_pos": psi_pos,
+                      "psi_rows": psi_rows}
+        return out
+
+    def _hold_g_steps(self, baseline: float, n_steps: int) -> Dict[str, Any]:
+        """REINFORCE (eq. 45) on the hold generator: slot logits and the level-space (mu, sigma),
+        with the same self-normalised importance correction and ESS trust region as the legacy
+        generator.  D, the kept plans and the committed rows are fixed here."""
+        batch = [q for q in self._g_batch() if q.get("hold")]
+        if not batch:
+            return {"updates_G": 0, "clipped_G_steps": 0, "batch_size": 0, "importance_ess": [],
+                    "ess_stopped": 0, "stop_reason": "no_hold_samples",
+                    "importance_correction": "self-normalised p_theta/p_draw; stop when ESS < fraction * n"}
+        adv = np.array([q["ell"] - float(baseline) for q in batch], dtype=np.float64)
+        logp_draw = np.array([q["logp_draw"] for q in batch], dtype=np.float64)
+        n_s = float(max(1, len(batch)))
+        ess_min = self.ess_min_fraction * n_s
+        nG = clipped = ess_stopped = 0
+        ess_trace: List[float] = []
+        stop = ""
+        for _ in range(int(n_steps)):
+            logp_new = np.array([self._hold_log_p(int(q["b"]), q["w"]) for q in batch], dtype=np.float64)
+            ratio = np.exp(np.clip(logp_new - logp_draw, -30.0, 30.0))
+            ess = float(ratio.sum() ** 2 / max(1e-300, float((ratio ** 2).sum())))
+            ess_trace.append(ess)
+            if len(batch) > 1 and ess < ess_min:
+                ess_stopped += 1
+                stop = "ess_below_trust_region"
+                break
+            omega = ratio / max(1e-300, float(ratio.sum())) * n_s
+            g_mu = np.zeros_like(self.h_mu)
+            g_ls = np.zeros_like(self.h_log_sigma)
+            g_lg = np.zeros_like(self.h_logits)
+            a = self._hold_alphas()
+            sig = np.exp(self.h_log_sigma)
+            for q, adv_i, om in zip(batch, adv, omega):
+                s = int(q["b"])
+                w = np.asarray(q["w"], dtype=np.float64)
+                g_mu[s] += om * adv_i * (w - self.h_mu[s]) / np.maximum(sig[s] ** 2, 1e-12)
+                g_ls[s] += om * adv_i * (((w - self.h_mu[s]) ** 2) / np.maximum(sig[s] ** 2, 1e-12) - 1.0)
+                oh = np.zeros(len(self.h_logits))
+                oh[s] = 1.0
+                g_lg += om * adv_i * (oh - a)
+            g_mu, g_ls, g_lg = g_mu / n_s, g_ls / n_s, g_lg / n_s
+            gn = float(np.sqrt((g_mu ** 2).sum() + (g_ls ** 2).sum() + (g_lg ** 2).sum()))
+            if not np.isfinite(gn):
+                stop = "non_finite_gradient"
+                break
+            if gn <= 1e-15:
+                stop = "zero_gradient (advantage 0)"
+                break
+            if gn > self.grad_clip:
+                f = self.grad_clip / gn
+                g_mu, g_ls, g_lg = g_mu * f, g_ls * f, g_lg * f
+                clipped += 1
+            lr = self.lr_G * self.hold_lr_G_scale
+            s_mu = np.clip(-lr * g_mu, -self.step_clip, self.step_clip)
+            s_ls = np.clip(-lr * g_ls, -self.step_clip, self.step_clip)
+            s_lg = np.clip(-lr * g_lg, -self.step_clip, self.step_clip)
+            if not (np.all(np.isfinite(s_mu)) and np.all(np.isfinite(s_ls)) and np.all(np.isfinite(s_lg))):
+                stop = "non_finite_step"
+                break
+            self.h_mu = self.h_mu + s_mu
+            self.h_log_sigma = np.clip(self.h_log_sigma + s_ls, np.log(self.hold_w_sigma_min),
+                                       np.log(self.hold_w_sigma_max))
+            self.h_logits = self.h_logits + s_lg
+            nG += 1
+        return {"updates_G": int(nG), "clipped_G_steps": int(clipped), "batch_size": int(len(batch)),
+                "importance_ess": [float(x) for x in ess_trace], "ess_stopped": int(ess_stopped),
+                "stop_reason": stop,
+                "importance_correction": "self-normalised p_theta/p_draw on re-used committed "
+                                         "samples; stop when ESS < fraction * n"}
+
     # ================================================================== conditioning
     def begin_unit(self, unit: UnitContext, history) -> None:
         self.unit = unit
@@ -511,6 +1336,12 @@ class GANMode(ModeController):
         self._unit_stats = []
         self._step_index = 0
         self._unit_counts = {"D": 0, "G": 0, "D_rejected": 0, "update_units": 0, "skipped_blocks": 0}
+        # hold mode is only known at the first prepare_reference of the unit (HOLD_CONTRACT); these
+        # assignments touch neither the rng nor any legacy quantity
+        self._hold_active = False
+        self._hold = None
+        self._hold_records = []
+        self._hist_blocks = []        # row indices are unit-local
 
     def _build_basis(self, unit: UnitContext) -> None:
         """Few joint directions from the reference differences (small SVD, eq. 41).
@@ -798,7 +1629,15 @@ class GANMode(ModeController):
                           n_proposals: int) -> List[Target]:
         """Window references: independent samples (b, w) from p_Theta, each a full (J, d) ideal
         whose window rows continue the realized current composition.  The engine freezes one of
-        them; the sample that produced it stays in Target.meta and is never altered afterwards."""
+        them; the sample that produced it stays in Target.meta and is never altered afterwards.
+
+        Hold mode (`unit.realizer_state` published by the engine, docs/HOLD_CONTRACT.md): the ideal
+        must be realizable, so the whole reference distribution is rebuilt as exact PLANS narrowed
+        to the committed history and the displacement acts in level space (`_hold_prepare`).  When
+        `realizer_state` is missing / None nothing below changes (legacy, bit-identical)."""
+        rs = getattr(unit, "realizer_state", None)
+        if rs is not None:
+            return self._hold_prepare(unit, history, rows, xi_current, n_proposals, rs)
         rows = np.asarray(rows)
         out: List[Target] = []
         for a in range(max(1, int(n_proposals))):
@@ -826,6 +1665,26 @@ class GANMode(ModeController):
         rows = np.asarray(rows)
         ref_meta = dict(reference.meta or {}) if reference is not None else {}
         fin = (stats or {}).get("refinement", {}).get("final", {}) or {}
+        if self._hold_active:
+            # the positions the realizer actually committed are part of the committed history and
+            # become jump candidates of the next holds ("close to the committed history")
+            for i, p in enumerate((stats or {}).get("positions", []) or []):
+                if 0 < i < self.M:
+                    self._committed_positions[i].append(int(p))
+                    self._committed_positions[i] = self._committed_positions[i][-24:]
+            lv_c = (stats or {}).get("levels")
+            if lv_c is not None and len(lv_c) == self.M:
+                # the levels a real window is drawn with come from here (FIDELITY_CONTRACT C)
+                self._committed_levels.append(np.asarray(lv_c, dtype=np.float64))
+                self._committed_levels = self._committed_levels[-64:]
+            # the sound's own fast motion, exactly as the engine measures it in hold_summary:
+            # mean d_xi² of a committed row to the mean of its commit block
+            fmb = unit.free_mask[rows]
+            if int(fmb.sum()) >= 3:
+                xb = np.asarray(xi_rows, dtype=np.float64)[fmb]
+                f_now = float(self.analyzer.dist2(xb, xb.mean(axis=0)[None, :]).mean())
+                self._realized_flutter = (f_now if self._realized_flutter is None
+                                          else 0.75 * self._realized_flutter + 0.25 * f_now)
         self._pending.append({
             "rows": rows, "xi": np.asarray(xi_rows, dtype=np.float64), "meta": ref_meta,
             "fit": float(fin.get("fit", 0.0)), "e_form": float(fin.get("e_form", 0.0)),
@@ -851,33 +1710,97 @@ class GANMode(ModeController):
         self._pending = []
 
         # ------------------------------------------------ (43) discriminator, Theta / rows fixed
-        Psi_ref = np.stack([self._psi(self.ref_xi[b][all_rows], all_rows) for b in range(len(self.ref_xi))])
-        Psi_gen = self._psi(xi_all, all_rows)[None, :]
-        d_stat = self._d_steps(Psi_ref, self.ref_w, Psi_gen, self.inner_steps_D_commit)
+        hold = self._hold if self._hold_active else None
+        d_rows_dropped = 0
+        d_which = "phi"
+        if hold is not None and hold.get("psi_pos") is not None:
+            # ---- real data: positives = unmanipulated playback of this hold, negative = the
+            # committed sound over the last `hold_psi_blocks` commit blocks (motion needs >= 2).
+            # Every committed block enters exactly one update as the newest block of that window.
+            self._hist_blocks.append((rows, np.asarray(xi_rows, dtype=np.float64)))
+            self._hist_blocks = self._hist_blocks[-self.hold_psi_blocks:]
+            neg_rows = np.concatenate([b[0] for b in self._hist_blocks])
+            neg_xi = np.concatenate([b[1] for b in self._hist_blocks], axis=0)
+            Psi_ref = hold["psi_pos"]
+            w_pos = np.full(len(Psi_ref), 1.0 / max(1, len(Psi_ref)))
+            Psi_gen = self._hold_psi(neg_xi, neg_rows)[None, :]
+            d_which = "h_phi"
+        elif hold is not None:
+            # positives = the EXACT rows of the kept reference plans of this hold, weights r_b;
+            # negative = the committed composition on the same rows
+            pos = np.searchsorted(hold["rows"], all_rows)
+            ok = (pos < len(hold["rows"])) & (hold["rows"][np.clip(pos, 0, len(hold["rows"]) - 1)] == all_rows)
+            d_rows_dropped = int((~ok).sum())
+            if d_rows_dropped:
+                self.warnings.append(f"unit {unit.index}: {d_rows_dropped} committed row(s) lie outside "
+                                     f"the held reference (accumulated across holds); D used the rest")
+            sel = pos[ok] if ok.any() else pos[:0]
+            d_rows = all_rows[ok] if ok.any() else all_rows
+            xi_d = xi_all[ok] if ok.any() else xi_all
+            if ok.any():
+                Psi_ref = np.stack([self._psi(hold["kept_xi"][b][sel], d_rows) for b in range(len(hold["kept_xi"]))])
+                w_pos = np.asarray(hold["r"], dtype=np.float64)
+            else:
+                Psi_ref = np.stack([self._psi(self.ref_xi[b][all_rows], all_rows) for b in range(len(self.ref_xi))])
+                w_pos = self.ref_w
+            Psi_gen = self._psi(xi_d, d_rows)[None, :]
+        else:
+            Psi_ref = np.stack([self._psi(self.ref_xi[b][all_rows], all_rows) for b in range(len(self.ref_xi))])
+            w_pos = self.ref_w
+            Psi_gen = self._psi(xi_all, all_rows)[None, :]
+        d_stat = self._d_steps(Psi_ref, w_pos, Psi_gen, self.inner_steps_D_commit, d_which,
+                               self.hold_d_l2 if d_which == "h_phi" else None)
 
         # ------------------------------------------------ (44) loss of the committed composition
-        d_act = float(_sigmoid(float(self.phi @ Psi_gen[0])))
-        ell = float(-np.log(max(d_act, 1e-12)) + self.lambda_fit * fit + self.lambda_f * e_form)
+        d_act = float(_sigmoid(float(getattr(self, d_which) @ Psi_gen[0])))
+        lg_plan = (last["meta"] or {}).get("logit_plan")
+        if d_which == "h_phi" and lg_plan is not None and np.isfinite(float(lg_plan)):
+            # the -log D term of eq. (44) saturates once D pushes the committed side to 0 (-log D
+            # ~ 13 for every plan alike).  In hold mode with real positives it is replaced by the
+            # CLIPPED NEGATIVE LOGIT of D on the exact PLAN rows of the published candidate - the
+            # realizer follows the plan at ~0.99, the term is linear in psi and bounded to
+            # +-hold_logit_clip, so it keeps a usable preference between plans.
+            d_term = float(-np.clip(float(lg_plan), -self.hold_logit_clip, self.hold_logit_clip))
+            d_term_kind = f"clipped_negative_logit_on_plan_rows(+-{self.hold_logit_clip})"
+        else:
+            d_term = float(-np.log(max(d_act, 1e-12)))
+            d_term_kind = "neg_log_D_committed"
+        ell = float(d_term + self.lambda_fit * fit + self.lambda_f * e_form)
         # ------------------------------------------------ statistics (FRAG_CONTRACT)
         stat = self._commit_statistics(unit, all_rows, d_act, reference, xi_all)
-        b_i = int(last["meta"].get("b", 0)) if last["meta"] else 0
-        w_i = np.asarray(last["meta"].get("w", np.zeros(self.r)), dtype=np.float64)
-        if w_i.shape != (self.r,):
-            w_i = np.zeros(self.r)
-        logp_draw = last["meta"].get("logp_draw")
-        if logp_draw is None or not np.isfinite(float(logp_draw)):
-            logp_draw = self._log_p(b_i, w_i)
+        if hold is not None and bool(last["meta"].get("hold")):
+            # the sample is (slot, level-space w); the slot index is the same object in every hold
+            n_w = max(1, self.M - 1)
+            b_i = int(last["meta"].get("slot", 0))
+            w_i = np.asarray(last["meta"].get("w", np.zeros(n_w)), dtype=np.float64)
+            if w_i.shape != (n_w,):
+                w_i = np.zeros(n_w)
+            logp_draw = last["meta"].get("logp_draw")
+            if logp_draw is None or not np.isfinite(float(logp_draw)):
+                logp_draw = self._hold_log_p(b_i, w_i)
+        else:
+            b_i = int(last["meta"].get("b", 0)) if last["meta"] else 0
+            w_i = np.asarray(last["meta"].get("w", np.zeros(self.r)), dtype=np.float64)
+            if w_i.shape != (self.r,):
+                w_i = np.zeros(self.r)
+            logp_draw = last["meta"].get("logp_draw")
+            if logp_draw is None or not np.isfinite(float(logp_draw)):
+                logp_draw = self._log_p(b_i, w_i)
         if self.loss_ema is None:
             baseline, baseline_source = ell, "first_committed_block_own_loss"
         else:
             baseline, baseline_source = float(self.loss_ema), f"ema_of_past_committed_losses(rate={self.baseline_rate})"
         self.loss_ema = ell if self.loss_ema is None else (1.0 - self.baseline_rate) * self.loss_ema + self.baseline_rate * ell
         self._g_buffer.append({"b": b_i, "w": w_i, "ell": ell, "logp_draw": float(logp_draw),
-                               "ref_id": last["ref_id"]})
+                               "ref_id": last["ref_id"],
+                               **({"hold": True} if (hold is not None and bool(last["meta"].get("hold"))) else {})})
         self._g_buffer = self._g_buffer[-self.g_batch_max:]
 
         # ------------------------------------------------ (45) generator, D / basis / rows fixed
-        g_stat = self._g_steps(baseline, self.inner_steps_G_commit)
+        if hold is not None:
+            g_stat = self._hold_g_steps(baseline, self.inner_steps_G_commit)
+        else:
+            g_stat = self._g_steps(baseline, self.inner_steps_G_commit)
 
         self._unit_counts["D"] += int(d_stat["updates_D"])
         self._unit_counts["G"] += int(g_stat["updates_G"])
@@ -888,7 +1811,8 @@ class GANMode(ModeController):
             "D_mean_ref_before": d_stat["D_mean_ref_before"], "D_mean_ref": d_stat["D_mean_ref"],
             "D_mean_actual_before": d_stat["D_mean_gen_before"], "D_mean_actual": d_stat["D_mean_gen"],
             "D_actual_after_D_step": d_act,
-            "G_loss": ell, "G_loss_terms": {"neg_log_D": float(-np.log(max(d_act, 1e-12))),
+            "G_loss": ell, "G_loss_terms": {"D_term": d_term, "D_term_kind": d_term_kind,
+                                            "neg_log_D_committed": float(-np.log(max(d_act, 1e-12))),
                                             "lambda_fit*fit": self.lambda_fit * fit,
                                             "lambda_f*e_form": self.lambda_f * e_form},
             "baseline": float(baseline), "baseline_source": baseline_source,
@@ -905,6 +1829,17 @@ class GANMode(ModeController):
             "sample": {"b": b_i, "parent_id": str(last["meta"].get("parent_id", "")),
                        "parent_origin": str(last["meta"].get("parent_origin", "")),
                        "w": [float(x) for x in w_i]},
+            **({"hold": {"hold_id": int(last["meta"].get("hold_id", -1)),
+                         "reference_age_steps": int((stats or {}).get("reference_age_steps", -1)),
+                         "slot": str(last["meta"].get("slot_name", "")),
+                         "positive_source": self.hold_positive_source,
+                         "positives": ("unmanipulated playback of this hold (exact rows), uniform weights"
+                                       if d_which == "h_phi" else
+                                       "kept reference plans of this hold (exact rows), weights r_b"),
+                         "negative_rows": int(len(self._hist_blocks) * self.block_rows if d_which == "h_phi" else len(all_rows)),
+                         "rows_outside_the_held_reference": int(d_rows_dropped),
+                         "alpha": self._hold_alphas().tolist(),
+                         "sigma_mean": float(np.exp(self.h_log_sigma).mean())}} if hold is not None else {}),
             "phi_norm": float(np.linalg.norm(self.phi)),
             "alpha": self.alphas().tolist(), "sigma_mean": float(np.exp(self.log_sigma).mean()),
             "order": "D step(s) then G step(s), reference and candidate fixed; never during realization",
@@ -957,7 +1892,10 @@ class GANMode(ModeController):
             dh = self.analyzer.dist2(xi_all[1:], xi_all[:-1])
             if fmc[1:].any():
                 out["realized_hop_dist2"] = float(dh[fmc[1:]].mean())
-        if self.fragment_mode():
+        if self.fragment_mode() and not (self._hold_active and self.hold_positive_source == "recordings"):
+            # in "recordings" mode D lives on psi_h and this read-out (random fragment compositions
+            # scored by the legacy phi, which is then never trained) would be meaningless; the
+            # equivalent read-outs are D(real windows) and D(candidate plans) per hold
             gl = self._frag_goal_levels
             level = float(gl[j0]) if gl is not None else 0.0
             offsets = np.arange(len(all_rows), dtype=np.int64) * self.hop_frames
@@ -975,28 +1913,31 @@ class GANMode(ModeController):
         return out
 
     def _d_steps(self, Psi_ref: np.ndarray, w_ref: np.ndarray, Psi_gen: np.ndarray,
-                 n_steps: int) -> Dict[str, Any]:
-        """Bounded gradient steps on eq. (43) with backtracking: the D loss never increases."""
-        L0, D_ref0, D_gen0 = self._d_loss(Psi_ref, w_ref, Psi_gen, self.phi)
+                 n_steps: int, which: str = "phi", l2: Optional[float] = None) -> Dict[str, Any]:
+        """Bounded gradient steps on eq. (43) with backtracking: the D loss never increases.
+        `which` selects the parameter vector: the legacy phi, or `h_phi` of the hold-mode feature
+        map (real windows vs the committed sound) - the update itself is the same."""
+        L0, D_ref0, D_gen0 = self._d_loss(Psi_ref, w_ref, Psi_gen, getattr(self, which), l2)
         L_cur = L0
         nD = 0
         rejected = 0
         backtracked = 0
         for _ in range(int(n_steps)):
-            D_ref = _sigmoid(Psi_ref @ self.phi)
-            D_gen = _sigmoid(Psi_gen @ self.phi)
+            D_ref = _sigmoid(Psi_ref @ getattr(self, which))
+            D_gen = _sigmoid(Psi_gen @ getattr(self, which))
             grad = (-(w_ref[:, None] * (1.0 - D_ref)[:, None] * Psi_ref).sum(axis=0)
-                    + (D_gen[:, None] * Psi_gen).mean(axis=0) + 2.0 * self.l2 * self.phi)
+                    + (D_gen[:, None] * Psi_gen).mean(axis=0)
+                    + 2.0 * (self.l2 if l2 is None else float(l2)) * getattr(self, which))
             if not np.all(np.isfinite(grad)):
                 rejected += 1
                 break
             lr = self.lr_D
             accepted = False
             for _bt in range(3):
-                trial = self.phi - lr * grad
-                L_try, _, _ = self._d_loss(Psi_ref, w_ref, Psi_gen, trial)
+                trial = getattr(self, which) - lr * grad
+                L_try, _, _ = self._d_loss(Psi_ref, w_ref, Psi_gen, trial, l2)
                 if np.isfinite(L_try) and np.all(np.isfinite(trial)) and L_try <= L_cur:
-                    self.phi = trial
+                    setattr(self, which, trial)
                     L_cur = float(L_try)
                     nD += 1
                     accepted = True
@@ -1006,12 +1947,19 @@ class GANMode(ModeController):
             if not accepted:
                 rejected += 1
                 break
-        L1, D_ref1, D_gen1 = self._d_loss(Psi_ref, w_ref, Psi_gen, self.phi)
+        L1, D_ref1, D_gen1 = self._d_loss(Psi_ref, w_ref, Psi_gen, getattr(self, which), l2)
         return {"D_loss_before": float(L0), "D_loss_after": float(L1),
                 "D_mean_ref_before": float(D_ref0.mean()), "D_mean_gen_before": float(D_gen0.mean()),
                 "D_mean_ref": float(D_ref1.mean()), "D_mean_gen": float(D_gen1.mean()),
                 "updates_D": int(nD), "rejected_D_steps": int(rejected),
                 "backtracked_D_steps": int(backtracked)}
+
+    def _logp_of(self, q: Dict[str, Any]) -> float:
+        """log p_Theta of a stored sample: the legacy (parent, xi-coefficient) law, or the hold law
+        (slot, level-space displacement) for samples drawn under a held realizable reference."""
+        if q.get("hold"):
+            return self._hold_log_p(int(q["b"]), q["w"])
+        return self._log_p(int(q["b"]), q["w"])
 
     def _g_batch(self) -> List[Dict[str, Any]]:
         """Newest committed sample first, older ones added while the self-normalised importance
@@ -1020,7 +1968,7 @@ class GANMode(ModeController):
         for s in reversed(self._g_buffer):
             trial = chosen + [s]
             if len(trial) > 1:
-                r = np.exp(np.clip([self._log_p(q["b"], q["w"]) - q["logp_draw"] for q in trial], -30.0, 30.0))
+                r = np.exp(np.clip([self._logp_of(q) - q["logp_draw"] for q in trial], -30.0, 30.0))
                 ess = float(r.sum() ** 2 / max(1e-300, float((r ** 2).sum())))
                 if ess < self.ess_min_fraction * len(trial):
                     break
@@ -1143,6 +2091,92 @@ class GANMode(ModeController):
                   "reference_step_displacement_mean"):
             if k in rs:
                 out[k] = rs[k]
+        if self._hold_active and self._hold_records:
+            hr = self._hold_records
+
+            def hcol(key: str) -> List[float]:
+                return [float(h[key]) for h in hr if isinstance(h.get(key), (int, float))]
+
+            d_ref = [float(c["D_mean_ref"]) for c in self._commit_records
+                     if isinstance(c.get("D_mean_ref"), float)]
+            req = [float(d["requested_dist2"]) for h in hr for d in h["draws"]]
+            ratio = [float(d["requested_over_local_flutter"]) for h in hr for d in h["draws"]]
+            slots = [str(d["slot"]) for h in hr for d in h["draws"]]
+            rp = [h["real_positives"] for h in hr if h.get("real_positives")]
+
+            def rcol(key: str) -> List[float]:
+                return [float(r[key]) for r in rp if isinstance(r.get(key), (int, float))]
+
+            out["hold"] = {
+                "holds": len(hr), "reference_source": self.reference_source,
+                "positive_source": self.hold_positive_source,
+                # --- FIDELITY_CONTRACT (C): D(committed) vs D(real, unmanipulated windows)
+                "D_real_windows_mean": (float(np.mean(rcol("D_real_windows_mean"))) if rp else None),
+                "D_gap_committed_minus_real": (
+                    float(np.mean(d_c) - np.mean(rcol("D_real_windows_mean")))
+                    if (d_c and rcol("D_real_windows_mean")) else None),
+                "D_candidate_plans_mean": (float(np.mean(rcol("D_candidate_plans_mean"))) if rp else None),
+                "D_unchanged_continuation_mean": (float(np.mean(rcol("D_unchanged_continuation"))) if rp else None),
+                "real_windows_per_hold": (float(np.mean(rcol("real_windows"))) if rp else None),
+                "psi_rows_per_window": (float(np.mean(rcol("psi_rows"))) if rp else None),
+                "psi_scale_source": self.h_psi_scale_source, "psi_dim": int(self.d_psi_hold),
+                "h_phi_norm": float(np.linalg.norm(self.h_phi)),
+                "h_phi_where_motion": self._h_phi_split(),
+                # does the generator actually pick the plans D finds more real?
+                "above_median_note": "share with D >= the median of the kept candidates (ties count, only 2-3 candidates survive the narrowing)",
+                "chosen_above_median_share": (
+                    float(np.mean([1.0 if r.get("chosen_above_median") else 0.0 for r in rp
+                                   if r.get("chosen_above_median") is not None]))
+                    if any(r.get("chosen_above_median") is not None for r in rp) else None),
+                "D_published_plan_mean": (float(np.mean(rcol("D_published_plan"))) if rp else None),
+                "parent_above_median_share": (
+                    float(np.mean([1.0 if r.get("parent_above_median") else 0.0 for r in rp
+                                   if r.get("parent_above_median") is not None]))
+                    if any(r.get("parent_above_median") is not None for r in rp) else None),
+                "D_chosen_parent_mean": (float(np.mean(rcol("D_chosen_parent"))) if rp else None),
+                "D_candidate_plans_median_mean": (float(np.mean(rcol("D_candidate_plans_median"))) if rp else None),
+                "slot_alphas_first": (hr[0]["slot_alphas"] if hr else None),
+                "slot_alphas_last": (hr[-1]["slot_alphas"] if hr else None),
+                "real_position_sources": {k: int(sum(int((h.get("real_positives") or {})
+                                                         .get("position_sources", {}).get(k, 0)) for h in hr))
+                                          for k in ("current", "committed", "mixture_candidate", "random")},
+                "generator_D_term": (f"clipped negative logit of D on the published plan's rows "
+                                     f"(+-{self.hold_logit_clip})"
+                                     if self.hold_positive_source == "recordings" else "-log D(committed)"),
+                # --- contract statistic: D(committed) vs D(references) - do they approach?
+                "D_committed_mean": out["D_committed_mean"],
+                "D_hold_reference_mean": (float(np.mean(d_ref)) if d_ref else None),
+                "D_gap_committed_minus_hold_reference": (
+                    float(np.mean([a - b for a, b in zip(d_c, d_ref)]))
+                    if (d_c and d_ref and len(d_c) == len(d_ref)) else None),
+                # --- narrowing
+                "candidate_plans_per_hold": float(np.mean(hcol("candidate_plans_drawn"))),
+                "kept_plans_per_hold": float(np.mean(hcol("candidate_plans_kept"))),
+                "kept_fraction_mean": float(np.mean(hcol("kept_fraction"))),
+                "move_over_own_flutter_kept_mean": float(np.mean(
+                    [float(x) for h in hr for x in h["move_over_flutter_kept"]] or [0.0])),
+                "move_over_own_flutter_min": float(self.hold_ratio_min),
+                "band_widened_holds": int(sum(1 for h in hr if h["band_widened"])),
+                "reference_spread_before_dist2": float(np.mean(hcol("reference_spread_before_dist2"))),
+                "reference_spread_after_dist2": float(np.mean(hcol("reference_spread_after_dist2"))),
+                "band_dist2_mean": [float(np.mean([h["band_dist2"][0] for h in hr])),
+                                    float(np.mean([h["band_dist2"][1] for h in hr]))],
+                "local_flutter_dist2_mean": float(np.mean(hcol("flutter_local_dist2"))),
+                "realized_flutter_ema_dist2_mean": float(np.mean(hcol("flutter_realized_ema_dist2"))),
+                "do_nothing_dist2_mean": float(np.mean(hcol("do_nothing_dist2"))),
+                # --- requested move (the engine measures the same quantity in hold_summary)
+                "requested_dist2_mean": (float(np.mean(req)) if req else None),
+                "requested_over_local_flutter_mean": (float(np.mean(ratio)) if ratio else None),
+                "plan_rows_calls": int(sum(hcol("plan_rows_calls"))),
+                "slot_share_chosen": {n: float(np.mean([1.0 if s == n else 0.0 for s in slots]))
+                                      for n in self.HOLD_SLOTS} if slots else {},
+                "slot_alphas": {n: float(v) for n, v in zip(self.HOLD_SLOTS, self._hold_alphas())},
+                "level_displacement_sigma_mean": float(np.exp(self.h_log_sigma).mean()),
+                "level_displacement_mu_absmax": float(np.abs(self.h_mu).max()),
+                "generator_inheritance": self.h_inheritance,
+                "internal_iterations_note": "candidate plans / plan_rows calls / D and G steps are "
+                                            "internal iterations, not musical time",
+            }
         return out
 
     # ================================================================== 10.6 lineage
@@ -1213,6 +2247,22 @@ class GANMode(ModeController):
                 "source": str(rs.get("source", "")),
                 "diversity_mean_pair_dist2": float(rs["diversity_mean_pair_dist2"])},
             "statistics": {k: v for k, v in stats.items() if k != "per_step"},
+            **({"hold_generator": {
+                "slots": list(self.HOLD_SLOTS), "logits": [float(x) for x in self.h_logits],
+                "mu": [[float(v) for v in row] for row in self.h_mu],
+                "log_sigma": [[float(v) for v in row] for row in self.h_log_sigma],
+                "level_dim": int(max(1, self.M - 1)), "inheritance": self.h_inheritance,
+                "note": "the displacement w lives in LEVEL space (material gains), whose acoustic "
+                        "meaning does not change with the per-unit basis B_ref, so mu / log_sigma "
+                        "are inherited instead of re-initialised"},
+                "hold_discriminator": {
+                    "positive_source": self.hold_positive_source,
+                    "phi": [float(x) for x in self.h_phi],
+                    "psi_mean": [float(x) for x in self.h_psi_mean],
+                    "psi_std": [float(x) for x in self.h_psi_std],
+                    "psi_scale_source": self.h_psi_scale_source,
+                    "psi_scale_n": int(self.h_psi_scale_n),
+                    "feature_names": list(self.h_psi_names)}} if self._hold_seen else {}),
             "lineage": [{"unit": int(l["unit"]), "chosen_parent_id": str(l["chosen_parent_id"]),
                          "chosen_candidate_id": int(l["chosen_candidate_id"]),
                          "new_parent_id": str(l["new_parent_id"])} for l in self.lineage][-8:],
@@ -1269,13 +2319,19 @@ class GANMode(ModeController):
             "history_parent_realization_gap_mean_dist2": (float(np.mean(gaps)) if gaps else None),
             "history_parent_windows": len(gaps),
             "statistics": {k: v for k, v in stats.items() if k != "per_step"}})
+        if self._hold_active:
+            self.hold_traces.append({"unit": int(unit.index), "holds": list(self._hold_records),
+                                     "summary": stats.get("hold", {})})
         self._pending = []
+        self._hold = None
 
     # ================================================================== checks / trace
     def signature(self) -> np.ndarray:
         parents_mean = self.parent_xi[:, self.fm_idx, :].mean(axis=(0, 1))
-        return np.concatenate([self.phi, self.mu.ravel(), self.log_sigma.ravel(),
-                               self.logits, parents_mean])
+        out = [self.phi, self.mu.ravel(), self.log_sigma.ravel(), self.logits, parents_mean]
+        if self._hold_seen:      # hold mode: the hold generator is part of the ideal distribution
+            out += [self.h_logits, self.h_mu.ravel(), self.h_log_sigma.ravel(), self.h_phi]
+        return np.concatenate(out)
 
     def trace(self) -> Dict[str, Any]:
         return {
@@ -1285,6 +2341,107 @@ class GANMode(ModeController):
             "lineage": self.lineage,
             "reference_summary": self.reference_summaries,
             "statistics": self.statistics,
+            **({"hold_mode": {
+                "active": True,
+                "law": "per hold the reference distribution is a set of EXACT plans that continue "
+                       "from the current positions / levels and are narrowed to a distance band "
+                       "around the committed history (the anchor = the mean of the last committed "
+                       "block); eq. (40) weights the kept plans; p_Theta(b, w) draws an origin "
+                       "class (slot) from a categorical carried across holds and units, one kept "
+                       "plan inside it with the eq. (40) weights, and a Gaussian displacement w of "
+                       "the MATERIAL LEVELS of the plan's steps (clipped into [0, 1]); the "
+                       "published ideal is the exact plan_rows of that displaced plan and the plan "
+                       "itself is in Target.meta['plan']",
+                "realizability": "xi_hat[rows] = plan_rows(plan) of the engine's own evaluator; the "
+                                 "xi-space displacement B_ref w of eq. (41) is NOT added in hold "
+                                 "mode (it is not realizable) - it stays in the legacy path",
+                "slots": list(self.HOLD_SLOTS),
+                "slot_meaning": {
+                    "levels_only": "level moves of the materials, no jump",
+                    "committed_positions": "jump to a position of the committed history (events' "
+                                           "src_position, positions the realizer committed earlier)",
+                    "fragment_candidates": "jump to an.fragment_candidates for the band profile of "
+                                           "the recent committed compositions",
+                    "random_positions": "fresh uniform position (the exploration share)"},
+                "slot_share_drawn": {n: s for n, s in zip(self.HOLD_SLOTS, self.HOLD_SLOT_SHARE)},
+                "narrowing": "keep the plans whose rows at the end of the hold lie in "
+                             f"[{self.hold_band_lo}, {self.hold_band_hi}] x (the hold's own flutter, "
+                             "measured on the UNCHANGED continuation) x (hold_move_scale x openness)^2 "
+                             "of the anchor: neither the unchanged sound nor an unrelated mix",
+                "discriminator": (
+                    ("REAL DATA (docs/FIDELITY_CONTRACT.md C): positives = exact composition rows of "
+                     "UNMANIPULATED playback on the rows of the hold - every track plays on "
+                     "continuously from a random position of its own source at a constant level, the "
+                     "levels drawn from the committed level vectors and the goal track on its "
+                     f"schedule ({self.hold_real_positives} windows per hold, "
+                     f"{self.hold_psi_blocks} commit blocks each, computed with the analyzer's exact "
+                     "Gram machinery).  Negative = the committed sound over the last "
+                     f"{self.hold_psi_blocks} commit blocks.  The feature map psi_h carries explicit "
+                     "MOTION terms (block-to-block change of the band features and of the "
+                     "contributions, hop / block / within-block / span distances), so D judges how "
+                     "the sound MOVES, not only where it is; its standardisation is frozen from the "
+                     "real windows of the first hold and its parameters h_phi are inherited across "
+                     "units.  D step(s) then G step(s) once per committed block."
+                     if self.hold_positive_source == "recordings" else
+                     "positives = the kept plans' exact rows on the committed rows with weights r_b; "
+                     "negative = the committed composition on the same rows; D step(s) then G "
+                     "step(s) once per committed block")),
+                "positive_source": self.hold_positive_source,
+                "positive_source_note": "hold_positive_source = 'recordings' (default) | 'plans' "
+                                        "(the previous law: random plans moved close to the sound, "
+                                        "which made the D gap partly self-made)",
+                "psi_h_features": list(self.h_psi_names),
+                "psi_h_standardisation": {"source": self.h_psi_scale_source, "n": int(self.h_psi_scale_n),
+                                          "mean": [float(x) for x in self.h_psi_mean],
+                                          "std": [float(x) for x in self.h_psi_std]},
+                "h_phi": [float(x) for x in self.h_phi],
+                "h_phi_where_motion": self._h_phi_split(),
+                "h_phi_note": "a positive weight means the feature makes a window look like UNMANIPULATED playback; the largest components say what D actually separates on",
+                "generator_update": "REINFORCE (eq. 45) on (slot, level displacement) with the same "
+                                    "importance correction / ESS trust region as the legacy law",
+                "config_defaults_used": {
+                    "hold_move_scale": float(self.hold_move_scale),
+                    "hold_reference_candidates": int(self.hold_candidates),
+                    "hold_band_lo": float(self.hold_band_lo), "hold_band_hi": float(self.hold_band_hi),
+                    "hold_move_over_flutter_min": float(self.hold_ratio_min),
+                    "hold_move_over_flutter_max": float(self.hold_ratio_max),
+                    "hold_level_move": float(self.hold_level_move),
+                    "hold_level_floor": float(self.hold_level_floor),
+                    "hold_magnitude_min": float(self.hold_magnitude_range[0]),
+                    "hold_magnitude_max": float(self.hold_magnitude_range[1]),
+                    "hold_jump_probability": float(self.hold_jump_probability),
+                    "hold_search_rows": int(self.hold_search_rows),
+                    "hold_keep_min": int(self.hold_keep_min), "hold_keep_max": int(self.hold_keep_max),
+                    "hold_fragment_pool": int(self.hold_fragment_pool),
+                    "hold_steadiness_factor": int(self.hold_steady_factor),
+                    "hold_max_jumps_per_plan": int(self.hold_max_jumps),
+                    "hold_w_sigma_init": float(self.hold_w_sigma_init),
+                    "hold_w_sigma_min": float(self.hold_w_sigma_min),
+                    "hold_w_sigma_max": float(self.hold_w_sigma_max),
+                    "hold_flutter_floor": float(self.hold_flutter_floor),
+                    "hold_positive_source": str(self.hold_positive_source),
+                    "hold_real_positives": int(self.hold_real_positives),
+                    "hold_psi_blocks": int(self.hold_psi_blocks),
+                    "hold_psi_scale_samples": int(self.hold_psi_scale_samples),
+                    "hold_real_near_share": float(self.hold_real_near_share),
+                    "hold_real_offset_seconds": float(self.hold_real_offset_seconds),
+                    "hold_logit_clip": float(self.hold_logit_clip),
+                    "hold_d_l2": float(self.hold_d_l2),
+                    "hold_lr_G_scale": float(self.hold_lr_G_scale),
+                    "note": "read from mode_defaults.gan with .get; not present in config.py "
+                            "DEFAULTS (shared file not edited), so a project file cannot set them "
+                            "until they are added there"},
+                "approximations": [
+                    "E_hist of eq. (40) is evaluated on a full-unit trajectory whose rows outside "
+                    "the held window are the anchor, so within one hold it varies only through the "
+                    "window rows: r_b is dominated by E_form there",
+                    "the per-hold restriction of p_Theta to the slots that survived the narrowing "
+                    "is treated as part of the environment, not of p_Theta (it cancels in the "
+                    "importance ratio only when the same slots survive)",
+                    "candidate plans are screened on a row subset (flux is then computed between "
+                    "non-adjacent rows); the kept plans and the published plan are evaluated on "
+                    "all rows"],
+                "per_unit": self.hold_traces}} if self._hold_seen else {}),
             "reference_distribution": {
                 "source": self.reference_source,
                 "fragment_vocabulary_available": bool(self.fragment_mode()),

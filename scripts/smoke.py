@@ -388,6 +388,62 @@ def check_C(modes, fx, hard):
        rf["status"] in ("BEST_EFFORT", "VALID_APPROXIMATION") and hcf.get("all_passed") and tf["analysis"]["d_xi"] > 30,
        f"{rf['status']} jumps={hcf.get('position_jumps')} multi-track steps={multi} {time.time() - t0:.0f}s")
     REPORT["C"]["fragment"] = {"status": rf["status"], "jumps": hcf.get("position_jumps"), "multi_track_jump_steps": multi}
+    # reference hold (docs/HOLD_CONTRACT.md): one frozen realizable ideal per 2 s, plan hints; the sound
+    # must actually follow the requested moves (measured like scripts/closeness.py)
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import closeness  # noqa: E402
+    ocfg = json.loads(json.dumps(fcfg))
+    ocfg["hires"].update({"reference_hold_seconds": 2.0, "reference_selection": "first",
+                          "reference_anchor": "block_mean", "n_reference_proposals": 1})
+    REPORT["C"]["hold"] = {}
+    for mode in modes:
+        opath = os.path.join(DEV, f"hold_{mode}.json")
+        ocfg["mode"] = mode
+        json.dump(ocfg, open(opath, "w"))
+        jo = Job(load_config(opath, mode), os.path.join(DEV, "out", "hold", mode), config_path=opath, mode_override=mode)
+        t0 = time.time()
+        ro = jo.run()
+        to = json.load(open(os.path.join(jo.output_dir, "state_trace.json")))
+        hco = to.get("hard_checks", {})
+        ok(f"{mode} hold: legal output, exact goal on the raw render",
+           ro["status"] in ("BEST_EFFORT", "VALID_APPROXIMATION") and hco.get("all_passed") and hco.get("exact_goals_rendered"),
+           f"{ro['status']} {time.time() - t0:.0f}s")
+        units_o = [u for u in to.get("units", []) if u.get("commits", 0) > 0]
+        held_ok = all(u.get("hold_segments") and len(u["hold_segments"]) <= -(-u["commits"] // 4) + 1
+                      and all(not st["reference_updated_during_realization"] for st in u["steps"]) for u in units_o)
+        ok(f"{mode} hold: one frozen reference per hold (2 s = 4 commits), recorded with its anchor", bool(units_o) and held_ok,
+           [(len(u["hold_segments"]), u["commits"]) for u in units_o])
+        hints = [u["hold_summary"]["plan_hints"] for u in units_o]
+        ok(f"{mode} hold: the ideal is published as a realizable plan (hints reach the realizer)",
+           sum(h["steps_with_level_hints"] + h["steps_with_jump_hints"] for h in hints) > 0, hints[0] if hints else None)
+        res = closeness.diag(os.path.join(DEV, "out", "hold"), mode, n_random=50)
+        nrow = sum(r["rows"] for r in res)
+        ach = sum(r["achieved"] * r["rows"] for r in res) / max(1, nrow)
+        cs = sum(r["cos"] * r["rows"] for r in res) / max(1, nrow)
+        ok(f"{mode} hold: the sound follows the requested moves (achieved fraction > 0.9, direction cosine > 0.9)",
+           ach > 0.9 and cs > 0.9, f"achieved {ach:+.2f} cos {cs:+.2f}")
+        REPORT["C"]["hold"][mode] = {"status": ro["status"], "achieved": ach, "cos": cs,
+                                     "requested_over_flutter": [u["hold_summary"]["requested_over_flutter"] for u in units_o]}
+    # second voices (user-authorised 2026-09-17): the same material at two positions at once
+    vcfg = json.loads(json.dumps(ocfg))
+    vcfg["mode"] = modes[0]
+    vcfg["hires"].update({"voices_per_material": 2, "explore_tracks_max": 3})
+    vpath = os.path.join(DEV, f"hold_v2_{modes[0]}.json")
+    json.dump(vcfg, open(vpath, "w"))
+    jv = Job(load_config(vpath, modes[0]), os.path.join(DEV, "out", "hold_v2", modes[0]), config_path=vpath, mode_override=modes[0])
+    t0 = time.time()
+    rv = jv.run()
+    tv = json.load(open(os.path.join(jv.output_dir, "state_trace.json")))
+    hcv = tv.get("hard_checks", {})
+    names = tv.get("source_order", [])
+    n_mat = (len(names) - 1) // 2
+    second_used = any(sg.get("end_gain", 0.0) > 0.05 for tr in tv["curve_segments_per_track"][1 + n_mat:] for sg in tr)
+    ok(f"{modes[0]} hold + second voices: legal output, exact goal, 1 + 2N tracks, a second voice sounds",
+       rv["status"] in ("BEST_EFFORT", "VALID_APPROXIMATION") and hcv.get("all_passed") and hcv.get("exact_goals_rendered")
+       and len(names) == 1 + 2 * n_mat and all(nm.endswith("#2") for nm in names[1 + n_mat:]) and second_used,
+       f"{rv['status']} tracks={len(names)} {time.time() - t0:.0f}s")
+    REPORT["C"]["hold_second_voices"] = {"status": rv["status"], "tracks": names}
+    os.chdir(ROOT)
     # poor-approximation fixture: must still output BEST_EFFORT/VALID within bounded time
     mode = modes[0]
     job, cfg = job_for(hard, mode, "hard")

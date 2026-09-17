@@ -32,7 +32,7 @@ from .analysis import Analyzer
 from .audio_io import read_wav
 from .bank import Bank
 from .config import MODE_IDS, SPEC_VERSION
-from .curves import Bump, MotionLimits, TrackCurve
+from .curves import Bump, Clip, MotionLimits, TrackCurve
 from .form import FormInfeasible, FormPlan
 from .history import History
 from .hires import HiresState, run_unit_hires
@@ -121,6 +121,22 @@ class Job:
             jump = float(np.max(np.abs(x[-1].astype(np.float64) - x[0].astype(np.float64))))
             if jump > 0.1:
                 self.warnings.append(f"track {k}: loop boundary jump {jump:.3f} (not repaired, by design)")
+        # second voices (user-authorised 2026-09-17): the same material may sound at two positions at
+        # once.  Tracks 1+N .. 2N share the PCM of tracks 1 .. N (no copy) and are ordinary tracks
+        # everywhere else (own gain curve, own position map); the hires state starts them half a
+        # loop away.  The static peak bound below counts every track, so it still holds.
+        self.n_materials = self.N
+        voices = int(cfg["hires"].get("voices_per_material", 1)) if cfg["hires"].get("enabled", False) else 1
+        self.voice_of = list(range(self.M))                   # track -> first track of the same source
+        if voices > 1:
+            for v in range(1, voices):
+                for k in range(1, self.n_materials + 1):
+                    self.sources.append(self.sources[k])
+                    self.infos.append(self.infos[k])
+                    self.input_paths.append(self.input_paths[k])
+                    self.voice_of.append(k)
+            self.M = len(self.sources)
+            self.N = self.M - 1
         bl = cfg["base_level"]
         peaks = np.array([float(np.max(np.abs(x))) for x in self.sources])
         if bl.get("policy", "shared_static_peak_bound") != "shared_static_peak_bound":
@@ -129,6 +145,8 @@ class Job:
         self.peaks = peaks
         self.base_gains = [B] * self.M
         self.track_names = ["goal"] + [os.path.splitext(os.path.basename(p))[0] for p in self.input_paths[1:]]
+        for k in range(self.n_materials + 1, self.M):         # second voices: material name + "#2", "#3", ...
+            self.track_names[k] = f"{self.track_names[k]}#{1 + (k - 1) // self.n_materials}"
         self.spec_document_sha256 = None
         sd = cfg.get("spec_document")
         if sd:
@@ -161,7 +179,12 @@ class Job:
             if cfg["hires"].get("fragment_vocabulary", False):
                 self.analyzer.build_fragment_bank(float(cfg["hires"].get("clip_feature_seconds", cfg["hires"]["min_clip_seconds"])))
             self.solo_bank_seconds = time.time() - t1
+            if float(cfg["hires"].get("reference_hold_seconds", 0.0)) > float(cfg["hires"]["commit_seconds"]):
+                self.analyzer.enable_window_cache()       # hold mode only: legacy paths stay bit-identical by construction
             self.hires_state = HiresState(self.M, 0)
+            for k in range(self.n_materials + 1, self.M):     # second voices start away from the first
+                v = (k - 1) // self.n_materials
+                self.hires_state.clips[k].append(Clip(0, int(self.sources[k].shape[0] * v / float(v + 1))))
         w_ms = self.analyzer.W / self.fs * 1000.0
         loops = {self.track_names[k]: self.total_frames / float(x.shape[0]) for k, x in enumerate(self.sources)}
         self.source_loop_counts = loops
@@ -725,7 +748,7 @@ class Job:
                         goal_ok = False
                         viol.append(f"track{i}:goal_hold_not_exact_in_phase@{p.start}")
             n_switch += sum(1 for sg in cv.segments if sg.label == "SWITCH")
-            n_jumps += len(cv.clips)
+            n_jumps += sum(1 for c in cv.clips if c.out_start > 0)     # the start offset of a second voice is not a jump
         return {"profile": "hires (steep switches, position jumps; slow-motion rules waived by user authorisation)",
                 "gain_bounds": min_g >= -self.lim.bound_tol and max_g <= 1 + self.lim.bound_tol,
                 "gain_range_observed": [min_g, max_g], "continuity_and_motion_limits": not any("discontinu" in v for v in viol),

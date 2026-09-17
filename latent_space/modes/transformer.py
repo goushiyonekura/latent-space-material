@@ -106,6 +106,50 @@ autoregression of eq. (37)/(38) and all learning hooks keep their form.
 When the fragment bank is absent every one of these branches is skipped and the mode behaves
 exactly as before (baseline configs).
 
+Held realizable ideals (docs/HOLD_CONTRACT.md, 2026-09-16, user-requested), active exactly when the
+engine publishes `unit.realizer_state` (`hires.reference_hold_seconds` > `commit_seconds`).  The
+diagnosis was that averaging ALL token values into one displacement produced a free ideal step of
+0.10 d_xi against the material's own 0.46 per commit: the attention never became audible.  New law —
+**the heads SELECT**:
+
+* `prepare_reference` is called once per 2 s hold and returns ONE plan, not a free trajectory.
+* Per model step k of the hold (= one commit frame) the token bank is rebuilt from the CURRENT PLAN
+  state — the positions the plan is playing after its earlier jumps, the levels it has reached — and
+  the three heads of eq. (35) are evaluated with those query features.  After a selected jump the
+  query features change: that is the autoregression, now over realizable states.
+* The fragment tokens of the material tracks and the `src_position` of every committed memory event
+  are the same kind of object: a realizable move (track, source position).  They are merged into one
+  selection distribution, the heads entering with their own alpha AND SIGN exactly as in eq. (37)
+  (the contrast head subtracts):  score(move) = sum_h sign_h alpha_h A^h(move), standardised, softmax
+  at `hold_temperature`.
+* The openness gates the move: a step moves with probability clip(o * `hold_move_rate`), so o = 0
+  stays and GOAL_HOLD never moves.  `hold_candidates` tokens are drawn without replacement, each is
+  turned into a plan step and its EXACT rows are evaluated with `realizer_state["plan_rows"]`; the
+  step whose exact displacement is best aligned (d_xi metric) with the head-combined value
+  sum_h sign_h alpha_h O_h of eq. (36) is taken.
+* A token becomes a plan step: the selected track JUMPS to that fragment (when `frame >=
+  next_jump_frame[track]` and no jump of that track earlier in the same plan within
+  `min_clip_frames`; otherwise the level part alone) and is brought toward `probe_foreground_gain`,
+  while every other material is brought toward the level the similarity / contrast structure gives it
+  (`probe_background_gain` for the most contrasted, foreground for the closest companion).  All level
+  moves are scaled by o * `hold_move_scale` (the recession additionally by `hold_background_scale`).
+  A memory selection re-proposes a committed fragment, so recurrence becomes an actual RETURN.
+* The published `xi_hat[rows]` are the EXACT `plan_rows` of the resulting plan and `meta["plan"]`
+  carries the step list, so the engine can offer the jumps and the end levels as hints (R2).  The
+  radial bound `_bound` and the free AR(1) path `_ar_path` are therefore not used in hold mode —
+  every published state is already an exact realizable mixture.
+* `observe_committed` is called once per COMMIT with the same held reference: the attention EMA, the
+  memory-use record and every per-reference statistic are folded once per HOLD (at
+  `stats["reference_is_new"]`) with rho = 1 - exp(-hold / tau_H); the memory digest and the played
+  positions keep following the committed events at every commit.
+* Statistics: attention entropy per head, recurrence (moves that return to a committed fragment),
+  selected-token share per head and per track, jump / level-only / stay fractions, the requested
+  move, and the internal iterations (tokens scored, realizable moves scored, candidate plan steps
+  and `plan_rows` calls) kept apart from musical time.
+
+Outside hold mode (`unit.realizer_state` missing / None) none of this runs: the branch is taken
+before any RNG draw and the legacy code path is bit-identical (R5).
+
 Realization (§9.4, eq. 39): E_T = <d_xi^2(xi_t(gamma), xi_hat_t)> over the non-hold rows (the
 window restriction of the same quantity is the default `window_error`).
 
@@ -240,6 +284,35 @@ class TransformerMode(ModeController):
         self._levels = np.zeros(self.M)
         self.frag_traces: List[Dict[str, Any]] = []
         self._frag_warned = False
+        # ---- hold mode (docs/HOLD_CONTRACT.md): the heads SELECT realizable fragment moves ------
+        # Active exactly when the engine publishes `unit.realizer_state` (hires.reference_hold_seconds
+        # > commit_seconds).  Every key below is mode-local and read with .get / in-code defaults, so
+        # the config loader never sees them (R7); when realizer_state is absent none of this runs and
+        # the legacy code path — including every RNG draw — is untouched (R5).
+        self.hold_move_scale = float(self.p.get("hold_move_scale", 1.0))
+        self.hold_move_rate = float(self.p.get("hold_move_rate", 0.6))
+        self.hold_bg_scale = float(self.p.get("hold_background_scale", 1.0))
+        self.hold_temp = max(1e-6, float(self.p.get("hold_temperature", 0.5)))
+        self.hold_cands = max(1, int(self.p.get("hold_candidates", 3)))
+        self.hold_selection = str(self.p.get("hold_selection", "sample"))
+        self.hold_max_props = max(1, int(self.p.get("hold_max_proposals", 2)))
+        # ---- law -> plan fidelity (docs/FIDELITY_CONTRACT.md, Transformer A): the heads select on
+        # SEVERAL tracks at once and the levels are fitted to the free target of eq. (36)/(37).
+        # New keys (in-code defaults; the registered hold_* keys above come from config.py).
+        self.hold_tracks_max = max(1, int(self.p.get("hold_tracks_max", 3)))
+        self.hold_refine_evals = max(0, int(self.p.get("hold_refine_evals", 10)))
+        self.hold_refine_tracks = max(0, int(self.p.get("hold_refine_tracks", 2)))
+        self.hold_refine_step = float(self.p.get("hold_refine_step", 0.18))
+        self.hold_refine_min = float(self.p.get("hold_refine_min_step", 0.04))
+        self.hold_mix_candidates = int(self.p.get("hold_mixture_candidates", 1))
+        # 1 = the previous single-token hold law (docs/HOLD_CONTRACT.md), kept selectable so those
+        # outputs stay reproducible in behaviour; 2 = the multi-track law of FIDELITY_CONTRACT (A).
+        self.hold_law_version = int(self.p.get("hold_law_version", 2))
+        self._W_vec = np.asarray(analyzer.weight_vector(), dtype=np.float64)
+        self.hold_traces: List[Dict[str, Any]] = []
+        self._max_hold_traces = 600
+        self._hold_used = False
+        self._hold_warned = False
 
     def _f(self, key: str, default: float) -> float:
         return float(self.p.get(key, default))
@@ -393,13 +466,17 @@ class TransformerMode(ModeController):
         return (np.array([int(f_eval % L[i]) for i in range(self.M)], dtype=np.int64), "continuous_clock")
 
     def _fragment_tokens(self, unit: UnitContext, rows: np.ndarray, xi_cur: np.ndarray,
-                         positions: np.ndarray, levels: np.ndarray) -> Dict[str, Any]:
+                         positions: np.ndarray, levels: np.ndarray,
+                         f_query: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """The fragment token bank for one window (FRAG_CONTRACT, Transformer §1).
 
         Returns the token keys (clip-averaged fragment features), the token values nu_p (EXACT
         composition of foregrounding that fragment minus the exact current composition, averaged
         over a few offsets inside the fragment clip) and the absolute key compositions
-        xi_current + nu_p."""
+        xi_current + nu_p.
+
+        `f_query` (hold mode only) are the features of what each track plays under the CURRENT PLAN
+        state; without it the played features of the realizer's own row are used, exactly as before."""
         an = self.analyzer
         src = self.sources
         nb = int(an.nb)
@@ -409,7 +486,8 @@ class TransformerMode(ModeController):
         offs = np.unique(np.round(np.linspace(0.0, float(clip_frames), int(self.n_frag_offsets),
                                               endpoint=False)).astype(np.int64))
         n_off = int(len(offs))
-        f_cur = np.asarray(unit.f_mat[int(rows[0])], dtype=np.float64)          # (M, d_phi) played
+        f_cur = (np.asarray(unit.f_mat[int(rows[0])], dtype=np.float64) if f_query is None
+                 else np.asarray(f_query, dtype=np.float64).reshape(self.M, self.d_phi))
         b_cur = xi0[1:1 + nb]
         n_sim = int(np.ceil((K - 1) / 2.0))
         n_con = max(0, (K - 1) - n_sim)
@@ -764,6 +842,669 @@ class TransformerMode(ModeController):
             }
         return meta
 
+    # ================================================================== hold mode (HOLD_CONTRACT)
+    # In hold mode the engine asks ONCE per 2 s hold for an ideal that the sound then chases, and it
+    # publishes `unit.realizer_state` with an exact plan evaluator.  The law of this mode becomes:
+    #
+    #   per model step k of the hold (= one commit frame), the head-combined attention over the
+    #   fragment tokens of the tracks that may move is ONE selection distribution over realizable
+    #   token moves; a move is drawn (temperature) when the openness gate opens, and it is applied as
+    #   a plan step: that track JUMPS to the fragment and is brought toward probe_foreground_gain,
+    #   while the track the contrast head attends most recedes toward probe_background_gain.  The
+    #   memory head offers the `src_position` of every committed event as a token of its own, so a
+    #   memory selection is an actual RETURN to a committed fragment.
+    #
+    # The query features of the next step are the features of the fragments the plan is playing after
+    # the selected jump — that is the autoregression.  The published ideal is the EXACT `plan_rows`
+    # of the resulting plan, so the free AR path of eq. (37)/(38) and the radial bound are bypassed
+    # (every published state is already an exact realizable mixture).
+    def _wcos(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Cosine in the d_xi metric of eq. (22) (diagonal weight W)."""
+        W = self._W_vec
+        na = float(np.sqrt(max(0.0, float((a * a * W).sum()))))
+        nb = float(np.sqrt(max(0.0, float((b * b * W).sum()))))
+        if na < 1e-12 or nb < 1e-12:
+            return 0.0
+        return float((a * b * W).sum() / (na * nb))
+
+    def _hold_attention(self, unit: UnitContext, row: int, f_q: np.ndarray, pack: Dict[str, Any],
+                        tok: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """The three heads of eq. (35) at ONE model step, with the query features of the plan state.
+
+        Returns per head the attention A (M queries x its own keys), the query-averaged weight w over
+        the keys, the head context O_h of eq. (36) and the entropy."""
+        M = self.M
+        tt = np.asarray(tok["track"], dtype=np.int64)
+        K = int(pack["ev_key"].shape[0])
+        B_corr = self.bias_scale * np.tanh(pack["corr"])
+        D2 = ((f_q[:, None, :] - tok["key"][None, :, :]) ** 2).sum(axis=-1)              # (M, T)
+        D2m = ((f_q[:, None, :] - pack["ev_key"][None, :, :]) ** 2).sum(axis=-1)         # (M, K)
+        rec = np.maximum(float(unit.seconds[int(row)]) - pack["ev_t"], 0.0) / self.tau_H
+        self_ref = ((tt[None, :] == np.arange(M, dtype=np.int64)[:, None])
+                    & np.asarray(tok["is_cur"], dtype=bool)[None, :])
+        score_pair = D2 / (2.0 * self.sigma_F ** 2)
+        ev_track = pack["ev_track"]
+        out: Dict[str, Dict[str, Any]] = {}
+        for h in self.heads:
+            if h == "memory":
+                Bm = (B_corr + self._bias_tendency(pack, "memory"))[:, ev_track.clip(0, M - 1)]
+                Bm = np.where(ev_track[None, :] >= 0, Bm, 0.0)
+                A = _softmax_masked(-D2m / (2.0 * self.sigma_F ** 2) - rec[None, :] + Bm,
+                                    np.zeros((M, K), dtype=bool))
+                O = np.einsum("ip,pd->d", A, pack["ev_val"]) / float(M)
+                by = self._by_track(A, ev_track)
+            else:
+                s = -score_pair if h == "similarity" else score_pair
+                B = (B_corr + self._bias_tendency(pack, h))[:, tt.clip(0, M - 1)]
+                A = _softmax_masked(s + B, self_ref)
+                O = np.einsum("ip,pd->d", A, tok["nu"]) / float(M)
+                by = self._by_track(A, tt)
+            ent, entn = self._entropy(A)
+            out[h] = {"A": A, "w": A.mean(axis=0), "O": O, "by_track": by,
+                      "entropy": ent, "entropy_normalized": entn}
+        return out
+
+    def _hold_moves(self, att: Dict[str, Dict[str, Any]], tok: Dict[str, Any], pack: Dict[str, Any],
+                    frame: int, positions: np.ndarray, njf: List[int], plan_last: List[Optional[int]],
+                    min_clip: int, jumps_on: bool):
+        """The realizable token moves at one step and the head-combined selection distribution.
+
+        A move is (material track, source position).  Fragment tokens carry the similarity /
+        contrast weights, committed events carry the memory weight through their `src_position`;
+        identical (track, position) moves are merged.  The heads enter with their own alpha weight
+        AND SIGN — the contrast head subtracts, exactly as it does in eq. (37) — and the scores are
+        standardised before the softmax so `hold_temperature` is scale free."""
+        L = [int(x) for x in self.analyzer.source_lengths]
+        step_q = max(1, int(self.analyzer.solo_hop))
+        idx: Dict[tuple, int] = {}
+        mv: List[Dict[str, Any]] = []
+
+        def slot(track: int, pos: int, origin: str) -> Dict[str, Any]:
+            key = (int(track), int(pos))
+            k = idx.get(key)
+            if k is None:
+                k = len(mv)
+                idx[key] = k
+                mv.append({"track": int(track), "position": int(pos), "origin": origin,
+                           "from_memory": False, "w": {h: 0.0 for h in self.heads}})
+            return mv[k]
+
+        tt = np.asarray(tok["track"], dtype=np.int64)
+        tp = np.asarray(tok["pos"], dtype=np.int64)
+        rank = list(tok["rank"])
+        for p in range(int(tok["n_tokens"])):
+            if int(tt[p]) < 1:
+                continue                                  # the goal track is not controllable
+            m = slot(int(tt[p]), int(tp[p]), "fragment:%s" % rank[p])
+            for h in ("similarity", "contrast"):
+                if h in att:
+                    m["w"][h] += float(att[h]["w"][p])
+        for k in range(int(pack["ev_key"].shape[0])):
+            tr, q = int(pack["ev_track"][k]), int(pack["ev_pos"][k])
+            if tr < 1 or tr >= self.M or q < 0:
+                continue
+            m = slot(tr, q, "memory")
+            m["from_memory"] = True
+            if "memory" in att:
+                m["w"]["memory"] += float(att["memory"]["w"][k])
+        if not mv:
+            return [], np.zeros(0)
+        for m in mv:
+            i = int(m["track"])
+            m["score"] = float(sum(self.sign[h] * self.alpha[h] * m["w"][h] for h in self.heads))
+            d = abs(int(m["position"]) - int(positions[i])) % max(1, L[i])
+            d = min(d, L[i] - d)
+            m["is_current_position"] = bool(d < step_q)
+            m["jump_ok"] = bool(jumps_on and not m["is_current_position"]
+                                and frame >= int(njf[i])
+                                and (plan_last[i] is None or frame - int(plan_last[i]) >= min_clip))
+            m["head"] = max(self.heads, key=lambda h: self.sign[h] * self.alpha[h] * m["w"][h])
+        sc = np.array([m["score"] for m in mv], dtype=np.float64)
+        z = (sc - sc.mean()) / (float(sc.std()) + 1e-12)
+        e = np.exp(np.clip((z - z.max()) / self.hold_temp, -60.0, 0.0))
+        return mv, e / max(e.sum(), 1e-300)
+
+    def _hold_relation(self, att: Dict[str, Dict[str, Any]], i: int):
+        """LAW VERSION 1 (docs/HOLD_CONTRACT.md, kept selectable through `hold_law_version`).
+
+        How near every OTHER material stands to the one coming forward, in the heads' own terms:
+        r_j = alpha_s * (similarity mass on track j) - alpha_c * (contrast mass on track j), rescaled
+        to [0, 1] over the other materials (1 = the most similar companion, 0 = the most contrasted)."""
+        v = np.zeros(self.M)
+        if "similarity" in att:
+            v = v + self.alpha["similarity"] * np.asarray(att["similarity"]["by_track"],
+                                                          dtype=np.float64).sum(axis=0)
+        if "contrast" in att:
+            v = v - self.alpha["contrast"] * np.asarray(att["contrast"]["by_track"],
+                                                        dtype=np.float64).sum(axis=0)
+        others = [j for j in range(1, self.M) if j != int(i)]
+        rel = np.ones(self.M)
+        if not others:
+            return rel, None
+        w = np.array([v[j] for j in others], dtype=np.float64)
+        span = float(w.max() - w.min())
+        nw = (w - w.min()) / span if span > 1e-12 else np.full(len(others), 0.5)
+        for k, j in enumerate(others):
+            rel[j] = float(nw[k])
+        return rel, int(others[int(np.argmin(nw))])
+
+    def _hold_step_v1(self, m: Dict[str, Any], frame: int, lv: np.ndarray, o: float, g0: float,
+                      att: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """LAW VERSION 1: ONE token -> one plan step.  The selected track jumps to the fragment (when
+        the minimum clip length allows it; otherwise the level part alone) and is brought toward
+        `probe_foreground_gain`; every other material is brought toward the absolute level profile the
+        similarity / contrast structure gives it.  Kept selectable through `hold_law_version` so the
+        outputs of the hold revision stay reproducible in behaviour."""
+        i = int(m["track"])
+        s = float(o) * self.hold_move_scale
+        lv = np.asarray(lv, dtype=np.float64)
+        rel, partner = self._hold_relation(att, i)
+        new = lv.copy()
+        new[i] = float(np.clip(lv[i] + (self.fg_gain - lv[i]) * s, 0.0, 1.0))
+        sb = s * self.hold_bg_scale
+        for j in range(1, self.M):
+            if j == i:
+                continue
+            tgt = self.bg_gain + (self.fg_gain - self.bg_gain) * float(rel[j])
+            new[j] = float(np.clip(lv[j] + (tgt - lv[j]) * sb, 0.0, 1.0))
+        new[0] = float(g0)
+        jumps = {int(i): int(m["position"])} if bool(m["jump_ok"]) else {}
+        return {"step": {"frame": int(frame), "jumps": jumps, "levels": [float(x) for x in new]},
+                "partner": partner, "relation": [round(float(x), 4) for x in rel],
+                "kind": ("jump" if jumps else "level")}
+
+    def _hold_track_mass(self, att: Dict[str, Dict[str, Any]]) -> np.ndarray:
+        """Head-combined attention mass per TRACK (M,): sum_h sign_h alpha_h * (the attention the
+        head puts on the tokens / events of that track, summed over the queries).  The contrast head
+        enters with its minus sign, exactly as in eq. (37).  O(M) — linear in the number of tracks."""
+        v = np.zeros(self.M)
+        for h in self.heads:
+            v = v + self.sign[h] * self.alpha[h] * np.asarray(att[h]["by_track"],
+                                                              dtype=np.float64).sum(axis=0)
+        return v
+
+    def _hold_free_target(self, xi_state: np.ndarray, O_sel: np.ndarray, o: float,
+                          tok: Dict[str, Any], n_move: int = 1):
+        """The FREE target of eq. (36)/(37) at one model step — what the law asks for before any
+        realizability is imposed.
+
+        DIRECTION: the head-combined value sum_h sign_h alpha_h O_h (eq. 36), normalised in the d_xi
+        metric.  MAGNITUDE: `o * hold_move_scale * sqrt(n_moving_tracks) * median_p d_xi(nu_p, 0)`,
+        i.e. the openness times the knob times the TYPICAL size of one fragment move in the current
+        vocabulary, times sqrt of the number of tracks that move (independent players add in
+        quadrature).  The median (not the maximum) is used so that the target sits at the scale of a
+        step this law can actually take: with a target far out of reach, minimising the distance to
+        it would only reward moving far, not moving in the right direction.  The target itself is
+        still a free point of xi-space and generally NOT realizable; the plan step is judged by how
+        close its exact rows come to it (`law_fidelity`)."""
+        Wv = self._W_vec
+        n = float(np.sqrt(max(0.0, float((O_sel * O_sel * Wv).sum()))))
+        vn = np.asarray(tok.get("value_norms") or [], dtype=np.float64)
+        ref = float(np.median(vn[1:])) if vn.size > 1 else float(np.sqrt(max(0.0, float(tok["reach2"]))))
+        mag = float(o) * self.hold_move_scale * float(np.sqrt(max(1, int(n_move)))) * ref
+        xi0 = np.asarray(xi_state, dtype=np.float64)
+        if n < 1e-12 or mag <= 0.0:
+            return xi0.copy(), 0.0
+        return xi0 + (mag / n) * np.asarray(O_sel, dtype=np.float64), mag
+
+    def _hold_levels_from_attention(self, mass: np.ndarray, lv: np.ndarray, o: float,
+                                    moving: List[int]) -> np.ndarray:
+        """Initial end levels of a step, proportional to the head-combined attention mass: every
+        material track is placed between `probe_background_gain` and `probe_foreground_gain` by its
+        min-max normalised mass, and the levels move that far from where they are (the tracks the
+        step actually moves by `o * hold_move_scale`, the others additionally by
+        `hold_background_scale`).  O(M)."""
+        idx = list(range(1, self.M))
+        lv = np.asarray(lv, dtype=np.float64)
+        new = lv.copy()
+        if not idx:
+            return new
+        w = np.array([mass[i] for i in idx], dtype=np.float64)
+        span = float(w.max() - w.min())
+        nw = (w - w.min()) / span if span > 1e-12 else np.full(len(idx), 0.5)
+        s = float(np.clip(float(o) * self.hold_move_scale, 0.0, 1.0))
+        mv = set(int(x) for x in moving)
+        for k, i in enumerate(idx):
+            tgt = self.bg_gain + (self.fg_gain - self.bg_gain) * float(nw[k])
+            sc = s if i in mv else s * self.hold_bg_scale
+            new[i] = float(np.clip(lv[i] + (tgt - lv[i]) * sc, 0.0, 1.0))
+        return new
+
+    def _hold_refine(self, plan_rows, steps: List[Dict[str, Any]], step: Dict[str, Any],
+                     sel: np.ndarray, xi_free: np.ndarray, tracks: List[int], budget: int):
+        """Short coordinate refinement of the step's END LEVELS so that the EXACT rows of the plan
+        come as close as possible to the free target (d_xi on the block mean).  Only `tracks` are
+        touched (the moving tracks plus the few loudest others), so the cost per step does not grow
+        with the number of tracks.  Returns (best d2, evaluations, best levels)."""
+        best_lv = np.asarray(step["levels"], dtype=np.float64).copy()
+        xi_c, _p, _i = plan_rows(steps + [step], sel)
+        best = float(self.analyzer.dist2(xi_c.mean(axis=0), xi_free))
+        evals = 1
+        d = float(self.hold_refine_step)
+        while evals < budget and d >= float(self.hold_refine_min):
+            improved = False
+            for i in tracks:
+                for sgn in (1.0, -1.0):
+                    if evals >= budget:
+                        break
+                    trial = best_lv.copy()
+                    trial[int(i)] = float(np.clip(trial[int(i)] + sgn * d, 0.0, 1.0))
+                    if abs(trial[int(i)] - best_lv[int(i)]) < 1e-9:
+                        continue
+                    st2 = dict(step)
+                    st2["levels"] = [float(x) for x in trial]
+                    xi_t, _p2, _i2 = plan_rows(steps + [st2], sel)
+                    evals += 1
+                    v = float(self.analyzer.dist2(xi_t.mean(axis=0), xi_free))
+                    if v < best - 1e-12:
+                        best, best_lv, improved = v, trial, True
+            if not improved:
+                d *= 0.5
+        return best, evals, best_lv
+
+    def _hold_plan(self, unit: UnitContext, rows: np.ndarray, xi_anchor: np.ndarray,
+                   rs: Dict[str, Any], pack: Dict[str, Any],
+                   probe_pack: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Build ONE plan for the whole hold and evaluate its exact rows (R2/R3)."""
+        an = self.analyzer
+        plan_rows = rs["plan_rows"]
+        commit = int(rs["commit_frames"])
+        min_clip = int(rs["min_clip_frames"])
+        t0 = int(rs["frame"])
+        hold_f = int(rs["hold_frames"])
+        end_f = int(rs["search_end_frame"])
+        jumps_on = bool(rs["jumps_enabled"])
+        njf = [int(x) for x in rs["next_jump_frame"]]
+        goal_g = np.asarray(rs["goal_gains"], dtype=np.float64).reshape(-1)
+        centers = unit.centers[rows]
+        lv = np.clip(np.asarray(rs["levels"], dtype=np.float64).reshape(-1).copy(), 0.0, 1.0)
+        lv0 = lv.copy()
+        steps: List[Dict[str, Any]] = []
+        plan_last: List[Optional[int]] = [None] * self.M
+        log: List[Dict[str, Any]] = []
+        A_sum: Dict[str, np.ndarray] = {}
+        by_sum: Dict[str, np.ndarray] = {h: np.zeros((self.M, self.M)) for h in self.heads}
+        ent: Dict[str, List[float]] = {h: [] for h in self.heads}
+        entn: Dict[str, List[float]] = {h: [] for h in self.heads}
+        mem_top: List[int] = []
+        n_plan_rows = 0
+        n_tokens_seen = 0
+        n_moves_seen = 0
+        tok: Optional[Dict[str, Any]] = None
+        hist_probe: Optional[Dict[str, Any]] = None
+        frames: List[int] = []
+        f = t0
+        while f < min(t0 + hold_f, end_f):
+            frames.append(int(f))
+            f += commit
+        if not frames:
+            frames = [int(t0)]
+        for k, fk in enumerate(frames):
+            sel = rows[(centers >= fk) & (centers < fk + commit)]
+            if len(sel) == 0:
+                break
+            r0 = int(sel[0])
+            # ---- exact state the plan has reached on this commit block (the autoregression state)
+            xi_b, _pb, info_b = plan_rows(steps, sel)
+            n_plan_rows += 1
+            xi_state = xi_b.mean(axis=0)
+            pos_q = np.asarray(info_b["positions"][0], dtype=np.int64)
+            lv_q = lv.copy()
+            lv_q[0] = float(goal_g[min(int(np.searchsorted(rows, r0)), len(goal_g) - 1)])
+            f_q = an.material_features_at(pos_q[None, :])[0][0]           # (M, d_phi) under the plan
+            tok = self._fragment_tokens(unit, sel, xi_state, pos_q, lv_q, f_query=f_q)
+            att = self._hold_attention(unit, r0, f_q, pack, tok)
+            n_tokens_seen += int(tok["n_tokens"]) + int(pack["ev_key"].shape[0])
+            for h in self.heads:
+                ent[h].append(float(att[h]["entropy"]))
+                entn[h].append(float(att[h]["entropy_normalized"]))
+                by_sum[h] = by_sum[h] + np.asarray(att[h]["by_track"], dtype=np.float64)
+                a = np.asarray(att[h]["A"], dtype=np.float64)
+                if h not in A_sum:
+                    A_sum[h] = a.copy()
+                elif A_sum[h].shape == a.shape:
+                    A_sum[h] = A_sum[h] + a
+            if "memory" in att:
+                mem_top.append(int(np.argmax(att["memory"]["w"])))
+            O_sel = np.zeros(self.d_xi)
+            for h in self.heads:
+                O_sel = O_sel + self.sign[h] * self.alpha[h] * np.asarray(att[h]["O"], dtype=np.float64)
+            o_k = float(unit.o[r0])
+            rec: Dict[str, Any] = {"step": int(k), "frame": int(fk), "t_seconds": float(unit.seconds[r0]),
+                                   "openness": o_k, "kind": "stay",
+                                   "entropy": {h: float(att[h]["entropy"]) for h in self.heads}}
+            mv, prob = self._hold_moves(att, tok, pack, fk, pos_q, njf, plan_last, min_clip, jumps_on)
+            n_moves_seen += len(mv)
+            if probe_pack is not None and hist_probe is None:
+                att_e = self._hold_attention(unit, r0, f_q, probe_pack, tok)
+                mv_e, prob_e = self._hold_moves(att_e, tok, probe_pack, fk, pos_q, njf, plan_last,
+                                                min_clip, jumps_on)
+                pe = np.zeros(len(mv))
+                key_e = {(m["track"], m["position"]): q for m, q in zip(mv_e, prob_e)}
+                for q, m in enumerate(mv):
+                    pe[q] = float(key_e.get((m["track"], m["position"]), 0.0))
+                hist_probe = {"unit": int(unit.index), "hold_frame": int(t0),
+                              "model_steps": int(len(frames)), "moves": int(len(mv)),
+                              "history_version": int(pack["history_version"]),
+                              "memory_tokens_committed": int(pack["n_tokens"]),
+                              "selection_total_variation": float(0.5 * np.abs(prob - pe).sum()),
+                              "definition": "1/2 * L1 distance between the head-combined SELECTION "
+                                            "distributions over the same realizable moves built from the "
+                                            "committed history and from an empty history, first model "
+                                            "step of the first hold of the unit with history"}
+            # ---- openness gate: how often a move happens at all (o = 0 -> stay)
+            p_move = float(np.clip(o_k * self.hold_move_rate, 0.0, 1.0))
+            if bool(unit.hold_mask[r0]):
+                rec["stay_reason"] = "goal_hold"
+            elif p_move <= 0.0:
+                rec["stay_reason"] = "openness_zero"
+            elif not mv:
+                rec["stay_reason"] = "no_realizable_move"
+            elif float(self.rng.random()) >= p_move:
+                rec["stay_reason"] = "openness_gate"
+            elif int(self.hold_law_version) <= 1:
+                # ================= LAW VERSION 1: one token per step (previous behaviour) ========
+                n = int(min(self.hold_cands, len(mv)))
+                if self.hold_selection == "top":
+                    order = [int(x) for x in np.argsort(-prob)[:n]]
+                else:
+                    order = [int(x) for x in self.rng.choice(len(mv), size=n, replace=False, p=prob)]
+                best = None
+                for ci in order:
+                    m = mv[ci]
+                    cand = self._hold_step_v1(m, fk, lv, o_k, float(lv_q[0]), att)
+                    xi_c, _pc, _ic = plan_rows(steps + [cand["step"]], sel)
+                    n_plan_rows += 1
+                    dxi = xi_c.mean(axis=0) - xi_state
+                    align = self._wcos(dxi, O_sel)
+                    if best is None or align > best[0] + 1e-12:
+                        best = (align, ci, m, cand,
+                                float(np.sqrt(max(0.0, float(an.dist2(dxi, np.zeros(self.d_xi)))))), xi_c)
+                align, ci, m, cand, dnorm, xi_c = best
+                xi_free, free_mag = self._hold_free_target(xi_state, O_sel, o_k, tok, 1)
+                d_stay = float(an.dist2(xi_state, xi_free))
+                d_step = float(an.dist2(xi_c.mean(axis=0), xi_free))
+                steps.append(cand["step"])
+                if cand["step"]["jumps"]:
+                    plan_last[int(m["track"])] = int(fk)
+                lv = np.clip(np.asarray(cand["step"]["levels"], dtype=np.float64), 0.0, 1.0)
+                rec.update({
+                    "kind": cand["kind"], "track": int(m["track"]), "src_position": int(m["position"]),
+                    "origin": str(m["origin"]), "head": str(m["head"]),
+                    "from_memory": bool(m["from_memory"]), "partner_track": cand["partner"],
+                    "moving_tracks": [int(m["track"])], "n_moving_tracks": 1,
+                    "moves": [{"track": int(m["track"]), "src_position": int(m["position"]),
+                               "origin": str(m["origin"]), "head": str(m["head"]),
+                               "from_memory": bool(m["from_memory"]),
+                               "jumped": bool(cand["step"]["jumps"]),
+                               "selection_probability": float(prob[ci]), "mixture_candidate": False}],
+                    "selection_probability": float(prob[ci]),
+                    "candidates_evaluated": int(len(order)), "refinement_evaluations": 0,
+                    "attention_alignment": float(align),
+                    "law_fidelity": (float(1.0 - d_step / d_stay) if d_stay > 1e-12 else None),
+                    "free_target_magnitude_d_xi": float(free_mag),
+                    "d2_step_to_free_target": float(d_step), "d2_stay_to_free_target": float(d_stay),
+                    "exact_step_displacement_d_xi": float(dnorm),
+                    "levels": [round(float(x), 4) for x in lv],
+                    "head_weights": {h: float(m["w"][h]) for h in self.heads},
+                })
+            else:
+                # ================= LAW VERSION 2: the heads select on several tracks at once =====
+                # ---- the tracks that move: largest head-combined mass; how many scales with o
+                mass = self._hold_track_mass(att)
+                n_move = int(np.clip(int(round(o_k * float(self.hold_tracks_max))), 1,
+                                     max(1, min(int(self.hold_tracks_max), self.M - 1))))
+                by_tr: Dict[int, List[int]] = {}
+                for q, mm in enumerate(mv):
+                    by_tr.setdefault(int(mm["track"]), []).append(q)
+                ranked = [i for i in sorted(range(1, self.M), key=lambda z: -float(mass[z])) if i in by_tr]
+                movers = ranked[:n_move]
+                # tracks the level refinement may touch: the movers plus the loudest few others
+                extra = [i for i in sorted(range(1, self.M), key=lambda z: -float(lv[z]))
+                         if i not in movers][: max(0, int(self.hold_refine_tracks))]
+                ref_tracks = list(movers) + extra
+                # ---- the free target of the law at this step (direction + explicit magnitude)
+                xi_free, free_mag = self._hold_free_target(xi_state, O_sel, o_k, tok, len(movers))
+                d_stay = float(an.dist2(xi_state, xi_free))
+                # ---- a few candidate steps: one sampled token per moving track, plus (once) the
+                # mixture-aware fragment of the strongest mover for the free target
+                cand_list: List[Dict[str, Any]] = []
+                n_cand = max(1, int(self.hold_cands))
+                for c in range(n_cand):
+                    picks: List[Dict[str, Any]] = []
+                    for i in movers:
+                        qs = by_tr[i]
+                        p_i = np.array([prob[q] for q in qs], dtype=np.float64)
+                        p_i = p_i / max(p_i.sum(), 1e-300)
+                        if self.hold_selection == "top" or c == 0:
+                            qi = int(qs[int(np.argmax(p_i))])
+                        else:
+                            qi = int(self.rng.choice(qs, p=p_i))
+                        picks.append({"move": mv[qi], "prob": float(prob[qi]), "mix": False})
+                    cand_list.append({"picks": picks})
+                if int(self.hold_mix_candidates) > 0 and movers and free_mag > 0.0:
+                    i0 = int(movers[0])
+                    try:
+                        ob = an.mixture_band_energy([int(x) for x in pos_q],
+                                                    [float(x) for x in lv], skip=i0)
+                        pmix = an.fragment_candidates_mix(
+                            i0, xi_free[: 1 + int(an.nb)], ob, float(max(lv[i0], self.fg_gain)), 1,
+                            exclude_near=int(pos_q[i0]), exclude_frames=int(an.solo_hop))
+                        if pmix:
+                            base = dict(cand_list[0])
+                            pk = [dict(x) for x in base["picks"]]
+                            pk[0] = {"move": {**mv[by_tr[i0][0]], "track": i0, "position": int(pmix[0]),
+                                              "origin": "mixture_candidate", "from_memory": False,
+                                              "head": mv[by_tr[i0][0]]["head"],
+                                              "jump_ok": bool(mv[by_tr[i0][0]]["jump_ok"])},
+                                     "prob": 0.0, "mix": True}
+                            cand_list.append({"picks": pk})
+                    except Exception:  # noqa: BLE001
+                        pass
+                # ---- evaluate each candidate's EXACT rows against the free target
+                base_lv = self._hold_levels_from_attention(mass, lv, o_k, movers)
+                base_lv[0] = float(lv_q[0])
+                keep_lv = np.asarray(lv, dtype=np.float64).copy()
+                keep_lv[0] = float(lv_q[0])
+                best = None
+                for ci_, cd in enumerate(cand_list):
+                    jumps = {int(p["move"]["track"]): int(p["move"]["position"])
+                             for p in cd["picks"] if bool(p["move"]["jump_ok"])}
+                    # two level starting points per candidate: the attention profile and the levels
+                    # the plan already has (the jump alone) - the refinement then starts from the
+                    # better of the two, so an overshooting profile cannot trap it
+                    starts_lv = [base_lv] if ci_ else [base_lv, keep_lv]
+                    for lv_s in starts_lv:
+                        st_ = {"frame": int(fk), "jumps": jumps, "levels": [float(x) for x in lv_s]}
+                        xi_c, _pc, _ic = plan_rows(steps + [st_], sel)
+                        n_plan_rows += 1
+                        v = float(an.dist2(xi_c.mean(axis=0), xi_free))
+                        if best is None or v < best[0] - 1e-12:
+                            best = (v, cd, st_)
+                d_step, cd, st_ = best
+                # ---- short level refinement through plan_rows toward the same free target
+                budget = max(1, int(self.hold_refine_evals))
+                d_ref, ev_ref, lv_ref = self._hold_refine(plan_rows, steps, st_, sel, xi_free,
+                                                          ref_tracks, budget)
+                n_plan_rows += ev_ref
+                st_["levels"] = [float(x) for x in lv_ref]
+                d_step = min(d_step, d_ref)
+                xi_c, _pc2, _ic2 = plan_rows(steps + [st_], sel)
+                n_plan_rows += 1
+                dxi = xi_c.mean(axis=0) - xi_state
+                align = self._wcos(dxi, O_sel)
+                fid = (1.0 - d_step / d_stay) if d_stay > 1e-12 else None
+                steps.append(st_)
+                for i_, _p_ in st_["jumps"].items():
+                    plan_last[int(i_)] = int(fk)
+                lv = np.clip(np.asarray(st_["levels"], dtype=np.float64), 0.0, 1.0)
+                mrec = [{"track": int(p["move"]["track"]), "src_position": int(p["move"]["position"]),
+                         "origin": str(p["move"]["origin"]), "head": str(p["move"]["head"]),
+                         "from_memory": bool(p["move"].get("from_memory", False)),
+                         "jumped": bool(int(p["move"]["track"]) in st_["jumps"]),
+                         "selection_probability": float(p["prob"]), "mixture_candidate": bool(p["mix"])}
+                        for p in cd["picks"]]
+                rec.update({
+                    "kind": ("jump" if st_["jumps"] else "level"),
+                    "moving_tracks": [int(x) for x in movers], "n_moving_tracks": int(len(movers)),
+                    "moves": mrec,
+                    "track": int(mrec[0]["track"]), "src_position": int(mrec[0]["src_position"]),
+                    "origin": str(mrec[0]["origin"]), "head": str(mrec[0]["head"]),
+                    "from_memory": bool(any(x["from_memory"] for x in mrec)),
+                    "mixture_candidate_used": bool(any(x["mixture_candidate"] for x in mrec)),
+                    "candidates_evaluated": int(len(cand_list)),
+                    "refinement_evaluations": int(ev_ref),
+                    "attention_alignment": float(align),
+                    "law_fidelity": (float(fid) if fid is not None else None),
+                    "free_target_magnitude_d_xi": float(free_mag),
+                    "d2_step_to_free_target": float(d_step), "d2_stay_to_free_target": float(d_stay),
+                    "exact_step_displacement_d_xi": float(np.sqrt(max(0.0, float(
+                        an.dist2(dxi, np.zeros(self.d_xi)))))),
+                    "levels": [round(float(x), 4) for x in lv],
+                    "track_mass": [round(float(mass[z]), 5) for z in range(self.M)],
+                })
+            if k == 0 and not steps:
+                # R2: the plan always has a step at the hold start (here: hold the current levels)
+                steps.append({"frame": int(t0), "jumps": {},
+                              "levels": [float(x) for x in np.append(lv_q[:1], lv[1:])]})
+            log.append(rec)
+        # ---- publish: the EXACT rows of the plan over the whole held span ----------------------
+        xi_plan, _pp, info = plan_rows(steps, rows)
+        n_plan_rows += 1
+        xi_hat = self.mu_det.copy()
+        xi_hat[rows] = xi_plan
+        xi_hat = fix_hold_rows(unit, xi_hat)
+        # ---- statistics ------------------------------------------------------------------------
+        blk = {}
+        for fk in frames:
+            sel = rows[(centers >= fk) & (centers < fk + commit)]
+            if len(sel):
+                blk[int(fk)] = xi_plan[np.searchsorted(rows, sel)].mean(axis=0)
+        bl = [blk[f_] for f_ in sorted(blk)]
+        disp = [float(np.sqrt(max(0.0, float(an.dist2(bl[q], bl[q - 1]))))) for q in range(1, len(bl))]
+        anchor = np.asarray(xi_anchor, dtype=np.float64).reshape(-1)
+        requested = float(an.dist2(bl[-1], anchor)) if bl else 0.0
+        moves = [r for r in log if r["kind"] != "stay"]
+        recurrent = 0
+        n_sel = 0
+        recurrent_sel = 0
+        tol = float(self.recurrence_tol_s) * float(self.fs)
+        L = [int(x) for x in an.source_lengths]
+        ev_pos, ev_tr = pack["ev_pos"], pack["ev_track"]
+        for r in moves:
+            hit_any = False
+            for sm in (r.get("moves") or []):
+                tr, q = int(sm["track"]), int(sm["src_position"])
+                hit = False
+                for e_k in range(len(ev_pos)):
+                    if int(ev_tr[e_k]) != tr or int(ev_pos[e_k]) < 0:
+                        continue
+                    d = abs(q - int(ev_pos[e_k])) % max(1, L[tr])
+                    if min(d, L[tr] - d) <= tol:
+                        hit = True
+                        break
+                sm["recurrent"] = hit
+                n_sel += 1
+                recurrent_sel += int(hit)
+                hit_any = hit_any or hit
+            r["recurrent"] = hit_any
+            recurrent += int(hit_any)
+        fids = [r["law_fidelity"] for r in moves if r.get("law_fidelity") is not None]
+        aligns = [r["attention_alignment"] for r in moves if r.get("attention_alignment") is not None]
+        n_steps = max(1, len(log))
+        att_mean = {h: {"A_mean": (A_sum[h] / max(1, len(ent[h]))) if h in A_sum else np.zeros((self.M, 1)),
+                        "by_track": by_sum[h] / float(n_steps),
+                        "entropy": float(np.mean(ent[h])) if ent[h] else 0.0,
+                        "entropy_normalized": float(np.mean(entn[h])) if entn[h] else 0.0,
+                        "top_per_step": list(mem_top)} for h in self.heads}
+        plan = {
+            "hold_frame": int(t0), "hold_seconds": float(hold_f) / float(self.fs),
+            "model_steps": int(len(log)), "steps_in_plan": int(len(steps)),
+            "jump_steps": int(sum(1 for r in log if r["kind"] == "jump")),
+            "level_only_steps": int(sum(1 for r in log if r["kind"] == "level")),
+            "stay_steps": int(sum(1 for r in log if r["kind"] == "stay")),
+            "recurrent_steps": int(recurrent),
+            "selected_tokens": int(n_sel), "recurrent_tokens": int(recurrent_sel),
+            "moving_tracks_per_step": (float(np.mean([r["n_moving_tracks"] for r in moves]))
+                                       if moves else 0.0),
+            "mean_law_fidelity": float(np.mean(fids)) if fids else None,
+            "law_fidelity_positive_rate": (float(np.mean([1.0 if x > 0 else 0.0 for x in fids]))
+                                           if fids else None),
+            "mixture_candidate_steps": int(sum(1 for r in moves if r.get("mixture_candidate_used"))),
+            "refinement_evaluations": int(sum(int(r.get("refinement_evaluations", 0)) for r in log)),
+            "selected_head_counts": {h: int(sum(1 for r in moves for sm in (r.get("moves") or [])
+                                                if sm.get("head") == h)) for h in self.heads},
+            "selected_track_counts": {str(i): int(sum(1 for r in moves for sm in (r.get("moves") or [])
+                                                      if int(sm["track"]) == i))
+                                      for i in range(1, self.M)},
+            "selected_from_memory": int(sum(1 for r in moves for sm in (r.get("moves") or [])
+                                            if sm.get("from_memory"))),
+            "requested_dist2_at_hold_end": float(requested),
+            "requested_d_xi_at_hold_end": float(np.sqrt(max(0.0, requested))),
+            "mean_step_displacement_d_xi": float(np.mean(disp)) if disp else 0.0,
+            "mean_attention_alignment": float(np.mean(aligns)) if aligns else None,
+            "dropped_jumps": int(len(info.get("dropped_jumps") or [])),
+            "levels_start": [round(float(x), 4) for x in lv0],
+            "levels_end": [round(float(x), 4) for x in lv],
+            "openness_at_hold_start": float(unit.o[int(rows[0])]),
+            "internal_iterations": {"plan_rows_calls": int(n_plan_rows),
+                                    "candidate_plan_steps_evaluated": int(sum(r.get("candidates_evaluated", 0)
+                                                                              for r in log)),
+                                    "tokens_scored": int(n_tokens_seen),
+                                    "realizable_moves_scored": int(n_moves_seen)},
+            "steps": log,
+        }
+        return {"xi_hat": xi_hat, "plan": steps, "stats": plan, "att_mean": att_mean, "tok": tok,
+                "history_probe": hist_probe}
+
+    def _prepare_reference_hold(self, unit: UnitContext, history, rows: np.ndarray,
+                                xi_current: np.ndarray, n_proposals: int,
+                                rs: Dict[str, Any]) -> List[Target]:
+        """`prepare_reference` in hold mode: one plan per proposal, published as its EXACT rows."""
+        xi0 = np.asarray(xi_current, dtype=np.float64).reshape(-1)
+        if xi0.shape != (self.d_xi,) or not np.isfinite(xi0).all():
+            if not self._xi_current_warned:
+                self._xi_current_warned = True
+                self.warnings.append(f"unit {unit.index}: realized current composition unusable "
+                                     f"(shape {np.shape(xi_current)}); hold plan anchored on the unit-start probe")
+            xi0 = self.xi_start.copy()
+        pack = self._history_pack(unit, history)
+        probe_pack = None
+        if self._win_probe is None and int(getattr(history, "n_updates", 0)) > 0:
+            probe_pack = self._history_pack(unit, None, empty=True)
+        out: List[Target] = []
+        for a in range(max(1, min(int(n_proposals), self.hold_max_props))):
+            res = self._hold_plan(unit, rows, xi0, rs, pack, probe_pack if a == 0 else None)
+            if res.get("history_probe") is not None and self._win_probe is None:
+                self._win_probe = res["history_probe"]
+            meta = dict(self._att_meta(res["att_mean"], pack, res["tok"]))
+            st = res["stats"]
+            meta.update({
+                "scope": "hold", "start_from": "realizer_state (exact positions / levels / next_jump_frame)",
+                "window_rows": [int(rows[0]), int(rows[-1])],
+                "window_seconds": [float(unit.seconds[rows[0]]), float(unit.seconds[rows[-1]])],
+                "model_steps": int(st["model_steps"]),
+                "excursion_clipped_steps": 0, "bound_usage_rate": 0.0,
+                "mean_step_displacement_d_xi": float(st["mean_step_displacement_d_xi"]),
+                "position_source": "realizer_state",
+                "plan": res["plan"], "hold_plan": st,
+                "realizable": "xi_hat[rows] are the EXACT plan_rows of meta['plan'] (R2); the free AR "
+                              "path of eq. (37)/(38) and the radial bound are bypassed in hold mode",
+                "mean_free_state": (res["xi_hat"][rows][unit.free_mask[rows]].mean(axis=0).tolist()
+                                    if unit.free_mask[rows].any() else res["xi_hat"][rows].mean(axis=0).tolist()),
+            })
+            out.append(Target(f"transformer:u{unit.index}:h{int(rs['frame'])}:{a}", res["xi_hat"], meta=meta))
+            self._unit_window_refs += 1
+            if len(self.hold_traces) < self._max_hold_traces:
+                self.hold_traces.append({"unit": int(unit.index), "proposal": int(a),
+                                         "anchor_dist2_to_plan_start": float(
+                                             self.analyzer.dist2(res["xi_hat"][rows][0], xi0)),
+                                         **{k: v for k, v in st.items() if k != "steps"},
+                                         "steps": st["steps"]})
+        self._unit_holds += 1
+        self._hold_used = True
+        return out
+
     # ================================================================== conditioning (§9.1)
     def begin_unit(self, unit: UnitContext, history) -> None:
         self.unit = unit
@@ -839,6 +1580,28 @@ class TransformerMode(ModeController):
         self._unit_recon: List[float] = []
         self._win_probe: Optional[Dict[str, Any]] = None
         self._xi_current_warned = False
+        # --- hold-mode accumulators (HOLD_CONTRACT; one prepare_reference per HOLD, not per commit)
+        self._unit_holds = 0
+        self._unit_hold_commits = 0
+        self._unit_hold_steps = {"jump": 0, "level": 0, "stay": 0}
+        self._unit_hold_head = {h: 0 for h in self.heads}
+        self._unit_hold_track = {i: 0 for i in range(1, self.M)}
+        self._unit_hold_mem = 0
+        self._unit_hold_recur = 0
+        self._unit_hold_moves = 0
+        self._unit_hold_req: List[float] = []
+        self._unit_hold_align: List[float] = []
+        self._unit_hold_fid: List[float] = []
+        self._unit_hold_fid_pos = 0
+        self._unit_hold_sel = 0
+        self._unit_hold_recur_tok = 0
+        self._unit_hold_ntracks: List[float] = []
+        self._unit_hold_mix = 0
+        self._unit_hold_refine = 0
+        self._unit_hold_dropped = 0
+        self._unit_hold_iter = {"plan_rows_calls": 0, "candidate_plan_steps_evaluated": 0,
+                                "tokens_scored": 0, "realizable_moves_scored": 0}
+        self._unit_hint_jumps = {"offered": 0, "taken": 0}
         if self.frag and self.tok_unit is not None:
             self.frag_traces.append({
                 "unit": int(unit.index), "scope": "unit_start",
@@ -1002,8 +1765,29 @@ class TransformerMode(ModeController):
         committed row), runs on the model-step subset of `rows`, and reads the committed history as
         it stands now (bias B(H), attention EMA, committed events + long-term digest).  Rows outside
         the window are filled with the unit-level ideal path; GOAL_HOLD rows are pinned to xi_goal.
-        Hypotheses stay inside the proposal: nothing is written to history.events here."""
+        Hypotheses stay inside the proposal: nothing is written to history.events here.
+
+        HOLD MODE (docs/HOLD_CONTRACT.md) branches out first: when the engine has published
+        `unit.realizer_state` the ideal is a realizable PLAN selected by the heads, not a free
+        autoregression.  Everything below this branch is the legacy path and must stay bit-identical
+        (R5) — the branch is taken before any RNG draw."""
         rows = np.asarray(rows, dtype=np.int64)
+        rs = getattr(unit, "realizer_state", None)
+        if isinstance(rs, dict) and callable(rs.get("plan_rows")) and rows.size:
+            if self.frag and getattr(self, "sources", None) is not None:
+                try:
+                    out = self._prepare_reference_hold(unit, history, rows, xi_current, n_proposals, rs)
+                    if out:
+                        return out
+                except Exception as e:  # noqa: BLE001
+                    if not self._hold_warned:
+                        self._hold_warned = True
+                        self.warnings.append(f"unit {unit.index}: hold plan unavailable ({e!r}); "
+                                             "this hold falls back to the free autoregression")
+            elif not self._hold_warned:
+                self._hold_warned = True
+                self.warnings.append("transformer: hold mode without the fragment bank; the selection law "
+                                     "needs fragment tokens, so the free autoregression is used")
         if rows.size == 0:
             return self.propose(unit, history, 0, n_proposals)
         xi0 = np.asarray(xi_current, dtype=np.float64).reshape(-1)
@@ -1105,6 +1889,14 @@ class TransformerMode(ModeController):
         rows = np.asarray(rows, dtype=np.int64)
         dt = float(len(rows)) * self.hop_s
         rho = float(history.rho_dt(dt))
+        # HOLD MODE: the SAME held reference is handed back at every commit of the hold, so nothing
+        # here may assume one prepare_reference per commit.  The attention EMA, the memory-use record
+        # and every per-reference statistic are folded ONCE per hold (at its first commit,
+        # stats["reference_is_new"]) with the history rate of the whole hold; the memory digest and
+        # the played positions keep updating at every commit, since they follow committed events.
+        hold = "reference_is_new" in stats
+        do_learn = (not hold) or bool(stats.get("reference_is_new"))
+        rho_a = rho if not hold else float(history.rho_dt(float(stats.get("reference_hold_seconds", dt))))
         meta = dict((reference.meta if reference is not None else {}) or {})
         by = meta.get("attention_by_track") or {}
         st = dict(history.mode_state.get("transformer") or {})
@@ -1114,12 +1906,12 @@ class TransformerMode(ModeController):
             cur = np.asarray(by.get(h, np.zeros((self.M, self.M))), dtype=np.float64)
             if cur.shape != (self.M, self.M) or not np.isfinite(cur).all():
                 cur = np.zeros((self.M, self.M))
-            else:
+            elif do_learn:
                 updated.append(h)
             prev = np.asarray(ema.get(h, self.A_ema[h]), dtype=np.float64)
             if prev.shape != (self.M, self.M) or not np.isfinite(prev).all():
                 prev = np.zeros((self.M, self.M))
-            new = (1.0 - rho) * prev + rho * cur
+            new = ((1.0 - rho_a) * prev + rho_a * cur) if do_learn else prev
             self.A_ema[h] = new
             ema[h] = new.tolist()
         st["attention_ema"] = ema
@@ -1141,19 +1933,65 @@ class TransformerMode(ModeController):
         # --- statistics of the attention that actually produced the committed reference ---------
         ent = meta.get("attention_entropy") or {}
         entn = meta.get("attention_entropy_normalized") or {}
-        for h in self.heads:
-            if h in ent:
-                self._unit_ent[h].append(float(ent[h]))
-            if h in entn:
-                self._unit_entn[h].append(float(entn[h]))
-        recur = self._recurrence(meta, stats)
-        if recur.get("fraction") is not None:      # undefined without played source positions
+        if do_learn:
+            for h in self.heads:
+                if h in ent:
+                    self._unit_ent[h].append(float(ent[h]))
+                if h in entn:
+                    self._unit_entn[h].append(float(entn[h]))
+        hp = (meta.get("hold_plan") or {}) if hold else {}
+        if hp:
+            recur = {"steps": int(hp.get("model_steps", 0)), "hits": int(hp.get("recurrent_steps", 0)),
+                     "moves": int(hp.get("model_steps", 0)) - int(hp.get("stay_steps", 0)),
+                     "fraction": (float(hp["recurrent_steps"]) / float(hp["model_steps"])
+                                  if hp.get("model_steps") else None),
+                     "tolerance_seconds": float(self.recurrence_tol_s),
+                     "definition": "hold mode: plan steps whose SELECTED fragment lies within the "
+                                   "tolerance of the src_position of a committed event of the same "
+                                   "track (an actual return to a committed fragment)"}
+        else:
+            recur = self._recurrence(meta, stats)
+        if do_learn and recur.get("fraction") is not None:   # undefined without played source positions
             self._unit_recur_hits += int(recur["hits"])
             self._unit_recur_steps += int(recur["steps"])
         disp = meta.get("mean_step_displacement_d_xi")
-        if isinstance(disp, (int, float)):
+        if do_learn and isinstance(disp, (int, float)):
             self._unit_disp_sum += float(disp)
             self._unit_disp_n += 1
+        if hold:
+            self._unit_hold_commits += 1
+            if hp and do_learn:
+                self._unit_hold_steps["jump"] += int(hp.get("jump_steps", 0))
+                self._unit_hold_steps["level"] += int(hp.get("level_only_steps", 0))
+                self._unit_hold_steps["stay"] += int(hp.get("stay_steps", 0))
+                for h in self.heads:
+                    self._unit_hold_head[h] += int((hp.get("selected_head_counts") or {}).get(h, 0))
+                for i in range(1, self.M):
+                    self._unit_hold_track[i] += int((hp.get("selected_track_counts") or {}).get(str(i), 0))
+                self._unit_hold_mem += int(hp.get("selected_from_memory", 0))
+                self._unit_hold_recur += int(hp.get("recurrent_steps", 0))
+                self._unit_hold_moves += int(hp.get("model_steps", 0)) - int(hp.get("stay_steps", 0))
+                self._unit_hold_dropped += int(hp.get("dropped_jumps", 0))
+                if hp.get("requested_dist2_at_hold_end") is not None:
+                    self._unit_hold_req.append(float(hp["requested_dist2_at_hold_end"]))
+                if hp.get("mean_attention_alignment") is not None:
+                    self._unit_hold_align.append(float(hp["mean_attention_alignment"]))
+                if hp.get("mean_law_fidelity") is not None:
+                    self._unit_hold_fid.append(float(hp["mean_law_fidelity"]))
+                    self._unit_hold_fid_pos += int(1 if float(hp["mean_law_fidelity"]) > 0 else 0)
+                self._unit_hold_sel += int(hp.get("selected_tokens", 0))
+                self._unit_hold_recur_tok += int(hp.get("recurrent_tokens", 0))
+                if hp.get("moving_tracks_per_step"):
+                    self._unit_hold_ntracks.append(float(hp["moving_tracks_per_step"]))
+                self._unit_hold_mix += int(hp.get("mixture_candidate_steps", 0))
+                self._unit_hold_refine += int(hp.get("refinement_evaluations", 0))
+                for kk, vv in (hp.get("internal_iterations") or {}).items():
+                    if kk in self._unit_hold_iter:
+                        self._unit_hold_iter[kk] += int(vv)
+                self._unit_hint_jumps["offered"] += int(sum(len(s_.get("jumps") or {})
+                                                            for s_ in (meta.get("plan") or [])))
+            plan_tracks = {int(i_) for s_ in (meta.get("plan") or []) for i_ in (s_.get("jumps") or {})}
+            self._unit_hint_jumps["taken"] += int(len(plan_tracks & {int(i_) for i_ in (stats.get("jumps") or {})}))
         # the realizer's own composition change over this committed block, in the same units: the
         # calibration target for the ideal's per-step displacement
         xr = np.asarray(xi_rows, dtype=np.float64)
@@ -1168,7 +2006,8 @@ class TransformerMode(ModeController):
                              "reference_id": (reference.id if reference is not None else None)}
         history.mode_state["transformer"] = st
         # --- memory references actually used by that reference --------------------------
-        top = self._record_memory_use(meta)
+        # (hold mode: once per HOLD, so a 2 s reference is not counted four times)
+        top = self._record_memory_use(meta) if do_learn else None
         fitd = None
         if reference is not None:
             fmw = unit.free_mask[rows]
@@ -1199,6 +2038,29 @@ class TransformerMode(ModeController):
             "played_positions": (list(pos_played) if pos_played is not None else None),
             "jumps": stats.get("jumps"),
         }
+        if hold:
+            rec.update({
+                "reference_is_new": bool(stats.get("reference_is_new")),
+                "reference_age_steps": int(stats.get("reference_age_steps", 0)),
+                "reference_hold_seconds": float(stats.get("reference_hold_seconds", 0.0)),
+                "learning_applied": bool(do_learn), "attention_ema_rho": float(rho_a),
+                "hold_plan": ({"model_steps": int(hp.get("model_steps", 0)),
+                               "jump_steps": int(hp.get("jump_steps", 0)),
+                               "level_only_steps": int(hp.get("level_only_steps", 0)),
+                               "stay_steps": int(hp.get("stay_steps", 0)),
+                               "selected_head_counts": hp.get("selected_head_counts"),
+                               "selected_track_counts": hp.get("selected_track_counts"),
+                               "recurrent_steps": int(hp.get("recurrent_steps", 0)),
+                               "requested_d_xi_at_hold_end": hp.get("requested_d_xi_at_hold_end"),
+                               "mean_step_displacement_d_xi": hp.get("mean_step_displacement_d_xi"),
+                               "mean_attention_alignment": hp.get("mean_attention_alignment"),
+                               "mean_law_fidelity": hp.get("mean_law_fidelity"),
+                               "moving_tracks_per_step": hp.get("moving_tracks_per_step"),
+                               "selected_tokens": hp.get("selected_tokens"),
+                               "recurrent_tokens": hp.get("recurrent_tokens"),
+                               "dropped_jumps": int(hp.get("dropped_jumps", 0)),
+                               "internal_iterations": hp.get("internal_iterations")} if hp else None),
+            })
         if len(self.step_traces) < self._max_step_traces:
             self.step_traces.append(rec)
         return {"rho": rho, "dt_seconds": dt, "heads_updated": updated,
@@ -1345,6 +2207,94 @@ class TransformerMode(ModeController):
                        "src_position": int(t.get("src_position", -1)), "weight": float(w[k])}
         return top
 
+    def _hold_unit_stats(self) -> Optional[Dict[str, Any]]:
+        """Per-unit hold-mode statistics (None outside hold mode)."""
+        if not self._unit_holds:
+            return None
+        n = int(sum(self._unit_hold_steps.values()))
+        mv = max(1, int(self._unit_hold_moves))
+        ns = max(1, int(self._unit_hold_sel))
+        return {
+            "holds": int(self._unit_holds), "commits_in_holds": int(self._unit_hold_commits),
+            "model_steps": int(n),
+            "step_kind_fraction": {k: (float(v) / float(max(1, n))) for k, v in self._unit_hold_steps.items()},
+            "step_kind_counts": dict(self._unit_hold_steps),
+            # ---- law -> plan fidelity (FIDELITY_CONTRACT, Transformer A) -----------------------
+            "mean_attention_alignment_of_chosen_step": (float(np.mean(self._unit_hold_align))
+                                                        if self._unit_hold_align else None),
+            "mean_law_fidelity": float(np.mean(self._unit_hold_fid)) if self._unit_hold_fid else None,
+            "law_fidelity_positive_hold_rate": (float(self._unit_hold_fid_pos) / float(len(self._unit_hold_fid))
+                                                if self._unit_hold_fid else None),
+            "mean_moving_tracks_per_step": (float(np.mean(self._unit_hold_ntracks))
+                                            if self._unit_hold_ntracks else None),
+            "selected_tokens": int(self._unit_hold_sel),
+            "mixture_candidate_steps": int(self._unit_hold_mix),
+            "level_refinement_evaluations": int(self._unit_hold_refine),
+            "selected_share_per_head": {h: float(self._unit_hold_head[h]) / float(ns) for h in self.heads},
+            "selected_share_per_track": {str(i): float(self._unit_hold_track[i]) / float(ns)
+                                         for i in range(1, self.M)},
+            "selected_from_memory_fraction": float(self._unit_hold_mem) / float(ns),
+            "recurrence_fraction_of_moves": float(self._unit_hold_recur) / float(mv),
+            "recurrence_fraction_of_selected_tokens": float(self._unit_hold_recur_tok) / float(ns),
+            "mean_requested_dist2_at_hold_end": (float(np.mean(self._unit_hold_req))
+                                                 if self._unit_hold_req else None),
+            "mean_requested_d_xi_at_hold_end": (float(np.mean(np.sqrt(np.maximum(self._unit_hold_req, 0.0))))
+                                                if self._unit_hold_req else None),
+            "plan_jumps_dropped_by_min_clip": int(self._unit_hold_dropped),
+            "plan_jump_tracks_offered": int(self._unit_hint_jumps["offered"]),
+            "plan_jump_tracks_realized_at_the_same_commit": int(self._unit_hint_jumps["taken"]),
+            "internal_iterations": {**{k: int(v) for k, v in self._unit_hold_iter.items()},
+                                    "note": "internal iterations of the selection, counted apart from musical "
+                                            "time: `plan_rows_calls` exact evaluations (one per model step for "
+                                            "the plan state, one per candidate step, one per hold on all rows), "
+                                            "`tokens_scored` fragment + memory tokens the heads scored, "
+                                            "`realizable_moves_scored` (track, position) moves in the selection "
+                                            "distributions, `candidate_plan_steps_evaluated` plan steps whose "
+                                            "exact rows were compared with the attention's own displacement"},
+            "definitions": {
+                "selection": "one distribution over realizable (track, source position) moves: the fragment "
+                             "tokens carry the similarity / contrast head weights, every committed event "
+                             "carries the memory weight through its src_position; score = sum_h sign_h "
+                             "alpha_h w_h(move), standardised, softmax at hold_temperature.  Per model step "
+                             "the tracks with the largest head-combined mass move (their number = "
+                             "round(o * hold_tracks_max), clipped to >= 1), each with its own sampled / top "
+                             "token; hold_candidates such token sets (plus one whose strongest track takes "
+                             "the fragment_candidates_mix suggestion for the free target) are evaluated "
+                             "exactly and the closest to the free target is kept",
+                "free_target": "xi_free = xi_plan_state + magnitude * direction; DIRECTION = the "
+                               "head-combined value sum_h sign_h alpha_h O_h of eq. (36) normalised in the "
+                               "d_xi metric, MAGNITUDE = o * hold_move_scale * sqrt(moving tracks) * "
+                               "median_p d_xi(nu_p, 0) (openness x knob x the typical size of one fragment "
+                               "move x sqrt of the number of independent players that move).  It is what "
+                               "the law asks for and is generally NOT realizable",
+                "levels": "initialised proportional to the head-combined attention mass (every material "
+                          "track placed between probe_background_gain and probe_foreground_gain by its "
+                          "min-max normalised mass), then a short coordinate refinement through plan_rows "
+                          "(hold_refine_evals evaluations, only the moving tracks and the hold_refine_tracks "
+                          "loudest others) that minimises d_xi^2(exact block mean, free target)",
+                "attention_alignment": "cosine in the d_xi metric between the EXACT displacement of the "
+                                       "chosen step (block mean of its plan_rows minus the block mean of "
+                                       "the plan state) and the head-combined value of eq. (36)",
+                "law_fidelity": "1 - d_xi^2(exact block mean of the step, free target) / "
+                                "d_xi^2(block mean of the stay plan, free target); 1 = the step lands on "
+                                "the free target, 0 = no closer to it than doing nothing, < 0 = further "
+                                "away.  Both distances are taken on the commit-block MEAN",
+                "step_kinds": "jump = at least one moving track jumped to its selected fragment; level = "
+                              "the level move alone (minimum clip length); stay = the openness gate did not "
+                              "open (o = 0 always stays)",
+                "recurrence": "fraction of MOVES (and of selected tokens) whose fragment lies within %.1f s "
+                              "(circular in the source) of the src_position of a committed event of the "
+                              "same track" % float(self.recurrence_tol_s),
+                "cost": "per model step: 1 plan_rows for the plan state, one per candidate token set, up to "
+                        "hold_refine_evals for the level refinement, 1 for the chosen step, plus 1 per hold "
+                        "on all rows.  The number of moving tracks, the candidates per track and the "
+                        "refinement tracks are all capped, so the cost per hold does not grow with M "
+                        "(only the O(M) attention / mass / level vectors do)",
+                "bypassed": "the radial tanh bound and the free AR(1) path of eq. (37)/(38) are not used in "
+                            "hold mode: every published state is an exact plan_rows mixture",
+            },
+        }
+
     # ================================================================== memory write (eq. 27)
     def end_unit(self, unit: UnitContext, history, chosen: Realization, alternatives) -> None:
         st = dict(history.mode_state.get("transformer") or {})
@@ -1447,6 +2397,7 @@ class TransformerMode(ModeController):
                                     "commits": int(self._unit_commits),
                                     "note": "one autoregression step per model step (%.3f s); no inner optimisation"
                                             % float(self.model_step)},
+            "hold_mode": self._hold_unit_stats(),
             "inherited_vs_reinitialised": {
                 "inherited_from_history": ["attention EMA", "reference order", "memory digest",
                                            "committed events (memory keys)", "M_H correlation bias"],
@@ -1569,6 +2520,60 @@ class TransformerMode(ModeController):
                 "hypotheses": "future states stay inside the proposal; the mode never writes history.events",
             },
             "time_scale": self._time_scale(),
+            "hold_mode": {
+                "active": bool(self._hold_used),
+                "law": ("docs/HOLD_CONTRACT.md + docs/FIDELITY_CONTRACT.md (A): per model step of the hold "
+                        "(one commit frame) the heads SELECT instead of averaging, and they select on "
+                        "SEVERAL tracks at once, because the tracks are independent players.  The fragment "
+                        "tokens of the material tracks and the src_position of every committed event are "
+                        "realizable moves; the head-combined score sum_h sign_h alpha_h w_h(move) (the "
+                        "contrast head subtracts, exactly as in eq. (37)) is standardised into ONE "
+                        "selection distribution at hold_temperature.  The openness gate decides whether a "
+                        "move happens at all (p = clip(o * hold_move_rate)) and how many tracks move "
+                        "(round(o * hold_tracks_max), at least one): the tracks with the largest "
+                        "head-combined mass each take their own sampled / top token and jump to it where "
+                        "the minimum clip allows.  The material LEVELS are then set so that the EXACT rows "
+                        "approach the FREE target of eq. (36)/(37): initialised proportional to the "
+                        "attention mass, then a short coordinate refinement through plan_rows.  Among "
+                        "hold_candidates token sets - plus one in which the strongest track takes the "
+                        "an.fragment_candidates_mix suggestion for the free target - the one whose exact "
+                        "rows come closest to the free target is kept.  The next step's queries are the "
+                        "features of what the PLAN then plays: that is the autoregression.  A memory "
+                        "selection re-proposes a committed fragment, so recurrence is an actual return."),
+                "fidelity_figures": ("attention_alignment = cosine (d_xi metric) between the exact step "
+                                     "displacement and the head-combined value of eq. (36); law_fidelity = "
+                                     "1 - d_xi^2(exact block mean of the step, free target) / "
+                                     "d_xi^2(block mean of the stay plan, free target).  The free target's "
+                                     "direction is the head-combined value, its magnitude is "
+                                     "o * hold_move_scale * max_p d_xi(nu_p, 0) - openness times the knob "
+                                     "times the reach of one commit step in the fragment vocabulary."),
+                "published": ("xi_hat[rows] = the EXACT plan_rows of the plan (R2), meta['plan'] carries the "
+                              "step list (frames on the commit grid, jumps, end levels); the plan simply "
+                              "holds after its last step up to the end of rows; GOAL_HOLD rows pinned"),
+                "bypassed_in_hold_mode": ["radial tanh excursion bound (_bound)",
+                                          "free AR(1) autoregression of eq. (37)/(38) (_ar_path)",
+                                          "interpolation from the model step to the analysis rows (_interp)"],
+                "state_source": ("unit.realizer_state: positions / levels / next_jump_frame are exact, so the "
+                                 "mode's own position and level tracking (_positions_now / _levels) is used "
+                                 "only on the legacy path"),
+                "learning_cadence": ("prepare_reference runs once per hold; the attention EMA, the memory-use "
+                                     "record and every per-reference statistic are folded once per hold at "
+                                     "stats['reference_is_new'] with rho = 1 - exp(-hold / tau_H); the memory "
+                                     "digest and the played positions still update at every commit"),
+                "parameters": {"hold_move_scale": self.hold_move_scale, "hold_move_rate": self.hold_move_rate,
+                               "hold_background_scale": self.hold_bg_scale, "hold_temperature": self.hold_temp,
+                               "hold_candidates": int(self.hold_cands), "hold_selection": self.hold_selection,
+                               "hold_max_proposals": int(self.hold_max_props),
+                               "hold_tracks_max": int(self.hold_tracks_max),
+                               "hold_refine_evals": int(self.hold_refine_evals),
+                               "hold_refine_tracks": int(self.hold_refine_tracks),
+                               "hold_refine_step": self.hold_refine_step,
+                               "hold_refine_min_step": self.hold_refine_min,
+                               "hold_mixture_candidates": int(self.hold_mix_candidates),
+                               "hold_law_version": int(self.hold_law_version),
+                               "probe_foreground_gain": self.fg_gain, "probe_background_gain": self.bg_gain},
+                "holds": self.hold_traces,
+            },
             "fragment_vocabulary": self.frag_traces,
             "attention_summary": self.attention_traces,
             "memory_references": self.memory_traces,

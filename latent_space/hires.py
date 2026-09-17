@@ -21,6 +21,14 @@ Per commit step (commit_seconds):
   4. the first commit block is committed (history, mode observation, events with positions).
 The goal track follows the exposure policy deterministically (0 in INTRO/OPEN, smooth rise over
 goal_rise_seconds at the end of CONTRACT, exact 1 in GOAL_HOLD, smooth descent in REOPEN).
+
+Reference hold (opt-in, `hires.reference_hold_seconds` > commit_seconds; docs/HOLD_CONTRACT.md):
+a reference that is re-anchored to the realized composition at every commit follows the sound
+instead of leading it (measured: the closeness of the fragment version is largely automatic and
+the 0.5 s moves of the ideal do not reach the sound).  With a hold, step 1 runs once per hold:
+the mode prepares ONE ideal over the whole held span from the anchor (the mean of the last
+committed block), it stays frozen for every commit of the hold, and only then is a new ideal
+anchored to where the sound has arrived.  Each hold is recorded (anchor, requested move).
 """
 from __future__ import annotations
 
@@ -77,6 +85,12 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     frag = bool(hz.get("fragment_vocabulary", False))
     beam_width = max(1, int(hz.get("beam_width", 3)))
     cand_rows = max(2, int(hz.get("candidate_rows", 8)))
+    hold = int(round(float(hz.get("reference_hold_seconds", 0.0)) * fs))
+    hold_on = hold > commit                    # legacy: a new reference at every commit
+    ref_select = str(hz.get("reference_selection", "hold_fit"))
+    anchor_kind = str(hz.get("reference_anchor", "last_row")) if hold_on else "last_row"
+    plan_aware = bool(hz.get("plan_aware_lookahead", True))
+    explore_max = int(hz.get("explore_tracks_max", 0))
     ge = cfg["form"]["goal_exposure"]
     goal_free = ge["policy"] == "free"
     open_cap = float(ge["open_max"]) if not goal_free else 1.0
@@ -151,28 +165,150 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             pos[:, i] = cv.positions(starts, sources[i].shape[0])
         return pos
 
+    flux_prev: Dict[str, Any] = {"row": None, "ratios": None}   # last committed row and its raw band ratios
+
+    def prev_for(rws) -> Optional[np.ndarray]:
+        """Band ratios of the committed row just before rws[0] (hold mode), else None."""
+        if hold_on and flux_prev["row"] is not None and len(rws) and int(rws[0]) == int(flux_prev["row"]) + 1:
+            return flux_prev["ratios"]
+        return None
+
+    def plan_rows(steps, rws: np.ndarray, level_now: np.ndarray):
+        """EXACT composition rows of a realizable plan (docs/HOLD_CONTRACT.md).  `steps` is a list
+        of {"frame": f, "jumps": {track: source_position}, "levels": (M,) end levels or None} with
+        frames on the commit grid (ascending): at frame f the listed tracks jump (when the minimum
+        clip length allows it; others are dropped and reported) and every material ramps from its
+        level to `levels` over ramp_seconds - exactly what the realizer itself can do at that
+        commit.  The goal track follows its deterministic schedule.  Returns (xi, parts, info)."""
+        rws = np.asarray(rws, dtype=np.int64)
+        c = centers[rws]
+        last = list(state.last_jump)
+        extra: List[List[Clip]] = [[] for _ in range(M)]
+        dropped: List[Tuple[int, int]] = []
+        lv = np.asarray(level_now, dtype=np.float64).copy()
+        g = np.repeat(lv[None, :], len(rws), axis=0)
+        for s_ in sorted(steps, key=lambda x: int(x["frame"])):
+            f0 = int(s_["frame"])
+            for i_, p_ in (s_.get("jumps") or {}).items():
+                i_ = int(i_)
+                if i_ <= 0 or i_ >= M or not bool(hz["position_jumps"]) or f0 - last[i_] < min_clip:
+                    dropped.append((f0, i_))
+                    continue
+                extra[i_].append(Clip(f0, int(p_)))
+                last[i_] = f0
+            if s_.get("levels") is not None:
+                end = np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0)
+                m_ = c >= f0
+                sr = np.clip((c[m_] - f0) / float(ramp), 0.0, 1.0)
+                q = sr * sr * sr * (10.0 + sr * (-15.0 + 6.0 * sr))
+                g[m_] = lv[None, :] + (end - lv)[None, :] * q[:, None]
+                lv = end
+        g[:, 0] = goal_curve.values(c)
+        pos = np.zeros((len(rws), M), dtype=np.int64)
+        for i_ in range(M):
+            cv = TrackCurve([], [], list(state.clips[i_]) + extra[i_])
+            pos[:, i_] = cv.positions(starts_all[rws], sources[i_].shape[0])
+        _fp, S_p, _cp = an.material_features_at(pos)
+        G0p, Gbp = an.grams_at_positions(sources, starts_all[rws], pos)
+        xi_p, parts_p = an.composition_from_grams(g, G0p, Gbp, S_p, prev_ratios=prev_for(rws))
+        return xi_p, parts_p, {"dropped_jumps": dropped, "gains": g, "positions": pos}
+
+    # ---- plan-aware lookahead (hold mode): a candidate is "this choice now, then the rest of the mode's
+    # plan", not "this choice held for the whole window" - otherwise a plan that changes levels at every
+    # commit is compared with something the realizer never intends to play (docs/HOLD_CONTRACT.md)
+    def positions_plan(starts: np.ndarray, jumps: Optional[Dict[int, int]], future: List[Dict[str, Any]]) -> np.ndarray:
+        if not future or not any(s_.get("jumps") for s_ in future):
+            return positions_for(starts, jumps)
+        pos = np.zeros((len(starts), M), dtype=np.int64)
+        for i in range(M):
+            clips_i = list(state.clips[i])
+            last = state.last_jump[i]
+            if jumps and i in jumps:
+                clips_i.append(Clip(int(t), int(jumps[i])))
+                last = int(t)
+            for s_ in future:
+                for i_, p_ in (s_.get("jumps") or {}).items():
+                    if int(i_) == i and i > 0 and bool(hz["position_jumps"]) and int(s_["frame"]) - last >= min_clip:
+                        clips_i.append(Clip(int(s_["frame"]), int(p_)))
+                        last = int(s_["frame"])
+            pos[:, i] = TrackCurve([], [], clips_i).positions(starts, sources[i].shape[0])
+        return pos
+
+    def gains_plan(levels_end: np.ndarray, t_now: int, rws: np.ndarray, level_now: np.ndarray,
+                   future: List[Dict[str, Any]]) -> np.ndarray:
+        g = gains_for(levels_end, t_now, rws, level_now)
+        if not future:
+            return g
+        c = centers[rws]
+        prev = np.asarray(levels_end, dtype=np.float64)
+        for s_ in future:
+            if s_.get("levels") is None:
+                continue
+            end = np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0)
+            m_ = c >= int(s_["frame"])
+            if m_.any():
+                sr = np.clip((c[m_] - int(s_["frame"])) / float(ramp), 0.0, 1.0)
+                q = sr * sr * sr * (10.0 + sr * (-15.0 + 6.0 * sr))
+                g[m_, 1:] = prev[None, 1:] + (end[1:] - prev[1:])[None, :] * q[:, None]
+            prev = end
+        return g
+
+    held: Optional[Dict[str, Any]] = None      # the reference being chased (hold mode)
+    hold_segments: List[Dict[str, Any]] = []
+    last_rows_c: Optional[np.ndarray] = None
     while t < search_end:
         w_end = min(t + look, search_end)
         rows = np.where((centers >= t) & (centers < w_end))[0]
         if len(rows) == 0:
             t = w_end
             continue
+        new_ref = (not hold_on) or held is None or (t - held["t0"] >= hold) or int(rows[-1]) > held["last_row"]
+        rows_ref = rows
+        if hold_on and new_ref:
+            # the held ideal must cover the window of every commit of the hold
+            rows_ref = np.where((centers >= t) & (centers < min(t + hold - commit + look, search_end)))[0]
         st = starts_all[rows]
-        pos_now = positions_for(st)
-        f, S, chi = an.material_features_at(pos_now)
-        unit.f_mat[rows] = f
-        unit.S[rows] = S
-        unit.chi[rows] = chi
+        if len(rows_ref) > len(rows):
+            pos_ref = positions_for(starts_all[rows_ref])
+            f_r, S_r, chi_r = an.material_features_at(pos_ref)
+            unit.f_mat[rows_ref] = f_r
+            unit.S[rows_ref] = S_r
+            unit.chi[rows_ref] = chi_r
+            pos_now, f, S, chi = pos_ref[:len(rows)], f_r[:len(rows)], S_r[:len(rows)], chi_r[:len(rows)]
+        else:
+            pos_now = positions_for(st)
+            f, S, chi = an.material_features_at(pos_now)
+            unit.f_mat[rows] = f
+            unit.S[rows] = S
+            unit.chi[rows] = chi
         prev_rows = np.where(centers < t)[0]
         if len(prev_rows) and ref_used[prev_rows[-1]]:
             xi_current = xi_committed[prev_rows[-1]]
         else:
             G0c, Gbc = an.grams_at_positions(sources, st[:1], pos_now[:1])
             xi_current = an.composition_from_grams(level[None, :], G0c, Gbc, S[:1])[0][0]
-        props = mode.prepare_reference(unit, history, rows, xi_current, n_ref) or [R0]
+        if new_ref:
+            xi_anchor = xi_current
+            if anchor_kind == "block_mean" and last_rows_c is not None and len(last_rows_c):
+                xi_anchor = xi_committed[last_rows_c].mean(axis=0)
+            if hold_on:
+                # what the realizer can do from here, for modes that build realizable ideals
+                lv_now = level.copy()
+                unit.realizer_state = {
+                    "frame": int(t), "rows": rows_ref.copy(), "levels": lv_now,
+                    "positions": pos_ref[0].copy() if len(rows_ref) > len(rows) else pos_now[0].copy(),
+                    "next_jump_frame": [int(state.last_jump[i] + min_clip) for i in range(M)],
+                    "jumps_enabled": bool(hz["position_jumps"]),
+                    "commit_frames": int(commit), "ramp_frames": int(ramp), "hold_frames": int(hold),
+                    "min_clip_frames": int(min_clip), "lookahead_frames": int(look), "search_end_frame": int(search_end),
+                    "goal_gains": goal_curve.values(centers[rows_ref]),
+                    "plan_rows": (lambda steps, rws=None, _lv=lv_now, _rr=rows_ref:
+                                  plan_rows(steps, _rr if rws is None else rws, _lv)),
+                }
+            props = mode.prepare_reference(unit, history, rows_ref, xi_anchor, n_ref) or [R0]
         G0n, Gbn = an.grams_at_positions(sources, st, pos_now)
         g_hold = gains_for(level.copy(), t, rows, level)
-        xi_hold, parts_hold = an.composition_from_grams(g_hold, G0n, Gbn, S)
+        xi_hold, parts_hold = an.composition_from_grams(g_hold, G0n, Gbn, S, prev_ratios=prev_for(rows))
 
         def J_of(xi_w, parts_w, ref, rws):
             em = float(mode.window_error(unit, xi_w, rws, ref))
@@ -183,17 +319,79 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             J = objective.w_mode * objective.normalize_mode_error(job.mode_name, em) + objective.w_form * ef + w_rel * jr
             return {"J": J, "mode_error": em, "fit": fit, "penalty": em - fit, "e_form": ef, "j_rel": jr}
 
-        ev0 = [J_of(xi_hold, parts_hold, tg, rows) for tg in props]
-        k_ref = int(np.argmin([e["J"] for e in ev0]))
-        ref = props[k_ref]
+        if new_ref:
+            ev0 = [J_of(xi_hold, parts_hold, tg, rows) for tg in props]
+            if ref_select == "first":
+                # no selection: choosing the proposal nearest to the unchanged sound ("hold_fit")
+                # systematically shrinks the move the mode asks for
+                k_ref = 0
+            else:
+                k_ref = int(np.argmin([e["J"] for e in ev0]))
+            ref = props[k_ref]
+            init = ev0[k_ref]
+            evals = len(props)
+            if hold_on:
+                # requested move: anchor -> ideal at the end of the hold (mean of its last block)
+                e_rows = rows_ref[(centers[rows_ref] >= t + hold - commit) & (centers[rows_ref] < t + hold)]
+                if len(e_rows) == 0:
+                    e_rows = rows_ref[-1:]
+                e_free = e_rows[unit.free_mask[e_rows]]
+                req = (float(an.dist2(ref.xi_hat[e_free].mean(axis=0)[None, :], np.asarray(xi_anchor)[None, :])[0])
+                       if len(e_free) else None)
+                # the same block if nothing were changed (the material's own drift): what the plan ADDS to it
+                # is its intervention - the part of the requested move that is not achieved automatically
+                stay_end, req_net = None, None
+                if len(e_free):
+                    k_e = np.searchsorted(rows_ref, e_free)
+                    xi_stay, _ps, _is = plan_rows([], rows_ref, level)
+                    stay_end = xi_stay[k_e].mean(axis=0)
+                    req_net = float(an.dist2(ref.xi_hat[e_free].mean(axis=0)[None, :], stay_end[None, :])[0])
+                held = {"ref": ref, "props": props, "k_ref": k_ref, "ev0": ev0, "t0": int(t),
+                        "last_row": int(rows_ref[-1]), "age": 0, "pending": {},
+                        "segment": {"t0_seconds": t / fs, "anchor_kind": anchor_kind,
+                                    "anchor": np.asarray(xi_anchor, dtype=np.float64).tolist(),
+                                    "reference_id": ref.id, "n_proposals": len(props), "k_ref": k_ref,
+                                    "selection": ref_select, "reference_hash": _hash_array(ref.xi_hat[rows_ref]),
+                                    "reference_rows": [int(rows_ref[0]), int(rows_ref[-1])],
+                                    "committed_rows": [int(rows[0]), int(rows[0])],
+                                    "openness": float(unit.o[rows[0]]), "phase": str(unit.phase_names[rows[0]]),
+                                    "requested_dist2_at_hold_end": req,
+                                    "stay_end": (stay_end.tolist() if stay_end is not None else None),
+                                    "intervention_dist2_at_hold_end": req_net}}
+                hold_segments.append(held["segment"])
+        else:
+            props, k_ref, ev0, ref = held["props"], held["k_ref"], held["ev0"], held["ref"]
+            held["age"] += 1
+            init = J_of(xi_hold, parts_hold, ref, rows)
+            evals = 1
+        # the rest of the mode's plan (steps after this commit), assumed to be played as planned
+        future: List[Dict[str, Any]] = []
+        if hold_on and plan_aware:
+            future = sorted([s_ for s_ in (ref.meta.get("plan") or []) if int(s_.get("frame", -1)) > int(t)],
+                            key=lambda s_: int(s_["frame"]))
+        G0z, Gbz, S_z = G0n, Gbn, S                # Grams of "no jump now"
+        if future:
+            if any(s_.get("jumps") for s_ in future):
+                pos_z = positions_plan(st, None, future)
+                _fz, S_z, _cz = an.material_features_at(pos_z)
+                G0z, Gbz = an.grams_at_positions(sources, st, pos_z)
+            g_hold = gains_plan(level.copy(), t, rows, level, future)
+            xi_hold, parts_hold = an.composition_from_grams(g_hold, G0z, Gbz, S_z, prev_ratios=prev_for(rows))
+            init = J_of(xi_hold, parts_hold, ref, rows)
+            evals += 1
         ref_hash = _hash_array(ref.xi_hat[rows])
-        init = ev0[k_ref]
-        evals = len(props)
         ratios_t = ref.xi_hat[rows][:, 1:1 + an.nb].mean(axis=0)
         # ---- jump candidates per material (clip-averaged fragment features in fragment mode)
         cands: Dict[int, List[int]] = {}
+        explore = list(mat)
+        if explore_max > 0 and hold_on:
+            # many tracks (second voices, 8-12 materials): the realizer explores its own jump candidates
+            # on a few tracks per commit only; the tracks of the mode's plan step are always examined below
+            free_now = [i for i in mat if t - state.last_jump[i] >= min_clip]
+            if len(free_now) > explore_max:
+                explore = sorted(int(i) for i in rng.choice(free_now, size=explore_max, replace=False))
         if bool(hz["position_jumps"]):
-            for i in mat:
+            for i in explore:
                 if t - state.last_jump[i] < min_clip:
                     continue
                 cur_pos = int(pos_now[0, i])
@@ -206,6 +404,26 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                     lst = [int(an.solo_pos[i][k]) for k in np.argsort(d)[: max(1, n_jump - 1)]]
                 lst.append(int(rng.integers(0, sources[i].shape[0])))
                 cands[i] = lst
+        # ---- plan hints of a held reference (docs/HOLD_CONTRACT.md): the positions / end levels the
+        # mode built its ideal from join the candidates; the objective against the frozen ideal decides
+        hint_jumps: Dict[int, int] = {}
+        hint_levels: Optional[np.ndarray] = None
+        if hold_on:
+            for s_ in (ref.meta.get("plan") or []):
+                if int(s_.get("frame", -1)) != int(t):
+                    continue
+                for i_, p_ in (s_.get("jumps") or {}).items():
+                    held["pending"][int(i_)] = (int(t), int(p_))
+                if s_.get("levels") is not None:
+                    hint_levels = np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0)
+            if bool(hz["position_jumps"]):
+                for i_, (f0_, p0_) in list(held["pending"].items()):
+                    if i_ in mat and t - state.last_jump[i_] >= min_clip:
+                        # a hinted jump that could not happen at its frame stays aligned in time
+                        hint_jumps[i_] = int((p0_ + (t - f0_)) % sources[i_].shape[0])
+                        cands.setdefault(i_, [])
+                        if hint_jumps[i_] not in cands[i_]:
+                            cands[i_].insert(0, hint_jumps[i_])
         # ---- combinations
         combos: List[Dict[int, int]] = [{}]
         if frag and cands:
@@ -213,11 +431,11 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             st_sub = starts_all[sub]
 
             def score(jumps: Dict[int, int]) -> float:
-                pos_s = positions_for(st_sub, jumps)
+                pos_s = positions_plan(st_sub, jumps, future)
                 _f, S_s, _c = an.material_features_at(pos_s)
                 G0s, Gbs = an.grams_at_positions(sources, st_sub, pos_s)
-                g = gains_for(level.copy(), t, sub, level)
-                xi_s, parts_s = an.composition_from_grams(g, G0s, Gbs, S_s)
+                g = gains_plan(level.copy(), t, sub, level, future)
+                xi_s, parts_s = an.composition_from_grams(g, G0s, Gbs, S_s, prev_ratios=prev_for(sub))
                 return J_of(xi_s, parts_s, ref, sub)["J"]
 
             beam: List[Tuple[Dict[int, int], float]] = [({}, score({}))]
@@ -239,20 +457,31 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             for i, lst in cands.items():
                 for p in lst:
                     combos.append({i: p})
+        if hint_jumps and hint_jumps not in combos:
+            combos.append(dict(hint_jumps))        # the mode's whole plan step is always examined
         # ---- level search on each surviving combination (full window rows)
         best = None
         for jumps in combos:
             if jumps:
-                pos_j = positions_for(st, jumps)
+                pos_j = positions_plan(st, jumps, future)
                 _fj, S_w, _cj = an.material_features_at(pos_j)
                 G0w, Gbw = an.grams_at_positions(sources, st, pos_j)
             else:
-                G0w, Gbw, S_w = G0n, Gbn, S
+                G0w, Gbw, S_w = G0z, Gbz, S_z
             lv = level.copy()
-            g = gains_for(lv, t, rows, level)
-            xi_w, parts_w = an.composition_from_grams(g, G0w, Gbw, S_w)
+            g = gains_plan(lv, t, rows, level, future)
+            xi_w, parts_w = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
             cur_ev = J_of(xi_w, parts_w, ref, rows)
             evals += 1
+            if hint_levels is not None:
+                trial = lv.copy()
+                trial[1:] = hint_levels[1:]
+                g = gains_plan(trial, t, rows, level, future)
+                xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
+                ev = J_of(xi_t, parts_t, ref, rows)
+                evals += 1
+                if ev["J"] < cur_ev["J"] - 1e-6:       # the level search then starts from the hinted levels
+                    cur_ev, lv, xi_w, parts_w = ev, trial, xi_t, parts_t
             step = level_step
             for _sweep in range(max_sweeps):
                 improved = False
@@ -262,8 +491,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                         trial[i] = float(np.clip(trial[i] + sign * step, 0.0, 1.0))
                         if abs(trial[i] - lv[i]) < 1e-9:
                             continue
-                        g = gains_for(trial, t, rows, level)
-                        xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w)
+                        g = gains_plan(trial, t, rows, level, future)
+                        xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
                         ev = J_of(xi_t, parts_t, ref, rows)
                         evals += 1
                         if ev["J"] < cur_ev["J"] - 1e-6:
@@ -302,6 +531,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         parts_c = {k: (v[k_c] if isinstance(v, np.ndarray) and v.shape[0] == len(rows) else v) for k, v in parts_w.items()}
         xi_committed[rows_c] = xi_c
         c_committed[rows_c] = parts_c["c"]
+        flux_prev["row"] = int(rows_c[-1])
+        flux_prev["ratios"] = np.asarray(parts_c["phi_raw"])[-1, 1:1 + an.nb].copy()
         ref_store[rows_c] = ref.xi_hat[rows_c]
         ref_used[rows_c] = True
         pos_end = positions_for(np.array([c_end - 1]), jumps)[0]
@@ -320,11 +551,19 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                                "src_position": int(pos_end[i])})
         dt = (c_end - t) / float(fs)
         hlog = history.observe_committed(unit, rows_c, xi_c, parts_c, dt, events)
-        mstat = mode.observe_committed(unit, history, rows_c, xi_c, parts_c, ref,
-                                       {"refinement": {"initial": init, "final": fin}, "reference_hash": ref_hash,
-                                        "k_ref": k_ref, "n_proposals": len(props), "proposal_initial_J": [e["J"] for e in ev0],
-                                        "positions": pos_end.tolist(), "jumps": {int(k): int(v) for k, v in jumps.items()},
-                                        "levels": lv_best.tolist(), "commit_end_frame": int(c_end)})
+        mstats = {"refinement": {"initial": init, "final": fin}, "reference_hash": ref_hash,
+                  "k_ref": k_ref, "n_proposals": len(props), "proposal_initial_J": [e["J"] for e in ev0],
+                  "positions": pos_end.tolist(), "jumps": {int(k): int(v) for k, v in jumps.items()},
+                  "levels": lv_best.tolist(), "commit_end_frame": int(c_end)}
+        if hold_on:
+            mstats.update({"reference_hold_seconds": hold / float(fs), "reference_age_steps": int(held["age"]),
+                           "reference_t0_frame": int(held["t0"]), "reference_is_new": bool(new_ref),
+                           "plan_hint_jumps": {int(k): int(v) for k, v in hint_jumps.items()},
+                           "plan_hint_jumps_taken": {int(i_): int(p_) for i_, p_ in jumps.items() if hint_jumps.get(i_) == p_},
+                           "plan_hint_levels": (hint_levels.tolist() if hint_levels is not None else None)})
+            held["segment"]["committed_rows"][1] = int(rows_c[-1])
+        mstat = mode.observe_committed(unit, history, rows_c, xi_c, parts_c, ref, mstats)
+        last_rows_c = rows_c
         n_commits += 1
         step_logs.append({"t_seconds": t / fs, "window_seconds": [t / fs, w_end / fs], "rows": int(len(rows)),
                           "committed_rows": int(len(rows_c)), "reference_id": ref.id, "reference_hash": ref_hash,
@@ -336,6 +575,16 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                           "jumps": {int(k): int(v) for k, v in jumps.items()}, "combos": len(combos),
                           "levels": lv_best.tolist(), "history_rho": hlog.get("rho"), "events_committed": len(events),
                           "mode_observe": mstat})
+        if hold_on:
+            taken = {int(i_): int(p_) for i_, p_ in jumps.items() if hint_jumps.get(i_) == p_}
+            step_logs[-1].update({"reference_is_new": bool(new_ref), "reference_age_steps": int(held["age"]),
+                                  "plan_future_steps_assumed": int(len(future)),
+                                  "plan_hint": {"jumps": {int(k): int(v) for k, v in hint_jumps.items()},
+                                                "jumps_taken": taken, "levels_hinted": hint_levels is not None,
+                                                "levels_distance_to_hint": (float(np.abs(lv_best[1:] - hint_levels[1:]).max())
+                                                                            if hint_levels is not None else None)}})
+            for i_ in jumps:
+                held["pending"].pop(int(i_), None)
         level = lv_best.copy()
         level[0] = float(goal_curve.values(np.array([c_end - 1]))[0]) if c_end > unit.start else level[0]
         t = c_end
@@ -386,7 +635,49 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     J1s = [sl["final_joint_objective"] for sl in step_logs]
     f0s = [sl["initial_fixed_target_error"] for sl in step_logs]
     f1s = [sl["final_fixed_target_error"] for sl in step_logs]
+    hold_report: Dict[str, Any] = {}
+    if hold_on:
+        # how the requested moves compare with the sound's own fast motion (docs/HOLD_CONTRACT.md):
+        # flutter = variance (d2, Bessel-corrected) of the committed rows of a commit block around
+        # their mean, on the rows AFTER the gain ramp - the realizer's own switches are not flutter
+        blk = ((centers - unit.start) // commit).astype(np.int64)
+        um = fm & ref_used & (((centers - unit.start) % commit) >= ramp)
+        fl, fl_open = [], []
+        for b in np.unique(blk[um]):
+            r_ = um & (blk == b)
+            n_ = int(r_.sum())
+            if n_ >= 2:
+                fl.append(float(an.dist2(xi[r_], xi[r_].mean(axis=0)[None, :]).mean()) * n_ / (n_ - 1.0))
+                if float(unit.o[r_].min()) >= 0.8:
+                    fl_open.append(fl[-1])
+        flutter = float(np.mean(fl)) if fl else None
+        flutter_open = float(np.mean(fl_open)) if fl_open else None
+        reqs = [h["requested_dist2_at_hold_end"] for h in hold_segments if h["requested_dist2_at_hold_end"] is not None]
+        reqs_open = [h["requested_dist2_at_hold_end"] for h in hold_segments
+                     if h["requested_dist2_at_hold_end"] is not None and h["openness"] >= 0.8]
+        hints = [sl["plan_hint"] for sl in step_logs if "plan_hint" in sl]
+        unit.realizer_state = None
+        hold_report = {
+            "reference_hold_seconds": hold / float(fs), "reference_selection": ref_select, "reference_anchor": anchor_kind,
+            "hold_segments": hold_segments,
+            "hold_summary": {
+                "holds": len(hold_segments), "realized_flutter_dist2": flutter,
+                "realized_flutter_dist2_open": flutter_open,
+                "mean_requested_dist2_at_hold_end": float(np.mean(reqs)) if reqs else None,
+                "mean_requested_dist2_at_hold_end_open": float(np.mean(reqs_open)) if reqs_open else None,
+                "requested_over_flutter": (float(np.mean(reqs) / flutter) if reqs and flutter else None),
+                "requested_over_flutter_open": (float(np.mean(reqs_open) / flutter_open) if reqs_open and flutter_open else None),
+                "mean_intervention_dist2_at_hold_end": (float(np.mean([h["intervention_dist2_at_hold_end"] for h in hold_segments
+                                                                        if h.get("intervention_dist2_at_hold_end") is not None]))
+                                                         if any(h.get("intervention_dist2_at_hold_end") is not None for h in hold_segments) else None),
+                "plan_hints": {"steps_with_jump_hints": int(sum(1 for h in hints if h["jumps"])),
+                               "hinted_jumps_offered": int(sum(len(h["jumps"]) for h in hints)),
+                               "hinted_jumps_taken": int(sum(len(h["jumps_taken"]) for h in hints)),
+                               "steps_with_level_hints": int(sum(1 for h in hints if h["levels_hinted"]))},
+                "note": "requested = d2(anchor, held ideal averaged over the last commit block of the hold); "
+                        "open = holds that start at openness >= 0.8"}}
     job.unit_reports.append({
+        **hold_report,
         "unit": unit.index, "frames": [int(unit.start), int(unit.end)], "goal_arrival_frame": unit.goal_arrival,
         "grid_points": int(unit.J), "bank": {"generated": 0, "rejected_illegal": 0, "notes": [], "relations": {}},
         "candidates_evaluated": 0, "budget": 0,

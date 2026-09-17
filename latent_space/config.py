@@ -110,7 +110,16 @@ DEFAULTS: Dict[str, Any] = {
                        # fragment-vocabulary mode: field SDE integrated in musical time (per model step)
                        "frag_step": 40.0, "frag_temperature_per_openness": 0.0016, "frag_drift_substeps": 10,
                        "frag_max_displacement_per_step": 1.5, "frag_anchor_samples": 24, "frag_anchor_offsets": 3,
-                       "frag_anchor_seed": 104729, "frag_energy_probe_samples": 8},
+                       "frag_anchor_seed": 104729, "frag_energy_probe_samples": 8,
+                       # hold mode (docs/HOLD_CONTRACT.md): field chain over realizable plans
+                       "hold_move_scale": 1.0,           # scales the level-perturbation sigma and the drift-target distance
+                       "hold_level_candidates": 6, "hold_jump_candidates": 3, "hold_multi_jump_candidates": 3,
+                       "hold_temperature_scale": 1.0, "hold_refine_sweeps": 1, "hold_eval_rows": 6,
+                       "hold_law_version": 2,             # 1 = single-pass chain (hold v1) | 2 = annealed coarse-to-fine
+                       # law version 2 (docs/FIDELITY_CONTRACT.md): denoising sweeps at decreasing temperature, fragments
+                       # from mixture-aware pools first, then levels by the finite-difference Langevin drift
+                       "hold_anneal_iterations": 3, "hold_anneal_ratio": 2.0, "hold_final_temperature": 0.4,
+                       "hold_tracks_per_step": 2, "hold_gradient_tracks": 4, "hold_mix_ranking": True},
         "vae_latent_dim": 2,
         "vae": {"mu_H_init": 0.5, "sigma_H_init": 0.04, "K_F": 0.1, "ridge_epsilon": 1e-6,
                 "cov_floor": 1e-4, "probe_goal_gain": 0.1, "probe_in_gain": 0.7,
@@ -119,7 +128,19 @@ DEFAULTS: Dict[str, Any] = {
                 # fragment-vocabulary basis (random fragment compositions, seeded) and tanh range control
                 "sigma_H_floor_frag": 0.09, "basis_scale_quantile": 99.0, "basis_scale_target_tanh": 0.95,
                 "basis_fragment_compositions": 300, "basis_fragment_offsets": 5, "basis_min_rows": 1500,
-                "basis_seed_offset": 9176},
+                "basis_seed_offset": 9176,
+                # hold mode (docs/HOLD_CONTRACT.md): latent path decoded onto the realizable set
+                "hold_move_scale": 1.0,             # multiplies the latent innovation of a held OU path
+                "hold_target_lead_rows": 3,         # rows by which the level fit leads D(z) (compensates the Q5 ramp)
+                "hold_fit_rows": 5, "hold_level_step": 0.25, "hold_level_min_step": 0.05, "hold_level_evals": 20,
+                "hold_jump_candidates": 2, "hold_jump_margin": 0.03, "hold_step_margin": 0.0,
+                "hold_plan_calls_max": 160,
+                "hold_latent_space": "controls",    # 'controls' (latent space of the reachable set) | 'xi' (hold v1 projection)
+                # control-space latent (docs/FIDELITY_CONTRACT.md): u = [levels | r PCA coords of the playing fragment],
+                # k PLS axes against the exact compositions, decoder -> clipped levels + nearest fragment -> plan_rows
+                "control_latent_dim": 6, "control_fragment_pca": 2, "control_basis_states": 1500,
+                "control_holdout_states": 200, "control_basis_offsets": 3, "control_seed_offset": 5521,
+                "control_jump_min_pca_dist": 0.6, "control_max_jumps_per_step": 3, "control_sigma_floor": 0.30},
         "transformer_heads": ["similarity", "contrast", "memory"],
         "transformer": {"sigma_F": 1.0, "tau_H_seconds": 180.0, "alpha_s": 0.25, "alpha_c": 0.25,
                          "alpha_m": 0.25, "alpha_G": 1.0, "cov_diag_floor": 1e-4,
@@ -133,7 +154,18 @@ DEFAULTS: Dict[str, Any] = {
                          "fragment_tokens_per_source": 6, "fragment_value_offsets": 3,
                          "fragment_step_seconds_reference": 0, "noise_scale_fragment": 0.25,
                          "excursion_radius_fragment": 1.0, "fragment_bound_growth_steps": 0,
-                         "recurrence_tolerance_seconds": 2.0},
+                         "recurrence_tolerance_seconds": 2.0,
+                         # hold mode (docs/HOLD_CONTRACT.md): the heads select realizable fragment moves
+                         "hold_move_scale": 1.0,       # scales every level move (s = o * hold_move_scale)
+                         "hold_move_rate": 0.6,        # p(step moves) = clip(o * rate)
+                         "hold_background_scale": 1.0, "hold_temperature": 0.5, "hold_candidates": 3,
+                         "hold_selection": "sample",   # 'sample' | 'top'
+                         "hold_max_proposals": 2,
+                         "hold_law_version": 2,        # 1 = one token per step (hold v1) | 2 = multi-track selection
+                         # law version 2 (docs/FIDELITY_CONTRACT.md): several tracks move per step, levels refined
+                         # through plan_rows toward the free head-combined target of eq. (36)/(37)
+                         "hold_tracks_max": 3, "hold_refine_evals": 10, "hold_refine_tracks": 2,
+                         "hold_refine_step": 0.18, "hold_refine_min_step": 0.04, "hold_mixture_candidates": 1},
         "gan_reference_target": 8,
         "gan_components": 2,
         "gan_adversarial_rounds_max": 4,
@@ -147,7 +179,23 @@ DEFAULTS: Dict[str, Any] = {
                 "inner_steps_D_per_commit": 8, "inner_steps_G_per_commit": 4, "generator_batch_max": 4,
                 "baseline_ema_rate": 0.2, "reference_continuity_seconds": 2.0, "min_block_free_rows": 3,
                 # fragment-vocabulary reference distribution (observe_committed statistics use a separate stream)
-                "frag_references": 12, "frag_segment_seconds": 2.0, "frag_offset_rows": 0, "frag_discriminator_samples": 2},
+                "frag_references": 12, "frag_segment_seconds": 2.0, "frag_offset_rows": 0, "frag_discriminator_samples": 2,
+                # hold mode (docs/HOLD_CONTRACT.md): references = realizable continuations near the committed
+                # history, narrowed by a move/own-flutter band and an absolute cap; generator over origin slots
+                "hold_move_scale": 1.0, "hold_reference_candidates": 14,
+                "hold_move_over_flutter_min": 3.0, "hold_move_over_flutter_max": 12.0,
+                "hold_band_lo": 0.0, "hold_band_hi": 16.0, "hold_level_move": 0.7, "hold_level_floor": 0.3,
+                "hold_magnitude_min": 0.3, "hold_magnitude_max": 1.5, "hold_jump_probability": 0.35,
+                "hold_search_rows": 4, "hold_keep_min": 2, "hold_keep_max": 3, "hold_fragment_pool": 4,
+                "hold_steadiness_factor": 4, "hold_w_sigma_init": 0.08, "hold_w_sigma_min": 0.01,
+                "hold_w_sigma_max": 0.30, "hold_flutter_floor": 1e-3,
+                "hold_positive_source": "recordings",    # D positives: 'recordings' (unmanipulated playback) | 'plans' (hold v1)
+                "hold_real_positives": 8, "hold_psi_blocks": 4, "hold_psi_scale_samples": 24,
+                "hold_max_jumps_per_plan": 3,
+                # positives drawn near the sound (current / committed / mixture candidates +- offset), a non-saturating
+                # generator reward (clipped logit of D on the published plan rows), stronger l2 on the hold discriminator
+                "hold_real_near_share": 0.8, "hold_real_offset_seconds": 4.0, "hold_logit_clip": 6.0,
+                "hold_d_l2": 1e-3, "hold_lr_G_scale": 20.0},
     },
     "history": {"enabled": True, "update_rate": 0.10, "recent_event_capacity": 16,
                 "parent_capacity": 8, "cov_regularization": 1e-6,
@@ -195,6 +243,21 @@ DEFAULTS: Dict[str, Any] = {
         "clip_feature_seconds": 2.0,      # fragment features = mean over this many seconds after the position
         "beam_width": 3,
         "candidate_rows": 8,              # rows of the window used while scoring jump combinations
+        # reference hold (2026-09-16, docs/HOLD_CONTRACT.md): one frozen ideal is chased for this long
+        # before a new one is anchored to the sound.  0 / <= commit_seconds = legacy (re-anchored at
+        # every commit, where the ideal follows the sound instead of leading it)
+        "reference_hold_seconds": 0.0,
+        "reference_selection": "hold_fit",  # 'hold_fit' (legacy: proposal nearest to the unchanged sound) | 'first'
+        "reference_anchor": "last_row",     # 'last_row' (legacy) | 'block_mean' (mean of the last committed block)
+        # hold mode only: candidates are scored as "this choice now, then the rest of the mode's plan"
+        # instead of "this choice held for the whole lookahead window"
+        "plan_aware_lookahead": True,
+        # the same material may sound at two positions at once (user-authorised 2026-09-17): every material
+        # gets this many tracks sharing its PCM; the extra voices start away from the first (1 = off)
+        "voices_per_material": 1,
+        # hold mode with many tracks: number of tracks on which the realizer tries its OWN jump candidates per
+        # commit (the tracks named by the mode's plan step are always examined); 0 = all tracks
+        "explore_tracks_max": 0,
     },
     "numerics": {"gain_bound_tolerance": 1e-9, "motion_relative_margin": 1e-6,
                  "db_rate_subintervals": 128},
@@ -344,6 +407,15 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ValueError("realization.lookahead_seconds must be >= commit_seconds > 0")
     if float(cfg["history"]["time_constant_seconds"]) <= 0:
         raise ValueError("history.time_constant_seconds must be > 0")
+    hz = cfg["hires"]                     # .get: resolved configs of older traces lack these keys
+    if float(hz.get("reference_hold_seconds", 0.0)) < 0:
+        raise ValueError("hires.reference_hold_seconds must be >= 0")
+    if hz.get("reference_selection", "hold_fit") not in ("hold_fit", "first"):
+        raise ValueError("hires.reference_selection must be 'hold_fit' or 'first'")
+    if not (1 <= int(hz.get("voices_per_material", 1)) <= 3):
+        raise ValueError("hires.voices_per_material must be 1, 2 or 3")
+    if hz.get("reference_anchor", "last_row") not in ("last_row", "block_mean"):
+        raise ValueError("hires.reference_anchor must be 'last_row' or 'block_mean'")
     ge = cfg["form"]["goal_exposure"]
     if ge["policy"] not in ("contract_only", "free"):
         raise ValueError("form.goal_exposure.policy must be 'contract_only' or 'free'")

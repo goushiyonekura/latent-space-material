@@ -172,7 +172,15 @@ class Analyzer:
         self.solo_E: List[np.ndarray] = []
         hann = np.hanning(self.W).astype(np.float32)
         ar = np.arange(self.W, dtype=np.int64)
+        seen: Dict[int, int] = {}                 # tracks that share one source array (second voices) share its bank
         for i, x in enumerate(sources):
+            if id(x) in seen and float(self.b[i]) == float(self.b[seen[id(x)]]):
+                j = seen[id(x)]
+                self.solo_pos.append(self.solo_pos[j])
+                self.solo_f.append(self.solo_f[j])
+                self.solo_E.append(self.solo_E[j])
+                continue
+            seen[id(x)] = i
             L = x.shape[0]
             pos = np.arange(0, L, self.solo_hop, dtype=np.int64)
             rows = []
@@ -208,6 +216,11 @@ class Analyzer:
         self.frag_f: List[np.ndarray] = []
         self.frag_E: List[np.ndarray] = []
         for i in range(self.M):
+            j = next((k for k in range(i) if self.solo_f[k] is self.solo_f[i]), None)
+            if j is not None:                      # second voice of the same source
+                self.frag_f.append(self.frag_f[j])
+                self.frag_E.append(self.frag_E[j])
+                continue
             f = self.solo_f[i]
             E = self.solo_E[i]
             P = len(f)
@@ -249,6 +262,67 @@ class Analyzer:
         order = np.argsort(d)[: max(1, n)]
         return [int(self.solo_pos[track][k]) for k in order]
 
+    # ---- mixture-aware fragment search (2026-09-17): which fragment of ONE track brings the whole
+    # MIXTURE closest to a target, given what the other tracks play.  Cross terms are ignored (they
+    # average out over a clip), so this is a fast pre-ranking over every fragment of the source; the
+    # caller evaluates the short list exactly (plan_rows / fragment_composition).
+    def fragment_index_at(self, track: int, position: int) -> int:
+        return int(np.clip(int(round(int(position) / float(self.solo_hop))), 0, len(self.solo_pos[track]) - 1))
+
+    def fragment_band_energy(self, track: int, positions=None) -> np.ndarray:
+        """Raw clip-averaged band energies (energy x band ratios) of `track` at the fragment(s)
+        nearest to `positions` (int or array); all fragments (P_i, nb) when positions is None."""
+        if not hasattr(self, "_frag_band"):
+            self._frag_band = {}
+        if track not in self._frag_band:
+            ratios = self.frag_f[track][:, 1:1 + self.nb] * self.norm_std[1:1 + self.nb] + self.norm_mean[1:1 + self.nb]
+            self._frag_band[track] = self.frag_E[track][:, None] * np.clip(ratios, 0.0, None)
+        B = self._frag_band[track]
+        if positions is None:
+            return B
+        if np.ndim(positions) == 0:
+            return B[self.fragment_index_at(track, int(positions))]
+        k = np.clip(np.round(np.asarray(positions) / float(self.solo_hop)).astype(np.int64), 0, len(B) - 1)
+        return B[k]
+
+    def mixture_band_energy(self, positions: Sequence[int], levels: Sequence[float], skip: Optional[int] = None) -> np.ndarray:
+        """Predicted raw band energies (nb,) of the mixture 'track i plays its fragment at
+        positions[i] with gain levels[i]' (cross terms ignored), optionally without track `skip`."""
+        out = np.zeros(self.nb)
+        for i in range(self.M):
+            if skip is not None and i == skip:
+                continue
+            a = float(levels[i])
+            if a > 0.0:
+                out += a * a * self.fragment_band_energy(i, int(positions[i]))
+        return out
+
+    def fragment_candidates_mix(self, track: int, target_phi: np.ndarray, others_band: np.ndarray, level: float, n: int,
+                                exclude_near: Optional[int] = None, exclude_frames: int = 0,
+                                energy_weight: float = 1.0) -> List[int]:
+        """Top-n fragment positions of `track` for a target MIXTURE.  `target_phi` = normalized
+        [logE, band ratios (nb), ...] of the wanted mixture (the first 1+nb entries of a xi row),
+        `others_band` = mixture_band_energy(..., skip=track) of what the other tracks play,
+        `level` = the gain this track would have.  Ranks EVERY fragment of the source."""
+        B = self.fragment_band_energy(track)                                  # (P, nb)
+        cand = np.asarray(others_band, dtype=np.float64)[None, :] + float(level) ** 2 * B
+        E = cand.sum(axis=1)
+        ratios = cand / (E[:, None] + self.eps)
+        tp = np.asarray(target_phi, dtype=np.float64)
+        rn = (ratios - self.norm_mean[1:1 + self.nb]) / self.norm_std[1:1 + self.nb]
+        en = (np.log1p(E / self.E_ref) - self.norm_mean[0]) / self.norm_std[0]
+        d = ((rn - tp[None, 1:1 + self.nb]) ** 2).sum(axis=1) + float(energy_weight) * (en - tp[0]) ** 2
+        d = d + 4.0 * (self.frag_E[track] < self.silence_energy)
+        if exclude_near is not None and exclude_frames > 0:
+            d = d + 1e6 * (np.abs(self.solo_pos[track] - exclude_near) < exclude_frames)
+        order = np.argsort(d)[: max(1, n)]
+        return [int(self.solo_pos[track][k]) for k in order]
+
+    def enable_window_cache(self, max_entries: int = 256) -> None:
+        """Reuse per-track PCM windows / spectra between grams_at_positions calls (hold mode)."""
+        self._win_cache: Dict[tuple, tuple] = {}
+        self._win_cache_max = int(max_entries)
+
     def grams_at_positions(self, sources: Sequence[np.ndarray], starts: np.ndarray, positions: np.ndarray):
         """Window Gram matrices for explicit per-track source positions (positions: (n, M) source
         frames of the window start for each track).  Exact for the summed PCM of those windows."""
@@ -256,21 +330,47 @@ class Analyzer:
         M, W, C = self.M, self.W, self.C
         hann = np.hanning(W).astype(np.float32)
         ar = np.arange(W, dtype=np.int64)
-        Xt = np.empty((n, M, W, C), dtype=np.float32)
-        for i, x in enumerate(sources):
-            idx = (positions[:, i][:, None] + ar[None, :]) % x.shape[0]
-            Xt[:, i] = x[idx] * np.float32(self.b[i])
+        cache = getattr(self, "_win_cache", None)
+        if cache is None:
+            Xt = np.empty((n, M, W, C), dtype=np.float32)
+            for i, x in enumerate(sources):
+                idx = (positions[:, i][:, None] + ar[None, :]) % x.shape[0]
+                Xt[:, i] = x[idx] * np.float32(self.b[i])
+            Xf = np.fft.rfft(Xt * hann[None, None, :, None], axis=2)
+        else:
+            # hold mode (enable_window_cache): candidates of one commit step differ in the position of
+            # one or two tracks only, so the windows / spectra of the other tracks are reused
+            Xt = np.empty((n, M, W, C), dtype=np.float32)
+            Xf = None
+            for i, x in enumerate(sources):
+                pi = np.ascontiguousarray(positions[:, i], dtype=np.int64)
+                key = (id(x), float(self.b[i]), pi.tobytes())
+                hit = cache.get(key)
+                if hit is None:
+                    idx = (pi[:, None] + ar[None, :]) % x.shape[0]
+                    xt = x[idx] * np.float32(self.b[i])
+                    xf = np.fft.rfft(xt * hann[None, :, None], axis=1)
+                    if len(cache) >= self._win_cache_max:
+                        cache.clear()
+                    cache[key] = hit = (xt, xf)
+                Xt[:, i] = hit[0]
+                if Xf is None:
+                    Xf = np.empty((n, M) + hit[1].shape[1:], dtype=hit[1].dtype)
+                Xf[:, i] = hit[1]
         flat = Xt.reshape(n, M, W * C)
         G0 = np.matmul(flat, flat.transpose(0, 2, 1)) / float(W * C)
-        Xf = np.fft.rfft(Xt * hann[None, None, :, None], axis=2)
         Gb = np.zeros((n, self.nb, M, M), dtype=np.float64)
         for bi, (f0, f1) in enumerate(self.band_bins):
             Xb = Xf[:, :, f0:f1, :].reshape(n, M, -1)
             Gb[:, bi] = np.matmul(Xb, np.conj(Xb).transpose(0, 2, 1)).real
         return G0, Gb
 
-    def composition_from_grams(self, gains: np.ndarray, G0: np.ndarray, Gb: np.ndarray, S_rows: np.ndarray):
-        """Composition state from explicit Grams (rows consecutive) and material similarity rows."""
+    def composition_from_grams(self, gains: np.ndarray, G0: np.ndarray, Gb: np.ndarray, S_rows: np.ndarray,
+                               prev_ratios: Optional[np.ndarray] = None):
+        """Composition state from explicit Grams (rows consecutive) and material similarity rows.
+        `prev_ratios` = raw band ratios of the row just before the first one: its flux is then a real
+        value instead of the 0 of a sequence start (hold mode: a commit window continues the committed
+        sound, and a flux that drops to 0 at every commit would be an artefact a discriminator can read)."""
         a = np.asarray(gains, dtype=np.float64)
         E_y = np.maximum(np.einsum("jm,jmk,jk->j", a, G0, a), 0.0)
         diag = np.einsum("jmm->jm", G0)
@@ -283,6 +383,8 @@ class Analyzer:
         if len(E_y) > 1:
             d = ratios[1:] - ratios[:-1]
             flux[1:] = (np.maximum(d, 0.0) ** 2).sum(axis=1)
+        if prev_ratios is not None and len(E_y):
+            flux[0] = float((np.maximum(ratios[0] - np.asarray(prev_ratios, dtype=np.float64), 0.0) ** 2).sum())
         phi_raw = np.concatenate([np.log1p(E_y / self.E_ref)[:, None], ratios, flux[:, None]], axis=1)
         phi = (phi_raw - self.norm_mean) / self.norm_std
         c = e / (e.sum(axis=1, keepdims=True) + self.eps)
