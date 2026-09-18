@@ -312,7 +312,7 @@ def check_B(modes, fx, alt, n2, n7):
 
 
 # ----------------------------------------------------------------------------- C
-def check_C(modes, fx, hard):
+def check_C(modes, fx, hard, n7=None):
     print("[C] artifacts and transparency")
     for mode in modes:
         out = os.path.join(DEV, "out", f"full_{mode}")
@@ -443,6 +443,26 @@ def check_C(modes, fx, hard):
        and len(names) == 1 + 2 * n_mat and all(nm.endswith("#2") for nm in names[1 + n_mat:]) and second_used,
        f"{rv['status']} tracks={len(names)} {time.time() - t0:.0f}s")
     REPORT["C"]["hold_second_voices"] = {"status": rv["status"], "tracks": names}
+    # polyphony cap (user decision 2026-09-17): at most K materials sound at once; 7 materials, K = 3
+    if n7 is not None:
+        ccfg = json.loads(json.dumps(ocfg))
+        ccfg["mode"] = modes[0]
+        ccfg["materials"] = [os.path.abspath(p) for p in n7["materials"]]
+        ccfg["goal"] = os.path.abspath(str(n7["goal"]))
+        ccfg["hires"].update({"max_active_materials": 3, "explore_tracks_max": 3})
+        cpath = os.path.join(DEV, f"hold_cap3_{modes[0]}.json")
+        json.dump(ccfg, open(cpath, "w"))
+        jc = Job(load_config(cpath, modes[0]), os.path.join(DEV, "out", "hold_cap3", modes[0]), config_path=cpath, mode_override=modes[0])
+        t0 = time.time()
+        rc_ = jc.run()
+        tc_ = json.load(open(os.path.join(jc.output_dir, "state_trace.json")))
+        hcc = tc_.get("hard_checks", {})
+        pc = hcc.get("polyphony_cap", {})
+        ok(f"{modes[0]} hold + polyphony cap: 7 materials, never more than 3 sounding outside ramps, exact goal",
+           rc_["status"] in ("BEST_EFFORT", "VALID_APPROXIMATION") and hcc.get("all_passed") and hcc.get("exact_goals_rendered")
+           and pc.get("max_active_materials") == 3 and 1 <= pc.get("observed_max_outside_ramps", 99) <= 3,
+           f"{rc_['status']} outside ramps {pc.get('observed_max_outside_ramps')} incl. ramps {pc.get('observed_max_including_ramps')} {time.time() - t0:.0f}s")
+        REPORT["C"]["hold_polyphony_cap"] = {"status": rc_["status"], "polyphony_cap": pc}
     os.chdir(ROOT)
     # poor-approximation fixture: must still output BEST_EFFORT/VALID within bounded time
     mode = modes[0]
@@ -468,7 +488,7 @@ def main():
     fx, alt, hard, n2, n7 = make_fixtures()
     if avail:
         check_B(avail, fx, alt, n2, n7)
-        check_C(avail, fx, hard)
+        check_C(avail, fx, hard, n7)
     REPORT["modes_checked"] = avail
     REPORT["modes_missing"] = [m for m in modes if m not in avail]
     with open(os.path.join(DEV, "smoke_report.json"), "w") as f:

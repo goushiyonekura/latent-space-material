@@ -17,7 +17,7 @@
     "cycles": 2,
     "timing_policy": "adaptive",
     "intro_seconds": 12,
-    "open_seconds": 90,
+    "open_seconds": 150,
     "contract_seconds": 30,
     "goal_hold_seconds": 5,
     "reopen_seconds": 30,
@@ -115,10 +115,12 @@
     "clip_feature_seconds": 2.0,
     "beam_width": 3,
     "candidate_rows": 8,
-    "reference_hold_seconds": 2.0,
+    "reference_hold_seconds": 4.0,
     "reference_selection": "first",
     "reference_anchor": "block_mean",
     "voices_per_material": 2,
-    "explore_tracks_max": 3
+    "explore_tracks_max": 3,
+    "max_active_materials": 3,
+    "min_sounding_seconds": 2.0
   }
 }

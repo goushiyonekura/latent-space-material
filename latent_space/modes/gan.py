@@ -93,6 +93,12 @@ class GANMode(ModeController):
     # SLOTS, not on the per-hold plan index, so that what it learns carries across holds and units.
     HOLD_SLOTS = ("levels_only", "committed_positions", "fragment_candidates", "random_positions")
     HOLD_SLOT_SHARE = (0.2, 0.3, 0.3, 0.2)
+    # polyphony cap (hires.max_active_materials > 0): a silent material can only enter by replacing a
+    # sounding one, so SWAP is its own origin class - the generator's categorical then learns directly
+    # how often the law should change WHO sounds, which a flag on the other slots could not express
+    # separately from where the jump comes from.  With no cap the 4 slots above are used unchanged.
+    HOLD_SLOTS_CAP = ("levels_only", "committed_positions", "fragment_candidates", "random_positions", "swap")
+    HOLD_SLOT_SHARE_CAP = (0.15, 0.2, 0.25, 0.15, 0.25)
 
     # ------------------------------------------------------------------ construction
     def __init__(self, cfg, analyzer, fs, rng, objective):
@@ -189,7 +195,11 @@ class GANMode(ModeController):
         self.hold_w_sigma_min = float(g("hold_w_sigma_min", 0.01))
         self.hold_w_sigma_max = float(g("hold_w_sigma_max", 0.30))
         self.hold_flutter_floor = float(g("hold_flutter_floor", 1e-3))
-        n_slot, n_w = len(self.HOLD_SLOTS), max(1, self.M - 1)
+        self.hold_slots = tuple(self.HOLD_SLOTS)          # replaced by HOLD_SLOTS_CAP when capped
+        self.hold_slot_share = tuple(self.HOLD_SLOT_SHARE)
+        self.hold_cap = 0
+        self.hold_seconds = 0.0           # length of one hold (from realizer_state)
+        n_slot, n_w = len(self.hold_slots), max(1, self.M - 1)
         self.h_logits = np.zeros(n_slot)
         self.h_mu = np.zeros((n_slot, n_w))
         self.h_log_sigma = np.full((n_slot, n_w), np.log(max(self.hold_w_sigma_init, 1e-9)))
@@ -224,6 +234,8 @@ class GANMode(ModeController):
         # the hold reward is bounded (a clipped logit, order 1) instead of -log D (order 13),
         # so the REINFORCE step size of the hold generator is scaled up to stay effective
         self.hold_lr_G_scale = float(g("hold_lr_G_scale", 20.0))
+        self.hold_real_cap_redraw = float(g("hold_real_cap_redraw", 0.5))  # cap only
+        self.hold_psi_scale_min_var = float(g("hold_psi_scale_min_var", 0.25))
         hn = ([f"mean_phi[{k}]" for k in range(self.d_phi)]
               + [f"sd_phi[{k}]" for k in range(self.d_phi)]
               + [f"dblock_phi[{k}]" for k in range(self.d_phi)]
@@ -238,6 +250,8 @@ class GANMode(ModeController):
         self.h_psi_std = np.ones(self.d_psi_hold)
         self.h_psi_scale_source = "uninitialised"
         self.h_psi_scale_n = 0
+        self.h_psi_provisional = False
+        self.h_psi_scale_varying_fraction = 0.0
         self._committed_levels: List[np.ndarray] = []
         self._hist_blocks: List[Tuple[np.ndarray, np.ndarray]] = []   # rolling committed blocks
         # psi layout (eq. 42): fixed for the whole job, so phi carries over between units
@@ -537,7 +551,7 @@ class GANMode(ModeController):
         re-initialised - the hold displacement lives in LEVEL space, which has the same acoustic
         meaning in every unit (the material gains).  Slot logits, mu and log_sigma are therefore
         inherited from `history.mode_state['gan']['hold_generator']` when they are usable."""
-        n_slot, n_w = len(self.HOLD_SLOTS), max(1, self.M - 1)
+        n_slot, n_w = len(self.hold_slots), max(1, self.M - 1)
         self.h_logits = np.zeros(n_slot)
         self.h_mu = np.zeros((n_slot, n_w))
         self.h_log_sigma = np.full((n_slot, n_w), np.log(max(self.hold_w_sigma_init, 1e-9)))
@@ -651,7 +665,15 @@ class GANMode(ModeController):
         out: List[np.ndarray] = []
         src_counts = {"current": 0, "committed": 0, "mixture_candidate": 0, "random": 0}
         for _ in range(int(n)):
+            # a random LEGAL state: the committed level magnitudes, but which materials sound is
+            # redrawn within the polyphony cap (no cap: returned unchanged, no draw - the engine's
+            # own helper).  Without this D could tell the two sides apart by density alone.
             lv = self._draw_levels_like_committed(rng, lv_now)
+            if int(self.hold_cap) > 0 and float(rng.random()) < self.hold_real_cap_redraw:
+                # part of the windows keep the committed vector's own (already legal) sounding set,
+                # the rest get a freshly drawn legal one - otherwise D can answer "real or not" from
+                # WHICH materials sound instead of from how the sound moves
+                lv = self.analyzer.cap_random_levels(lv, rng)
             pos = np.zeros((len(ext), self.M), dtype=np.int64)
             for i in range(self.M):
                 L = int(src[i].shape[0])
@@ -697,7 +719,8 @@ class GANMode(ModeController):
             m = np.asarray(hd.get("psi_mean", []), dtype=np.float64)
             s = np.asarray(hd.get("psi_std", []), dtype=np.float64)
             f = np.asarray(hd.get("phi", []), dtype=np.float64)
-            if m.shape == (self.d_psi_hold,) and s.shape == (self.d_psi_hold,) and np.all(np.isfinite(m)):
+            if (m.shape == (self.d_psi_hold,) and s.shape == (self.d_psi_hold,) and np.all(np.isfinite(m))
+                    and not bool(hd.get("psi_scale_provisional", False))):
                 self.h_psi_mean, self.h_psi_std = m, np.maximum(s, 1e-6)
                 self.h_psi_scale_source = "frozen_from_the_first_hold"
                 self.h_psi_scale_n = int(hd.get("psi_scale_n", 0))
@@ -706,12 +729,72 @@ class GANMode(ModeController):
                 return
         P = np.stack([self._hold_psi_raw(x, rows) for x in samples])
         m = P.mean(axis=0)
-        s = np.maximum(P.std(axis=0), 1e-3)
+        raw = P.std(axis=0)
+        s = np.maximum(raw, 1e-3)
         m[-1] = 0.0
         s[-1] = 1.0
         self.h_psi_mean, self.h_psi_std = m, s
-        self.h_psi_scale_source = "real_unmanipulated_windows_of_the_first_hold"
         self.h_psi_scale_n = int(len(samples))
+        frac = float(np.mean(raw[:-1] > 1e-3))
+        # A hold that starts in silence produces 24 identical windows: every feature would then be
+        # standardised by the floor 1e-3 and D would see gradients ~10^3 that its backtracking line
+        # search rejects.  The scales therefore stay PROVISIONAL until an informative hold appears
+        # (with or without a polyphony cap: the piece starts from silence either way).
+        if frac < self.hold_psi_scale_min_var:
+            self.h_psi_scale_source = f"provisional (only {frac:.2f} of the features vary in this hold)"
+            self.h_psi_provisional = True
+            self.h_phi = np.zeros(self.d_psi_hold)
+        else:
+            self.h_psi_scale_source = "real_unmanipulated_windows_of_the_first_hold"
+            self.h_psi_provisional = False
+        self.h_psi_scale_varying_fraction = frac
+
+    def _cap_statistics(self, hr: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Polyphony-cap figures per unit: how often the sounding SET changed (swaps per minute),
+        the share of holds at the cap, and D split by holds whose published plan swaps - with a
+        silent entry the audible-splice cue disappears, so the two groups answer different
+        questions about what the discriminator is reading."""
+        caps = [h["cap"] for h in hr if h.get("cap")]
+        if not caps:
+            return {"max_active_materials": int(self.hold_cap)}
+        hold_seconds = float(getattr(self, 'hold_seconds', 0.0) or 2.0)
+        n_sw = int(sum(1 for c in caps if c.get("published_swap")))
+        act = [int(c["active_materials_at_hold_start"]) for c in caps]
+        d_sw = [float(c["D_actual_after_D_step"]) for c in self._commit_records
+                if isinstance(c.get("hold"), dict) and c["hold"].get("swap")]
+        d_no = [float(c["D_actual_after_D_step"]) for c in self._commit_records
+                if isinstance(c.get("hold"), dict) and not c["hold"].get("swap")
+                and "D_actual_after_D_step" in c]
+        dr_sw = [float(h["real_positives"]["D_real_windows_mean"]) for h in hr
+                 if h.get("real_positives") and (h.get("cap") or {}).get("published_swap")]
+        dr_no = [float(h["real_positives"]["D_real_windows_mean"]) for h in hr
+                 if h.get("real_positives") and not (h.get("cap") or {}).get("published_swap")]
+        dp_sw = [float(h["real_positives"]["D_published_plan"]) for h in hr
+                 if h.get("real_positives") and (h.get("cap") or {}).get("published_swap")
+                 and h["real_positives"].get("D_published_plan") is not None]
+        dp_no = [float(h["real_positives"]["D_published_plan"]) for h in hr
+                 if h.get("real_positives") and not (h.get("cap") or {}).get("published_swap")
+                 and h["real_positives"].get("D_published_plan") is not None]
+        return {
+            "max_active_materials": int(self.hold_cap),
+            "holds": len(caps), "holds_with_swap": n_sw,
+            "swaps_per_minute": float(n_sw / max(1e-9, len(caps) * hold_seconds / 60.0)),
+            "share_at_cap": float(np.mean([1.0 if c["at_cap"] else 0.0 for c in caps])),
+            "active_materials_mean": float(np.mean(act)) if act else None,
+            "active_materials_share": {str(k): float(np.mean([1.0 if a_ == k else 0.0 for a_ in act]))
+                                       for k in sorted(set(act))},
+            "swap_candidates_per_hold": float(np.mean([c["swap_candidates_drawn"] for c in caps])),
+            "swap_candidates_kept_per_hold": float(np.mean([c["swap_candidates_kept"] for c in caps])),
+            "D_committed_swap": (float(np.mean(d_sw)) if d_sw else None),
+            "D_committed_no_swap": (float(np.mean(d_no)) if d_no else None),
+            "D_real_windows_swap": (float(np.mean(dr_sw)) if dr_sw else None),
+            "D_real_windows_no_swap": (float(np.mean(dr_no)) if dr_no else None),
+            "D_published_plan_swap": (float(np.mean(dp_sw)) if dp_sw else None),
+            "D_published_plan_no_swap": (float(np.mean(dp_no)) if dp_no else None),
+            "note": "a swap enters a silent material on a voice that jumps while still silent, so "
+                    "those holds carry no audible splice; comparing the two groups says how much of "
+                    "what D reads is the splice and how much is the level motion",
+        }
 
     def _h_phi_split(self) -> Dict[str, Any]:
         """How much of the discriminator's weight norm sits on WHERE the sound is and how much on
@@ -816,7 +899,10 @@ class GANMode(ModeController):
 
     def _hold_draw_plan(self, unit: UnitContext, slot: int, mag: float, step_frames: List[int],
                         levels_now: np.ndarray, next_jump: List[int], goal_at, pools: Dict[str, Any],
-                        jumps_on: bool, o0: float) -> Dict[str, Any]:
+                        jumps_on: bool, o0: float, cap: int = 0, voices: Optional[Dict[int, List[int]]] = None,
+                        sounding: Optional[List[int]] = None, silent: Optional[List[int]] = None,
+                        project=None, positions_now: Optional[np.ndarray] = None,
+                        anchor: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """One candidate reference plan.
 
         Levels: a smooth gesture from the current levels toward a drawn target
@@ -827,16 +913,45 @@ class GANMode(ModeController):
         length) with probability `hold_jump_probability`, from the slot's position pool.  Keeping
         the cuts on the hold boundary leaves the later commit blocks of the hold free of material
         discontinuities - the sound's own fast motion (flutter) stays small while the requested
-        move over the hold does not."""
+        move over the hold does not.
+
+        With a polyphony cap only the <= K SOUNDING materials get a level gesture and a jump (a
+        gradient on a silent material is meaningless), and the `swap` slot is the only way a silent
+        material can enter: one sounding material leaves (all its voices to 0) while one voice of a
+        silent one comes in at a drawn level, and that entering voice jumps to its fragment at the
+        hold start WHILE IT IS STILL SILENT - so the material change happens without an audible
+        splice.  The entering fragment is pre-ranked with `an.fragment_candidates_mix` against the
+        band energy of the materials that STAY."""
         rng = self.rng
         beta = float(np.clip(self.hold_move_scale * float(mag) * self.hold_level_move * float(o0), 0.0, 1.0))
         jumps0: Dict[int, int] = {}
         n_fallback = 0
         f0 = int(step_frames[0])
-        if jumps_on and slot > 0:
-            # which tracks cut at the hold start; capped so that the cost and the number of
+        lv0 = np.asarray(levels_now, dtype=np.float64)
+        movable = list(range(1, self.M))
+        swap: Optional[Dict[str, Any]] = None
+        entering: List[int] = []
+        if cap > 0 and voices is not None:
+            snd = list(sounding or [])
+            sil = list(silent or [])
+            # free places under the cap (the piece starts from silence, and a material may have been
+            # faded out): they are filled without anyone having to leave
+            free = int(cap) - len(snd)
+            if free > 0 and sil:
+                k_ = int(min(free, len(sil)))
+                entering = [int(x) for x in rng.choice(np.asarray(sil), size=k_, replace=False)]
+                sil = [m for m in sil if m not in entering]
+            movable = [i for m in (snd + entering) for i in voices[m]]
+            if slot == 4:                       # SWAP: who sounds is the decision
+                swap = self._hold_draw_swap(rng, cap, voices, snd, sil, lv0, next_jump, f0,
+                                            positions_now, anchor, pools, free > 0)
+                if swap is not None:
+                    jumps0.update(swap["jumps"])
+                    movable = [i for m in (swap["stay"] + entering) for i in voices[m]]
+        if jumps_on and slot in (1, 2, 3):
+            # which sounding tracks cut at the hold start; capped so that the cost and the number of
             # simultaneous cuts stay bounded when M grows (2 voices per material, 8-12 materials)
-            elig = [i for i in range(1, self.M)
+            elig = [i for i in movable
                     if f0 >= int(next_jump[i]) and float(rng.random()) < self.hold_jump_probability]
             if len(elig) > self.hold_max_jumps:
                 elig = [int(x) for x in rng.choice(np.asarray(elig), size=self.hold_max_jumps, replace=False)]
@@ -849,23 +964,85 @@ class GANMode(ModeController):
                     if slot != 3:
                         n_fallback += 1
                 jumps0[int(i)] = int(p)
-        lv0 = np.asarray(levels_now, dtype=np.float64)
         # target levels stay above `hold_level_floor`: a mixture whose materials are all near zero
         # has a noisy normalized band profile, and that noise lands in the very fast motion the
         # requested move is measured against (it is also what E_form's energy / N_eff terms guard)
         u = self.hold_level_floor + (1.0 - self.hold_level_floor) * rng.uniform(0.0, 1.0, max(1, self.M - 1))
         target = lv0[1:] + beta * (u - lv0[1:])
+        if cap > 0:
+            keep = np.zeros(self.M - 1, dtype=bool)
+            for i in movable:
+                keep[i - 1] = True
+            target = np.where(keep, target, lv0[1:])      # silent materials keep their level (0)
         steps: List[Dict[str, Any]] = []
         n = len(step_frames)
         for k, f in enumerate(step_frames):
             lv = lv0.copy()
             lv[1:] = np.clip(lv0[1:] + (float(k + 1) / float(n)) * (target - lv0[1:]), 0.0, 1.0)
+            if swap is not None and k >= 1:
+                # from the second commit step on: the leaving material is out, the entering voice in
+                for i in swap["out_tracks"]:
+                    lv[i] = 0.0
+                lv[swap["in_track"]] = float(swap["in_level"])
             lv[0] = float(goal_at(f))
+            if project is not None:
+                lv = np.asarray(project(lv), dtype=np.float64)
             steps.append({"frame": int(f), "jumps": (dict(jumps0) if k == 0 else {}),
                           "levels": [float(x) for x in lv]})
         return {"steps": steps, "slot": int(slot), "magnitude": float(mag), "beta": beta,
                 "target_levels": [round(float(x), 3) for x in target],
-                "n_jumps": len(jumps0), "pool_fallbacks": int(n_fallback)}
+                "n_jumps": len(jumps0), "pool_fallbacks": int(n_fallback),
+                "swap": (None if swap is None else {"out": int(swap["out"]), "in": int(swap["in"]),
+                                                    "in_track": int(swap["in_track"]),
+                                                    "in_level": round(float(swap["in_level"]), 3),
+                                                    "silent_entry": bool(swap["silent_entry"]),
+                                                    "position_source": swap["position_source"]})}
+
+    def _hold_draw_swap(self, rng, cap: int, voices: Dict[int, List[int]], sounding: List[int],
+                        silent: List[int], lv0: np.ndarray, next_jump: List[int], f0: int,
+                        positions_now: Optional[np.ndarray], anchor: Optional[np.ndarray],
+                        pools: Dict[str, Any], free_place: bool = False) -> Optional[Dict[str, Any]]:
+        """One material out, one silent material in on one voice.  The entering voice jumps at the
+        hold start while it is still silent; the fragment is pre-ranked with
+        `an.fragment_candidates_mix` for the recent committed profile against the band energy of the
+        materials that stay, with a share from the committed history and a random share."""
+        an = self.analyzer
+        if not silent:
+            return None
+        if free_place or not sounding:
+            # a place under the cap is free: a material enters without anyone leaving
+            m_out, stay = -1, list(sounding)
+        else:
+            m_out = int(sounding[int(rng.integers(0, len(sounding)))])
+            stay = [m for m in sounding if m != m_out]
+        m_in = int(silent[int(rng.integers(0, len(silent)))])
+        vin = voices[m_in]
+        i_in = int(vin[int(rng.integers(0, len(vin)))])
+        lvl = float(self.hold_level_floor + (1.0 - self.hold_level_floor) * float(rng.random()))
+        pos: Optional[int] = None
+        src = "none"
+        if f0 >= int(next_jump[i_in]):
+            mixed = getattr(an, "fragment_candidates_mix", None)
+            r = float(rng.random())
+            if r < 0.2 and pools["committed"][i_in]:
+                pool = pools["committed"][i_in]
+                pos = int(pool[int(rng.integers(0, len(pool)))])
+                src = "committed"
+            elif r < 0.85 and mixed is not None and anchor is not None and positions_now is not None:
+                lv_stay = np.zeros(self.M)
+                for m in stay:
+                    lv_stay[voices[m]] = lv0[voices[m]]
+                others = an.mixture_band_energy(positions_now, lv_stay, skip=i_in)
+                cands = mixed(i_in, np.asarray(anchor)[: 1 + an.nb], others, lvl, 4)
+                pos = int(cands[int(rng.integers(0, len(cands)))])
+                src = "mixture_candidate"
+            else:
+                pos = int(rng.integers(0, int(self.sources[i_in].shape[0])))
+                src = "random"
+        return {"out": m_out, "in": m_in, "stay": stay, "in_track": i_in, "in_level": lvl,
+                "out_tracks": ([int(i) for i in voices[m_out]] if m_out >= 0 else []),
+                "jumps": ({i_in: int(pos)} if pos is not None else {}),
+                "silent_entry": pos is not None, "position_source": src}
 
     def _hold_prepare(self, unit: UnitContext, history, rows: np.ndarray, xi_anchor: np.ndarray,
                       n_proposals: int, rs: Dict[str, Any]) -> List[Target]:
@@ -879,6 +1056,14 @@ class GANMode(ModeController):
         if not self._hold_active:
             self._hold_active = True
             self._hold_seen = True
+            # polyphony cap (docs/FIDELITY_CONTRACT.md): with a cap the law must also decide WHO
+            # sounds, so a fifth origin class (swap) joins the categorical.  cap = 0: nothing here
+            # changes, not one extra random number is drawn.
+            self.hold_cap = int(rs.get("max_active_materials", 0) or 0)
+            if self.hold_cap > 0:
+                self.hold_slots = tuple(self.HOLD_SLOTS_CAP)
+                self.hold_slot_share = tuple(self.HOLD_SLOT_SHARE_CAP)
+            self.hold_seconds = float(int(rs.get("hold_frames", 0)) / float(self.fs)) or 2.0
             self._restore_hold_generator(history)
             self.reference_source = "hold_exact_plans_narrowed_to_the_committed_history"
         hold_id = int(self._hold_counter)
@@ -890,6 +1075,13 @@ class GANMode(ModeController):
         next_jump = [int(x) for x in rs["next_jump_frame"]]
         positions_now = np.asarray(rs["positions"], dtype=np.int64)
         jumps_on = bool(rs["jumps_enabled"]) and self.M > 1 and getattr(self, "sources", None) is not None
+        cap = int(self.hold_cap)
+        groups = np.asarray(rs.get("material_of_track", np.arange(self.M)), dtype=np.int64)
+        project = rs.get("project_levels")
+        voices = {int(m): [i for i in range(1, self.M) if int(groups[i]) == int(m)]
+                  for m in sorted({int(groups[i]) for i in range(1, self.M)})}
+        sounding = [m for m, vv in voices.items() if float(np.max(levels_now[vv])) > 1e-6]
+        silent = [m for m in voices if m not in sounding]
         centers = unit.centers[rows]
         free = unit.free_mask[rows]
         goal_gains = np.asarray(rs.get("goal_gains", np.zeros(len(rows))), dtype=np.float64)
@@ -958,10 +1150,12 @@ class GANMode(ModeController):
 
         # ---- B candidate plans, screened on a row subset
         avail = [0] + ([1, 2, 3] if jumps_on else [])
+        if cap > 0 and len(self.hold_slots) > 4 and silent and sounding:
+            avail.append(4)                       # swap: the only way a silent material enters
         if jumps_on and getattr(an, "frag_f", None) is None:
             avail = [0, 1, 3]
-        tot = sum(self.HOLD_SLOT_SHARE[s] for s in avail)
-        counts = {s: max(1, int(round(self.hold_candidates * self.HOLD_SLOT_SHARE[s] / tot))) for s in avail}
+        tot = sum(self.hold_slot_share[s] for s in avail)
+        counts = {s: max(1, int(round(self.hold_candidates * self.hold_slot_share[s] / tot))) for s in avail}
         plan_slots: List[int] = []
         for s in avail:
             plan_slots.extend([s] * counts[s])
@@ -974,7 +1168,9 @@ class GANMode(ModeController):
         for slot in plan_slots:
             mag = float(np.exp(rng.uniform(np.log(max(m0, 1e-6)), np.log(max(m1, m0 + 1e-6)))))
             pl = self._hold_draw_plan(unit, slot, mag, step_frames, levels_now, next_jump,
-                                      goal_at, pools, jumps_on, o0)
+                                      goal_at, pools, jumps_on, o0,
+                                      cap=cap, voices=voices, sounding=sounding, silent=silent,
+                                      project=project, positions_now=positions_now, anchor=anchor)
             xi_s, _ps, info_s = ev(pl["steps"], sub_rows)
             n_eval += 1
             pl["xi_sub"] = xi_s
@@ -1054,13 +1250,25 @@ class GANMode(ModeController):
             kb = int(rng.choice(len(keep), p=p_sel))
             slot = kept_slots[kb]
             w = self.h_mu[slot] + np.exp(self.h_log_sigma[slot]) * rng.standard_normal(max(1, self.M - 1))
-            steps_gen = [{"frame": int(s["frame"]), "jumps": {int(i): int(p) for i, p in s["jumps"].items()},
-                          "levels": ([float(s["levels"][0])]
-                                     + [float(np.clip(s["levels"][i] + w[i - 1], 0.0, 1.0))
-                                        for i in range(1, self.M)])}
-                         for s in cands[keep[kb]]["steps"]]
+            steps_gen = []
+            for s_ in cands[keep[kb]]["steps"]:
+                lv = np.asarray(s_["levels"], dtype=np.float64).copy()
+                # the displacement acts on the SOUNDING tracks of that step only (a level change on
+                # a silent material would either do nothing or evict a sounding one), then the plan
+                # is projected back onto the cap so that what is published is what can be played
+                mv = np.clip(lv[1:] + w, 0.0, 1.0)
+                lv[1:] = np.where(lv[1:] > 1e-6, mv, lv[1:]) if cap > 0 else mv
+                if project is not None:
+                    lv = np.asarray(project(lv), dtype=np.float64)
+                steps_gen.append({"frame": int(s_["frame"]),
+                                  "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
+                                  "levels": [float(x) for x in lv]})
             xi_g, _pg, info_g = ev(steps_gen, rows)
             n_eval += 1
+            # publish exactly the levels the evaluator used (docs/FIDELITY_CONTRACT.md, cap item 1)
+            for k_, lu in enumerate(info_g.get("levels_used") or []):
+                if lu is not None and k_ < len(steps_gen):
+                    steps_gen[k_]["levels"] = [float(x) for x in lu]
             pub_xi.append(xi_g)
             xi_hat = base_full.copy()
             xi_hat[rows] = xi_g
@@ -1069,16 +1277,19 @@ class GANMode(ModeController):
             logp = self._hold_log_p(slot, w)
             out.append(Target(
                 f"gan:u{unit.index}:hold{hold_id}:{a}", xi_hat,
-                meta={"hold": True, "b": int(kb), "slot": int(slot), "slot_name": self.HOLD_SLOTS[slot],
+                meta={"hold": True, "b": int(kb), "slot": int(slot), "slot_name": self.hold_slots[slot],
                       "w": [float(x) for x in w], "logp_draw": float(logp),
                       "alpha": float(a_full[slot]), "select_p": float(p_sel[kb]),
                       "parent_id": f"gan:u{unit.index}:h{hold_id}:b{int(keep[kb])}",
-                      "parent_origin": self.HOLD_SLOTS[slot], "basis_hash": self.basis_hash,
+                      "parent_origin": self.hold_slots[slot], "basis_hash": self.basis_hash,
+                      "swap": (cands[keep[kb]].get("swap") is not None),
+                      "swap_detail": cands[keep[kb]].get("swap"),
+                      "active_materials_start": int(len(sounding)), "cap": int(cap),
                       "hold_id": hold_id, "plan": steps_gen,
                       "continuity_seconds": 0.0, "continuity_delta_norm": 0.0,
                       "requested_dist2": d_pub, "dropped_jumps": len(info_g["dropped_jumps"]),
                       "rows": [int(rows[0]), int(rows[-1])]}))
-            draws.append({"proposal": int(a), "kept_index": int(kb), "slot": self.HOLD_SLOTS[slot],
+            draws.append({"proposal": int(a), "kept_index": int(kb), "slot": self.hold_slots[slot],
                           "w": [round(float(x), 4) for x in w], "requested_dist2": d_pub,
                           "requested_over_local_flutter": d_pub / max(1e-12, flutter),
                           "plan_jumps": {str(s["frame"]): s["jumps"] for s in steps_gen if s["jumps"]},
@@ -1091,10 +1302,10 @@ class GANMode(ModeController):
         psi_rows = rows[:n_psi]
         if self.hold_positive_source == "recordings" and getattr(self, "sources", None) is not None:
             n_draw = self.hold_real_positives
-            if self.h_psi_scale_source == "uninitialised":
+            if self.h_psi_scale_source == "uninitialised" or self.h_psi_provisional:
                 n_draw = max(n_draw, self.hold_psi_scale_samples)
             real = self._hold_real_windows(unit, rs, psi_rows, n_draw, rng, anchor)
-            if self.h_psi_scale_source == "uninitialised":
+            if self.h_psi_scale_source == "uninitialised" or self.h_psi_provisional:
                 self._hold_psi_scales(history, real, psi_rows)
             pos_set = real[: self.hold_real_positives]
             psi_pos = np.stack([self._hold_psi(x, psi_rows) for x in pos_set])
@@ -1152,6 +1363,14 @@ class GANMode(ModeController):
                          f"(EMA over the committed blocks) x (hold_move_scale "
                          f"{self.hold_move_scale} x openness {o0:.2f})^2",
             "do_nothing_dist2": d_none,
+            "cap": {"max_active_materials": int(cap),
+                    "active_materials_at_hold_start": int(len(sounding)),
+                    "at_cap": bool(cap > 0 and len(sounding) >= cap),
+                    "silent_materials": int(len(silent)),
+                    "published_swap": (out[0].meta.get("swap_detail") if out else None),
+                    "swap_candidates_drawn": int(sum(1 for c in cands if c.get("swap") is not None)),
+                    "swap_candidates_kept": int(sum(1 for k in keep if cands[k].get("swap") is not None))}
+            if cap > 0 else None,
             "candidate_plans_drawn": len(cands), "candidate_plans_in_band": int(len(in_band)),
             "candidate_plans_kept": len(keep),
             "kept_fraction": float(len(in_band)) / float(max(1, len(cands))),
@@ -1162,16 +1381,16 @@ class GANMode(ModeController):
             "move_over_flutter_kept": [round(float(rat_all[k]), 2) for k in keep],
             "plan_flutter_kept": [round(float(cands[k]["flutter"]), 4) for k in keep],
             "move_over_flutter_min": float(self.hold_ratio_min),
-            "slot_all": [self.HOLD_SLOTS[c["slot"]] for c in cands],
+            "slot_all": [self.hold_slots[c["slot"]] for c in cands],
             "beta_all": [round(float(c["beta"]), 3) for c in cands],
             "jumps_all": [int(c["n_jumps"]) for c in cands],
             "d_anchor_kept": [round(float(cands[k].get("d_anchor_rows", cands[k]["d_anchor"])), 4) for k in keep],
-            "slots_drawn": {self.HOLD_SLOTS[s]: int(sum(1 for c in cands if c["slot"] == s)) for s in avail},
-            "slots_kept": {self.HOLD_SLOTS[s]: int(sum(1 for x in kept_slots if x == s)) for s in avail},
+            "slots_drawn": {self.hold_slots[s]: int(sum(1 for c in cands if c["slot"] == s)) for s in avail},
+            "slots_kept": {self.hold_slots[s]: int(sum(1 for x in kept_slots if x == s)) for s in avail},
             "J_ref": [round(float(x), 5) for x in j_ref], "weights_r_b": [round(float(x), 4) for x in r_b],
             "e_form_kept": [round(float(x), 5) for x in e_form_k],
             "e_hist_kept": [round(float(x), 5) for x in e_hist_k],
-            "slot_alphas": {n: round(float(v), 4) for n, v in zip(self.HOLD_SLOTS, a_full)},
+            "slot_alphas": {n: round(float(v), 4) for n, v in zip(self.hold_slots, a_full)},
             "draws": draws, "position_pool": {"band_profile": pools["band_profile_source"],
                                               "committed_positions_per_track": pools["n_committed"]},
             "plan_rows_calls": int(n_eval),
@@ -1833,6 +2052,8 @@ class GANMode(ModeController):
                          "reference_age_steps": int((stats or {}).get("reference_age_steps", -1)),
                          "slot": str(last["meta"].get("slot_name", "")),
                          "positive_source": self.hold_positive_source,
+                         "swap": bool(last["meta"].get("swap")),
+                         "active_materials_start": int(last["meta"].get("active_materials_start", -1)),
                          "positives": ("unmanipulated playback of this hold (exact rows), uniform weights"
                                        if d_which == "h_phi" else
                                        "kept reference plans of this hold (exact rows), weights r_b"),
@@ -2140,6 +2361,8 @@ class GANMode(ModeController):
                 "real_position_sources": {k: int(sum(int((h.get("real_positives") or {})
                                                          .get("position_sources", {}).get(k, 0)) for h in hr))
                                           for k in ("current", "committed", "mixture_candidate", "random")},
+                "cap": (self._cap_statistics(hr) if self.hold_cap > 0 else
+                        {"max_active_materials": 0, "note": "no polyphony cap in this job"}),
                 "generator_D_term": (f"clipped negative logit of D on the published plan's rows "
                                      f"(+-{self.hold_logit_clip})"
                                      if self.hold_positive_source == "recordings" else "-log D(committed)"),
@@ -2169,8 +2392,8 @@ class GANMode(ModeController):
                 "requested_over_local_flutter_mean": (float(np.mean(ratio)) if ratio else None),
                 "plan_rows_calls": int(sum(hcol("plan_rows_calls"))),
                 "slot_share_chosen": {n: float(np.mean([1.0 if s == n else 0.0 for s in slots]))
-                                      for n in self.HOLD_SLOTS} if slots else {},
-                "slot_alphas": {n: float(v) for n, v in zip(self.HOLD_SLOTS, self._hold_alphas())},
+                                      for n in self.hold_slots} if slots else {},
+                "slot_alphas": {n: float(v) for n, v in zip(self.hold_slots, self._hold_alphas())},
                 "level_displacement_sigma_mean": float(np.exp(self.h_log_sigma).mean()),
                 "level_displacement_mu_absmax": float(np.abs(self.h_mu).max()),
                 "generator_inheritance": self.h_inheritance,
@@ -2248,7 +2471,7 @@ class GANMode(ModeController):
                 "diversity_mean_pair_dist2": float(rs["diversity_mean_pair_dist2"])},
             "statistics": {k: v for k, v in stats.items() if k != "per_step"},
             **({"hold_generator": {
-                "slots": list(self.HOLD_SLOTS), "logits": [float(x) for x in self.h_logits],
+                "slots": list(self.hold_slots), "logits": [float(x) for x in self.h_logits],
                 "mu": [[float(v) for v in row] for row in self.h_mu],
                 "log_sigma": [[float(v) for v in row] for row in self.h_log_sigma],
                 "level_dim": int(max(1, self.M - 1)), "inheritance": self.h_inheritance,
@@ -2261,7 +2484,9 @@ class GANMode(ModeController):
                     "psi_mean": [float(x) for x in self.h_psi_mean],
                     "psi_std": [float(x) for x in self.h_psi_std],
                     "psi_scale_source": self.h_psi_scale_source,
-                    "psi_scale_n": int(self.h_psi_scale_n),
+                    "psi_scale_n": (0 if self.h_psi_provisional else int(self.h_psi_scale_n)),
+                    "psi_scale_provisional": bool(self.h_psi_provisional),
+                    "psi_scale_varying_fraction": float(self.h_psi_scale_varying_fraction),
                     "feature_names": list(self.h_psi_names)}} if self._hold_seen else {}),
             "lineage": [{"unit": int(l["unit"]), "chosen_parent_id": str(l["chosen_parent_id"]),
                          "chosen_candidate_id": int(l["chosen_candidate_id"]),
@@ -2355,7 +2580,7 @@ class GANMode(ModeController):
                 "realizability": "xi_hat[rows] = plan_rows(plan) of the engine's own evaluator; the "
                                  "xi-space displacement B_ref w of eq. (41) is NOT added in hold "
                                  "mode (it is not realizable) - it stays in the legacy path",
-                "slots": list(self.HOLD_SLOTS),
+                "slots": list(self.hold_slots),
                 "slot_meaning": {
                     "levels_only": "level moves of the materials, no jump",
                     "committed_positions": "jump to a position of the committed history (events' "
@@ -2363,7 +2588,7 @@ class GANMode(ModeController):
                     "fragment_candidates": "jump to an.fragment_candidates for the band profile of "
                                            "the recent committed compositions",
                     "random_positions": "fresh uniform position (the exploration share)"},
-                "slot_share_drawn": {n: s for n, s in zip(self.HOLD_SLOTS, self.HOLD_SLOT_SHARE)},
+                "slot_share_drawn": {n: s for n, s in zip(self.hold_slots, self.hold_slot_share)},
                 "narrowing": "keep the plans whose rows at the end of the hold lie in "
                              f"[{self.hold_band_lo}, {self.hold_band_hi}] x (the hold's own flutter, "
                              "measured on the UNCHANGED continuation) x (hold_move_scale x openness)^2 "
@@ -2428,6 +2653,8 @@ class GANMode(ModeController):
                     "hold_logit_clip": float(self.hold_logit_clip),
                     "hold_d_l2": float(self.hold_d_l2),
                     "hold_lr_G_scale": float(self.hold_lr_G_scale),
+                    "hold_real_cap_redraw": float(self.hold_real_cap_redraw),
+                    "hold_psi_scale_min_var": float(self.hold_psi_scale_min_var),
                     "note": "read from mode_defaults.gan with .get; not present in config.py "
                             "DEFAULTS (shared file not edited), so a project file cannot set them "
                             "until they are added there"},

@@ -147,6 +147,32 @@ diagnosis was that averaging ALL token values into one displacement produced a f
   move, and the internal iterations (tokens scored, realizable moves scored, candidate plan steps
   and `plan_rows` calls) kept apart from musical time.
 
+Law version 3 (2026-09-17, `hold_law_version` = 3, the default) — "what the heads attend to is what you
+hear".  Measured on the real two-voice materials, law 2 followed its own plan but barely moved the
+sound: the engine's `mean_intervention_dist2_at_hold_end` (the ideal at the hold end against what
+the hold would have been if nothing were changed) was 0.09 / 0.07 / 0.12 against a material flutter
+of 0.18 / 0.15 / 0.06, the memory head took 88-100 % of the selections and 45-60 % of the steps were
+"stay".  Law 3 therefore:
+
+* normalises EVERY HEAD SEPARATELY before combining, by a z-score over the material tracks (for the
+  mass) and over the realizable moves (for the per-move score).  Dividing by a head's total would
+  only equalise the sums and still leave a head with fewer keys a larger value per key - which is
+  exactly how the memory head, with ~20 event tokens against ~6 fragment tokens per source, took
+  almost every selection.  The contrast head subtracts, as in eq. (37);
+* makes the LEVELS the attention: the end level of material track i is `u_i ** hold_level_sharpness`
+  with u the min-max normalised combined mass - ~0 for the least attended track, ~1 for the most
+  attended - and the openness scales how far the levels travel from where they are (o = 0 stays).
+  There is no stochastic stay gate any more; the short exact refinement may adjust the profile, but
+  only within +/- 2 * hold_refine_step, so it cannot undo it;
+* keeps the jumps of law 2 (the highest-mass tracks take their top / sampled fragment token where
+  the minimum clip allows, memory tokens returning to committed fragments);
+* records `attention_contribution_corr`: the correlation over the material tracks between the
+  combined attention mass and the contribution vector c of the exact plan rows of the step
+  (`an.split(xi)[1]`).  That is the figure this law is about; `law_fidelity` keeps measuring the
+  agreement with the FREE eq. (36) target, which law 3 no longer optimises directly.
+
+Laws 1 and 2 stay selectable through `hold_law_version`.
+
 Outside hold mode (`unit.realizer_state` missing / None) none of this runs: the branch is taken
 before any RNG draw and the legacy code path is bit-identical (R5).
 
@@ -305,9 +331,18 @@ class TransformerMode(ModeController):
         self.hold_refine_step = float(self.p.get("hold_refine_step", 0.18))
         self.hold_refine_min = float(self.p.get("hold_refine_min_step", 0.04))
         self.hold_mix_candidates = int(self.p.get("hold_mixture_candidates", 1))
+        # law version 3: the level of every material track IS a sharpened map of its normalised
+        # head-combined attention mass (~0 for the least attended, ~1 for the most attended).
+        self.hold_level_sharpness = max(0.1, float(self.p.get("hold_level_sharpness", 3.0)))
+        # polyphony cap (docs/FIDELITY_CONTRACT.md): how strongly a SOUNDING material keeps its place
+        # in the top-K ranking, as a fraction of the spread of the material masses (0 = no hysteresis)
+        self.hold_cap_hysteresis = max(0.0, float(self.p.get("hold_cap_hysteresis", 0.25)))
         # 1 = the previous single-token hold law (docs/HOLD_CONTRACT.md), kept selectable so those
-        # outputs stay reproducible in behaviour; 2 = the multi-track law of FIDELITY_CONTRACT (A).
-        self.hold_law_version = int(self.p.get("hold_law_version", 2))
+        # outputs stay reproducible in behaviour; 2 = the multi-track law of FIDELITY_CONTRACT (A);
+        # 3 (default) = "what the heads attend to is what you hear": per-head normalised track mass,
+        # levels a sharpened map of that mass, no stochastic stay gate (openness scales the size).
+        # Selector: `hold_law_version` (registered in config.py with the default 3).
+        self.hold_law_version = int(self.p.get("hold_law_version", 3))
         self._W_vec = np.asarray(analyzer.weight_vector(), dtype=np.float64)
         self.hold_traces: List[Dict[str, Any]] = []
         self._max_hold_traces = 600
@@ -906,7 +941,7 @@ class TransformerMode(ModeController):
 
     def _hold_moves(self, att: Dict[str, Dict[str, Any]], tok: Dict[str, Any], pack: Dict[str, Any],
                     frame: int, positions: np.ndarray, njf: List[int], plan_last: List[Optional[int]],
-                    min_clip: int, jumps_on: bool):
+                    min_clip: int, jumps_on: bool, per_head_norm: bool = False):
         """The realizable token moves at one step and the head-combined selection distribution.
 
         A move is (material track, source position).  Fragment tokens carry the similarity /
@@ -949,6 +984,16 @@ class TransformerMode(ModeController):
                 m["w"]["memory"] += float(att["memory"]["w"][k])
         if not mv:
             return [], np.zeros(0)
+        if per_head_norm:
+            # LAW 3: every head is normalised over the move set BEFORE the heads are combined, so a
+            # head cannot win simply by having fewer keys (the memory head has ~20 event tokens
+            # against ~6 per source x N fragment tokens, which gave it 88-100 % of the selections).
+            for h in self.heads:
+                w = np.array([float(m["w"][h]) for m in mv], dtype=np.float64)
+                sd = float(w.std())
+                z = (w - float(w.mean())) / sd if sd > 1e-300 else np.zeros_like(w)
+                for q, m in enumerate(mv):
+                    m["w"][h] = float(z[q])
         for m in mv:
             i = int(m["track"])
             m["score"] = float(sum(self.sign[h] * self.alpha[h] * m["w"][h] for h in self.heads))
@@ -1023,6 +1068,111 @@ class TransformerMode(ModeController):
                                                               dtype=np.float64).sum(axis=0)
         return v
 
+    def _hold_track_mass_normalised(self, att: Dict[str, Dict[str, Any]]):
+        """LAW 3: head-combined attention mass per MATERIAL track with every head normalised
+        separately first.
+
+        Each head's `by_track` row-sum over the material tracks is divided by its own total, so the
+        heads enter the combination as comparable distributions over tracks and the memory head can
+        no longer dominate through its number of key tokens.  The contrast head subtracts, exactly as
+        in eq. (37).  Returns (mass (M,), per-head normalised masses, u (M,) = the min-max
+        normalisation of the combined mass over the material tracks)."""
+        per: Dict[str, np.ndarray] = {}
+        mass = np.zeros(self.M)
+        for h in self.heads:
+            by = np.asarray(att[h]["by_track"], dtype=np.float64).sum(axis=0)
+            m = np.zeros(self.M)
+            if self.M > 1:
+                v = by[1:]
+                sd = float(v.std())
+                # z-score, not "divide by the total": dividing by the total equalises the heads' SUM
+                # but leaves a head with fewer keys a larger value per key, which is exactly how the
+                # memory head took 88-100 % of the selections.  The z-score equalises the SPREAD.
+                m[1:] = (v - float(v.mean())) / sd if sd > 1e-300 else np.zeros_like(v)
+            per[h] = m
+            mass = mass + self.sign[h] * self.alpha[h] * m
+        u = np.zeros(self.M)
+        if self.M > 1:
+            w = mass[1:]
+            span = float(w.max() - w.min())
+            u[1:] = (w - w.min()) / span if span > 1e-12 else np.full(self.M - 1, 0.5)
+        return mass, per, u
+
+    def _hold_levels_v3(self, u: np.ndarray, lv: np.ndarray, o: float) -> np.ndarray:
+        """LAW 3: the mix you hear IS the attention distribution over the tracks.
+
+        The end level of every material track is a monotone, sharpened map of its normalised
+        head-combined mass: `level = u ** hold_level_sharpness`, i.e. ~0 for the least attended track
+        and ~1 for the most attended one (sharpness > 1 pushes the middle down, so the attended
+        tracks stand out).  The openness scales how far the levels travel from where they are
+        (`s = clip(o * hold_move_scale)`), so o = 0 leaves everything where it is."""
+        lv = np.asarray(lv, dtype=np.float64)
+        new = lv.copy()
+        s = float(np.clip(float(o) * self.hold_move_scale, 0.0, 1.0))
+        g = float(self.hold_level_sharpness)
+        for i in range(1, self.M):
+            tgt = float(np.clip(float(u[i]) ** g, 0.0, 1.0))
+            new[i] = float(np.clip(lv[i] + (tgt - lv[i]) * s, 0.0, 1.0))
+        return new
+
+    def _hold_cap_choice(self, mass: np.ndarray, lv: np.ndarray, groups: np.ndarray, cap: int, o: float):
+        """LAW 3 under the polyphony cap (`hires.max_active_materials`): "the K most attended
+        MATERIALS are what you hear".
+
+        The voices of one material compete as ONE material (its mass is the mass of its best-attended
+        voice, and that voice is the one that sounds), the top `cap` materials by mass are chosen, and
+        the levels come from the sharpened min-max normalisation of the mass WITHIN those materials.
+        Every voice of every other material is set to exactly 0, so the emitted levels are already the
+        projection `project_levels` would apply and the published plan and rows describe the same
+        thing.  Returns (base levels (M,), chosen voice per chosen material, material mass, sounding
+        material ids before / after)."""
+        mats = sorted({int(groups[i]) for i in range(1, self.M)})
+        voice: Dict[int, int] = {}
+        m_mass: Dict[int, float] = {}
+        for m_ in mats:
+            vs = [i for i in range(1, self.M) if int(groups[i]) == m_]
+            b = max(vs, key=lambda z: float(mass[z]))
+            voice[m_] = int(b)
+            m_mass[m_] = float(mass[b])
+        # hysteresis: a material that is SOUNDING keeps its place unless another is clearly better
+        # attended.  Without it the top-K boundary flips whenever two masses are nearly equal and the
+        # sounding set changes at almost every commit (measured: 42-99 changes per minute).
+        spread = float(max(m_mass.values()) - min(m_mass.values())) if len(m_mass) > 1 else 0.0
+        bonus = float(self.hold_cap_hysteresis) * spread
+        rank = {m_: m_mass[m_] + (bonus if any(float(lv[i]) > 1e-9 for i in range(1, self.M)
+                                               if int(groups[i]) == m_) else 0.0) for m_ in mats}
+        keep = sorted(mats, key=lambda q: (-rank[q], q))[: max(1, int(cap))]
+        w = np.array([m_mass[q] for q in keep], dtype=np.float64)
+        span = float(w.max() - w.min())
+        nw = (w - w.min()) / span if span > 1e-12 else np.full(len(keep), 1.0)
+        s = float(np.clip(float(o) * self.hold_move_scale, 0.0, 1.0))
+        g = float(self.hold_level_sharpness)
+        lv = np.asarray(lv, dtype=np.float64)
+        new = np.zeros(self.M)
+        new[0] = lv[0]
+        for k, m_ in enumerate(keep):
+            i = voice[m_]
+            # the least attended of the K sounding materials still sounds: the sharpened map is
+            # lifted off zero here (unlike the uncapped case, where the least attended track leaves)
+            tgt = float(np.clip(self.bg_gain + (1.0 - self.bg_gain) * float(nw[k]) ** g, 0.0, 1.0))
+            new[i] = float(np.clip(lv[i] + (tgt - lv[i]) * s, 0.0, 1.0))
+            if lv[i] <= 1e-9 and new[i] < self.bg_gain * s:
+                new[i] = float(np.clip(self.bg_gain * s, 0.0, 1.0))     # an entering voice is audible
+        before = sorted({int(groups[i]) for i in range(1, self.M) if float(lv[i]) > 1e-9})
+        after = sorted({int(groups[i]) for i in range(1, self.M) if float(new[i]) > 1e-9})
+        return new, voice, m_mass, keep, before, after
+
+    @staticmethod
+    def _corr(a: np.ndarray, b: np.ndarray) -> Optional[float]:
+        a = np.asarray(a, dtype=np.float64).ravel()
+        b = np.asarray(b, dtype=np.float64).ravel()
+        if a.size < 2 or a.size != b.size:
+            return None
+        sa, sb = float(a.std()), float(b.std())
+        if sa < 1e-12 or sb < 1e-12:
+            return None
+        return float(((a - a.mean()) * (b - b.mean())).mean() / (sa * sb))
+
     def _hold_free_target(self, xi_state: np.ndarray, O_sel: np.ndarray, o: float,
                           tok: Dict[str, Any], n_move: int = 1):
         """The FREE target of eq. (36)/(37) at one model step — what the law asks for before any
@@ -1071,12 +1221,14 @@ class TransformerMode(ModeController):
         return new
 
     def _hold_refine(self, plan_rows, steps: List[Dict[str, Any]], step: Dict[str, Any],
-                     sel: np.ndarray, xi_free: np.ndarray, tracks: List[int], budget: int):
+                     sel: np.ndarray, xi_free: np.ndarray, tracks: List[int], budget: int,
+                     bound: Optional[float] = None):
         """Short coordinate refinement of the step's END LEVELS so that the EXACT rows of the plan
         come as close as possible to the free target (d_xi on the block mean).  Only `tracks` are
         touched (the moving tracks plus the few loudest others), so the cost per step does not grow
         with the number of tracks.  Returns (best d2, evaluations, best levels)."""
         best_lv = np.asarray(step["levels"], dtype=np.float64).copy()
+        lv_ref0 = best_lv.copy()          # law 3: the attention profile the refinement may not leave
         xi_c, _p, _i = plan_rows(steps + [step], sel)
         best = float(self.analyzer.dist2(xi_c.mean(axis=0), xi_free))
         evals = 1
@@ -1089,6 +1241,9 @@ class TransformerMode(ModeController):
                         break
                     trial = best_lv.copy()
                     trial[int(i)] = float(np.clip(trial[int(i)] + sgn * d, 0.0, 1.0))
+                    if bound is not None:
+                        lo, hi = lv_ref0[int(i)] - float(bound), lv_ref0[int(i)] + float(bound)
+                        trial[int(i)] = float(np.clip(trial[int(i)], max(0.0, lo), min(1.0, hi)))
                     if abs(trial[int(i)] - best_lv[int(i)]) < 1e-9:
                         continue
                     st2 = dict(step)
@@ -1116,6 +1271,10 @@ class TransformerMode(ModeController):
         jumps_on = bool(rs["jumps_enabled"])
         njf = [int(x) for x in rs["next_jump_frame"]]
         goal_g = np.asarray(rs["goal_gains"], dtype=np.float64).reshape(-1)
+        # polyphony cap (docs/FIDELITY_CONTRACT.md): 0 = no limit and nothing below changes
+        cap = int(rs.get("max_active_materials", 0) or 0)
+        groups = np.asarray(rs.get("material_of_track") or list(range(self.M)), dtype=np.int64)
+        cap_log: List[Dict[str, Any]] = []
         centers = unit.centers[rows]
         lv = np.clip(np.asarray(rs["levels"], dtype=np.float64).reshape(-1).copy(), 0.0, 1.0)
         lv0 = lv.copy()
@@ -1173,7 +1332,9 @@ class TransformerMode(ModeController):
             rec: Dict[str, Any] = {"step": int(k), "frame": int(fk), "t_seconds": float(unit.seconds[r0]),
                                    "openness": o_k, "kind": "stay",
                                    "entropy": {h: float(att[h]["entropy"]) for h in self.heads}}
-            mv, prob = self._hold_moves(att, tok, pack, fk, pos_q, njf, plan_last, min_clip, jumps_on)
+            v3 = int(self.hold_law_version) >= 3
+            mv, prob = self._hold_moves(att, tok, pack, fk, pos_q, njf, plan_last, min_clip, jumps_on,
+                                        per_head_norm=v3)
             n_moves_seen += len(mv)
             if probe_pack is not None and hist_probe is None:
                 att_e = self._hold_attention(unit, r0, f_q, probe_pack, tok)
@@ -1192,15 +1353,17 @@ class TransformerMode(ModeController):
                                             "distributions over the same realizable moves built from the "
                                             "committed history and from an empty history, first model "
                                             "step of the first hold of the unit with history"}
-            # ---- openness gate: how often a move happens at all (o = 0 -> stay)
-            p_move = float(np.clip(o_k * self.hold_move_rate, 0.0, 1.0))
+            # ---- openness gate.  Laws 1/2: a step moves with probability clip(o * hold_move_rate).
+            # Law 3: no stochastic gate at all - the openness scales how FAR the levels move, so
+            # o = 0 stays by construction and the "stay" fraction is no longer 45-60 %.
+            p_move = 1.0 if v3 else float(np.clip(o_k * self.hold_move_rate, 0.0, 1.0))
             if bool(unit.hold_mask[r0]):
                 rec["stay_reason"] = "goal_hold"
-            elif p_move <= 0.0:
+            elif o_k <= 1e-9 or p_move <= 0.0:
                 rec["stay_reason"] = "openness_zero"
             elif not mv:
                 rec["stay_reason"] = "no_realizable_move"
-            elif float(self.rng.random()) >= p_move:
+            elif (not v3) and float(self.rng.random()) >= p_move:
                 rec["stay_reason"] = "openness_gate"
             elif int(self.hold_law_version) <= 1:
                 # ================= LAW VERSION 1: one token per step (previous behaviour) ========
@@ -1241,7 +1404,7 @@ class TransformerMode(ModeController):
                     "selection_probability": float(prob[ci]),
                     "candidates_evaluated": int(len(order)), "refinement_evaluations": 0,
                     "attention_alignment": float(align),
-                    "law_fidelity": (float(1.0 - d_step / d_stay) if d_stay > 1e-12 else None),
+                    "law_fidelity": (float(1.0 - d_step / d_stay) if d_stay > 1e-3 else None),
                     "free_target_magnitude_d_xi": float(free_mag),
                     "d2_step_to_free_target": float(d_step), "d2_stay_to_free_target": float(d_stay),
                     "exact_step_displacement_d_xi": float(dnorm),
@@ -1249,20 +1412,41 @@ class TransformerMode(ModeController):
                     "head_weights": {h: float(m["w"][h]) for h in self.heads},
                 })
             else:
-                # ================= LAW VERSION 2: the heads select on several tracks at once =====
-                # ---- the tracks that move: largest head-combined mass; how many scales with o
-                mass = self._hold_track_mass(att)
+                # ====== LAW VERSION 2 / 3: the heads select on several tracks at once ============
+                # law 3 normalises every head over the tracks BEFORE combining them, so that the mix
+                # you hear is the attention distribution and no head wins by its number of tokens
+                if v3:
+                    mass, mass_per_head, u_mass = self._hold_track_mass_normalised(att)
+                else:
+                    mass = self._hold_track_mass(att)
+                    mass_per_head, u_mass = None, None
                 n_move = int(np.clip(int(round(o_k * float(self.hold_tracks_max))), 1,
                                      max(1, min(int(self.hold_tracks_max), self.M - 1))))
                 by_tr: Dict[int, List[int]] = {}
                 for q, mm in enumerate(mv):
                     by_tr.setdefault(int(mm["track"]), []).append(q)
-                ranked = [i for i in sorted(range(1, self.M), key=lambda z: -float(mass[z])) if i in by_tr]
-                movers = ranked[:n_move]
-                # tracks the level refinement may touch: the movers plus the loudest few others
-                extra = [i for i in sorted(range(1, self.M), key=lambda z: -float(lv[z]))
-                         if i not in movers][: max(0, int(self.hold_refine_tracks))]
-                ref_tracks = list(movers) + extra
+                cap_on = bool(v3 and cap > 0)
+                cap_new_lv = None
+                if cap_on:
+                    # the K most attended MATERIALS are what you hear; everything else is silent, so
+                    # only those voices may take a token or a level evaluation (requirement 2/4)
+                    cap_new_lv, cap_voice, cap_mmass, cap_keep, cap_before, cap_after = \
+                        self._hold_cap_choice(mass, lv, groups, cap, o_k)
+                    allowed = [int(cap_voice[m_]) for m_ in cap_keep]
+                    # an ENTERING voice is a priority mover: it must take its selected fragment token
+                    # while it is still silent, so the splice is inaudible (requirement 2)
+                    entering = set(cap_after) - set(cap_before)
+                    ranked = [i for i in sorted(allowed, key=lambda z: (0 if int(groups[z]) in entering else 1,
+                                                                        -float(mass[z]))) if i in by_tr]
+                    movers = ranked[:n_move]
+                    ref_tracks = [i for i in allowed][: max(1, n_move + int(self.hold_refine_tracks))]
+                else:
+                    ranked = [i for i in sorted(range(1, self.M), key=lambda z: -float(mass[z])) if i in by_tr]
+                    movers = ranked[:n_move]
+                    # tracks the level refinement may touch: the movers plus the loudest few others
+                    extra = [i for i in sorted(range(1, self.M), key=lambda z: -float(lv[z]))
+                             if i not in movers][: max(0, int(self.hold_refine_tracks))]
+                    ref_tracks = list(movers) + extra
                 # ---- the free target of the law at this step (direction + explicit magnitude)
                 xi_free, free_mag = self._hold_free_target(xi_state, O_sel, o_k, tok, len(movers))
                 d_stay = float(an.dist2(xi_state, xi_free))
@@ -1285,8 +1469,9 @@ class TransformerMode(ModeController):
                 if int(self.hold_mix_candidates) > 0 and movers and free_mag > 0.0:
                     i0 = int(movers[0])
                     try:
+                        lv_ob = cap_new_lv if cap_on else lv
                         ob = an.mixture_band_energy([int(x) for x in pos_q],
-                                                    [float(x) for x in lv], skip=i0)
+                                                    [float(x) for x in lv_ob], skip=i0)
                         pmix = an.fragment_candidates_mix(
                             i0, xi_free[: 1 + int(an.nb)], ob, float(max(lv[i0], self.fg_gain)), 1,
                             exclude_near=int(pos_q[i0]), exclude_frames=int(an.solo_hop))
@@ -1302,7 +1487,13 @@ class TransformerMode(ModeController):
                     except Exception:  # noqa: BLE001
                         pass
                 # ---- evaluate each candidate's EXACT rows against the free target
-                base_lv = self._hold_levels_from_attention(mass, lv, o_k, movers)
+                if cap_on:
+                    base_lv = np.asarray(cap_new_lv, dtype=np.float64).copy()
+                elif v3:
+                    # LAW 3: the levels ARE the attention - a sharpened map of the normalised mass
+                    base_lv = self._hold_levels_v3(u_mass, lv, o_k)
+                else:
+                    base_lv = self._hold_levels_from_attention(mass, lv, o_k, movers)
                 base_lv[0] = float(lv_q[0])
                 keep_lv = np.asarray(lv, dtype=np.float64).copy()
                 keep_lv[0] = float(lv_q[0])
@@ -1310,10 +1501,11 @@ class TransformerMode(ModeController):
                 for ci_, cd in enumerate(cand_list):
                     jumps = {int(p["move"]["track"]): int(p["move"]["position"])
                              for p in cd["picks"] if bool(p["move"]["jump_ok"])}
-                    # two level starting points per candidate: the attention profile and the levels
-                    # the plan already has (the jump alone) - the refinement then starts from the
-                    # better of the two, so an overshooting profile cannot trap it
-                    starts_lv = [base_lv] if ci_ else [base_lv, keep_lv]
+                    # law 2: two level starting points per candidate (the attention profile and the
+                    # levels the plan already has), so an overshooting profile cannot trap the
+                    # refinement.  Law 3 starts only from the attention profile - "do nothing" is not
+                    # an alternative there, the level profile IS the law's statement.
+                    starts_lv = [base_lv] if (v3 or ci_) else [base_lv, keep_lv]
                     for lv_s in starts_lv:
                         st_ = {"frame": int(fk), "jumps": jumps, "levels": [float(x) for x in lv_s]}
                         xi_c, _pc, _ic = plan_rows(steps + [st_], sel)
@@ -1324,8 +1516,10 @@ class TransformerMode(ModeController):
                 d_step, cd, st_ = best
                 # ---- short level refinement through plan_rows toward the same free target
                 budget = max(1, int(self.hold_refine_evals))
-                d_ref, ev_ref, lv_ref = self._hold_refine(plan_rows, steps, st_, sel, xi_free,
-                                                          ref_tracks, budget)
+                # law 3: the refinement may only adjust the attention profile, not undo it
+                d_ref, ev_ref, lv_ref = self._hold_refine(
+                    plan_rows, steps, st_, sel, xi_free, ref_tracks, budget,
+                    bound=(2.0 * float(self.hold_refine_step) if v3 else None))
                 n_plan_rows += ev_ref
                 st_["levels"] = [float(x) for x in lv_ref]
                 d_step = min(d_step, d_ref)
@@ -1333,7 +1527,23 @@ class TransformerMode(ModeController):
                 n_plan_rows += 1
                 dxi = xi_c.mean(axis=0) - xi_state
                 align = self._wcos(dxi, O_sel)
-                fid = (1.0 - d_step / d_stay) if d_stay > 1e-12 else None
+                fid = (1.0 - d_step / d_stay) if d_stay > 1e-3 else None
+                # "what the heads attend to is what you hear": correlation over the MATERIAL tracks
+                # between the combined attention mass and the contribution vector c of the exact
+                # plan rows of this step (an.split(xi)[1], the part of xi after the d_phi features)
+                c_end = np.asarray(an.split(xi_c)[1], dtype=np.float64).mean(axis=0)
+                ac_corr = self._corr(mass[1:], c_end[1:])
+                # under the polyphony cap the decision is about MATERIALS, and the two voices of one
+                # material carry almost the same attention features: the honest figure sums the
+                # contributions of the voices and correlates them with the material mass
+                ac_corr_mat = None
+                mats_all = sorted({int(groups[i]) for i in range(1, self.M)})
+                if len(mats_all) < self.M - 1 or cap > 0:
+                    mm = np.array([max(float(mass[i]) for i in range(1, self.M) if int(groups[i]) == m_)
+                                   for m_ in mats_all], dtype=np.float64)
+                    cm = np.array([sum(float(c_end[i]) for i in range(1, self.M) if int(groups[i]) == m_)
+                                   for m_ in mats_all], dtype=np.float64)
+                    ac_corr_mat = self._corr(mm, cm)
                 steps.append(st_)
                 for i_, _p_ in st_["jumps"].items():
                     plan_last[int(i_)] = int(fk)
@@ -1356,6 +1566,16 @@ class TransformerMode(ModeController):
                     "refinement_evaluations": int(ev_ref),
                     "attention_alignment": float(align),
                     "law_fidelity": (float(fid) if fid is not None else None),
+                    "attention_contribution_corr": (float(ac_corr) if ac_corr is not None else None),
+                    "attention_contribution_corr_materials": (float(ac_corr_mat) if ac_corr_mat is not None
+                                                              else None),
+                    "attention_mass": [round(float(mass[z]), 5) for z in range(self.M)],
+                    "sounding_materials_before": ([int(x) for x in cap_before] if cap_on else None),
+                    "sounding_materials_after": ([int(x) for x in cap_after] if cap_on else None),
+                    "sounding_set_changed": (bool(set(cap_before) != set(cap_after)) if cap_on else None),
+                    "entering_materials": ([int(x) for x in sorted(set(cap_after) - set(cap_before))]
+                                           if cap_on else None),
+                    "contribution_c": [round(float(x), 4) for x in c_end],
                     "free_target_magnitude_d_xi": float(free_mag),
                     "d2_step_to_free_target": float(d_step), "d2_stay_to_free_target": float(d_stay),
                     "exact_step_displacement_d_xi": float(np.sqrt(max(0.0, float(
@@ -1371,6 +1591,12 @@ class TransformerMode(ModeController):
         # ---- publish: the EXACT rows of the plan over the whole held span ----------------------
         xi_plan, _pp, info = plan_rows(steps, rows)
         n_plan_rows += 1
+        # requirement 1: the published plan and the published rows must describe the same thing, so
+        # the step levels become the ones the engine actually used after the polyphony projection
+        used = info.get("levels_used") or []
+        for q_, s_ in enumerate(sorted(steps, key=lambda x: int(x["frame"]))):
+            if q_ < len(used) and used[q_] is not None:
+                s_["levels"] = [float(x) for x in used[q_]]
         xi_hat = self.mu_det.copy()
         xi_hat[rows] = xi_plan
         xi_hat = fix_hold_rows(unit, xi_hat)
@@ -1411,6 +1637,13 @@ class TransformerMode(ModeController):
             recurrent += int(hit_any)
         fids = [r["law_fidelity"] for r in moves if r.get("law_fidelity") is not None]
         aligns = [r["attention_alignment"] for r in moves if r.get("attention_alignment") is not None]
+        accs = [r["attention_contribution_corr"] for r in moves
+                if r.get("attention_contribution_corr") is not None]
+        accms = [r["attention_contribution_corr_materials"] for r in moves
+                 if r.get("attention_contribution_corr_materials") is not None]
+        snd = [r for r in moves if r.get("sounding_materials_after") is not None]
+        n_sound_end = (len(snd[-1]["sounding_materials_after"]) if snd else
+                       len({int(groups[i]) for i in range(1, self.M) if float(lv[i]) > 1e-9}))
         n_steps = max(1, len(log))
         att_mean = {h: {"A_mean": (A_sum[h] / max(1, len(ent[h]))) if h in A_sum else np.zeros((self.M, 1)),
                         "by_track": by_sum[h] / float(n_steps),
@@ -1428,6 +1661,15 @@ class TransformerMode(ModeController):
             "moving_tracks_per_step": (float(np.mean([r["n_moving_tracks"] for r in moves]))
                                        if moves else 0.0),
             "mean_law_fidelity": float(np.mean(fids)) if fids else None,
+            "median_law_fidelity": float(np.median(fids)) if fids else None,
+            "mean_attention_contribution_corr": float(np.mean(accs)) if accs else None,
+            "mean_attention_contribution_corr_materials": float(np.mean(accms)) if accms else None,
+            "law_version": int(self.hold_law_version),
+            "polyphony_cap": int(cap),
+            "sounding_set_changes": int(sum(1 for r in snd if r.get("sounding_set_changed"))),
+            "sounding_materials_at_hold_end": int(n_sound_end),
+            "sounding_materials_at_cap": bool(cap > 0 and n_sound_end >= cap),
+            "entering_materials": int(sum(len(r.get("entering_materials") or []) for r in snd)),
             "law_fidelity_positive_rate": (float(np.mean([1.0 if x > 0 else 0.0 for x in fids]))
                                            if fids else None),
             "mixture_candidate_steps": int(sum(1 for r in moves if r.get("mixture_candidate_used"))),
@@ -1593,6 +1835,14 @@ class TransformerMode(ModeController):
         self._unit_hold_align: List[float] = []
         self._unit_hold_fid: List[float] = []
         self._unit_hold_fid_pos = 0
+        self._unit_hold_acc: List[float] = []
+        self._unit_hold_accm: List[float] = []
+        self._unit_cap = 0
+        self._unit_cap_changes = 0
+        self._unit_cap_entering = 0
+        self._unit_cap_full = 0
+        self._unit_cap_counts: Dict[int, int] = {}
+        self._unit_cap_seconds = 0.0
         self._unit_hold_sel = 0
         self._unit_hold_recur_tok = 0
         self._unit_hold_ntracks: List[float] = []
@@ -1979,6 +2229,17 @@ class TransformerMode(ModeController):
                 if hp.get("mean_law_fidelity") is not None:
                     self._unit_hold_fid.append(float(hp["mean_law_fidelity"]))
                     self._unit_hold_fid_pos += int(1 if float(hp["mean_law_fidelity"]) > 0 else 0)
+                if hp.get("mean_attention_contribution_corr") is not None:
+                    self._unit_hold_acc.append(float(hp["mean_attention_contribution_corr"]))
+                if hp.get("mean_attention_contribution_corr_materials") is not None:
+                    self._unit_hold_accm.append(float(hp["mean_attention_contribution_corr_materials"]))
+                self._unit_cap = int(hp.get("polyphony_cap", 0) or 0)
+                self._unit_cap_changes += int(hp.get("sounding_set_changes", 0))
+                self._unit_cap_entering += int(hp.get("entering_materials", 0))
+                self._unit_cap_full += int(1 if hp.get("sounding_materials_at_cap") else 0)
+                nse = int(hp.get("sounding_materials_at_hold_end", 0))
+                self._unit_cap_counts[nse] = self._unit_cap_counts.get(nse, 0) + 1
+                self._unit_cap_seconds += float(hp.get("hold_seconds", 0.0))
                 self._unit_hold_sel += int(hp.get("selected_tokens", 0))
                 self._unit_hold_recur_tok += int(hp.get("recurrent_tokens", 0))
                 if hp.get("moving_tracks_per_step"):
@@ -2055,6 +2316,7 @@ class TransformerMode(ModeController):
                                "mean_step_displacement_d_xi": hp.get("mean_step_displacement_d_xi"),
                                "mean_attention_alignment": hp.get("mean_attention_alignment"),
                                "mean_law_fidelity": hp.get("mean_law_fidelity"),
+                               "mean_attention_contribution_corr": hp.get("mean_attention_contribution_corr"),
                                "moving_tracks_per_step": hp.get("moving_tracks_per_step"),
                                "selected_tokens": hp.get("selected_tokens"),
                                "recurrent_tokens": hp.get("recurrent_tokens"),
@@ -2222,7 +2484,31 @@ class TransformerMode(ModeController):
             # ---- law -> plan fidelity (FIDELITY_CONTRACT, Transformer A) -----------------------
             "mean_attention_alignment_of_chosen_step": (float(np.mean(self._unit_hold_align))
                                                         if self._unit_hold_align else None),
+            "law_version": int(self.hold_law_version),
             "mean_law_fidelity": float(np.mean(self._unit_hold_fid)) if self._unit_hold_fid else None,
+            "median_law_fidelity": float(np.median(self._unit_hold_fid)) if self._unit_hold_fid else None,
+            "mean_attention_contribution_corr": (float(np.mean(self._unit_hold_acc))
+                                                 if self._unit_hold_acc else None),
+            "mean_attention_contribution_corr_materials": (float(np.mean(self._unit_hold_accm))
+                                                           if self._unit_hold_accm else None),
+            "polyphony_cap": {
+                "max_active_materials": int(self._unit_cap),
+                "sounding_set_changes": int(self._unit_cap_changes),
+                "sounding_set_changes_per_minute": (60.0 * float(self._unit_cap_changes)
+                                                    / float(self._unit_cap_seconds)
+                                                    if self._unit_cap_seconds > 0 else None),
+                "materials_entering": int(self._unit_cap_entering),
+                "holds_at_the_cap": int(self._unit_cap_full),
+                "holds_at_the_cap_share": (float(self._unit_cap_full) / float(max(1, self._unit_holds))),
+                "holds_by_sounding_material_count": {str(k): int(v) for k, v in
+                                                     sorted(self._unit_cap_counts.items())},
+                "definition": "sounding materials at the END of each hold under the mode's own plan (the "
+                              "voices of one material count once); a 'change' is a hold step whose set of "
+                              "sounding materials differs from the one before it.  The engine's own "
+                              "hard_checks.polyphony_cap measures the rendered result",
+            } if self._unit_cap > 0 else None,
+            "median_attention_contribution_corr": (float(np.median(self._unit_hold_acc))
+                                                   if self._unit_hold_acc else None),
             "law_fidelity_positive_hold_rate": (float(self._unit_hold_fid_pos) / float(len(self._unit_hold_fid))
                                                 if self._unit_hold_fid else None),
             "mean_moving_tracks_per_step": (float(np.mean(self._unit_hold_ntracks))
@@ -2272,6 +2558,20 @@ class TransformerMode(ModeController):
                           "min-max normalised mass), then a short coordinate refinement through plan_rows "
                           "(hold_refine_evals evaluations, only the moving tracks and the hold_refine_tracks "
                           "loudest others) that minimises d_xi^2(exact block mean, free target)",
+                "attention_contribution_corr": "correlation over the MATERIAL tracks between the "
+                                               "head-combined attention mass and the contribution vector c "
+                                               "of the exact plan rows of the step (an.split(xi)[1], block "
+                                               "mean): 'what the heads attend to is what you hear'",
+                "law_version_3": "per-head normalised track mass (each head's by_track distribution over "
+                                 "the material tracks is divided by its own total before the signed alpha "
+                                 "combination, so the memory head cannot win by its number of key tokens); "
+                                 "the end level of every material track = u ** hold_level_sharpness with u "
+                                 "the min-max normalised combined mass (~0 for the least attended, ~1 for "
+                                 "the most attended), the openness scaling how far the levels travel "
+                                 "(o = 0 stays); no stochastic stay gate; jumps unchanged (the tracks with "
+                                 "the largest mass take their top / sampled token where the minimum clip "
+                                 "allows); the exact refinement may only adjust the profile within "
+                                 "+/- 2 * hold_refine_step",
                 "attention_alignment": "cosine in the d_xi metric between the EXACT displacement of the "
                                        "chosen step (block mean of its plan_rows minus the block mean of "
                                        "the plan state) and the head-combined value of eq. (36)",
@@ -2570,6 +2870,8 @@ class TransformerMode(ModeController):
                                "hold_refine_step": self.hold_refine_step,
                                "hold_refine_min_step": self.hold_refine_min,
                                "hold_mixture_candidates": int(self.hold_mix_candidates),
+                               "hold_level_sharpness": self.hold_level_sharpness,
+                               "hold_cap_hysteresis": self.hold_cap_hysteresis,
                                "hold_law_version": int(self.hold_law_version),
                                "probe_foreground_gain": self.fg_gain, "probe_background_gain": self.bg_gain},
                 "holds": self.hold_traces,

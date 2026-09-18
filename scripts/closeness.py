@@ -141,7 +141,8 @@ def diag(outdir, mode, n_random=400, seed=20260916):
                 p[:, i] = (int(rng.integers(0, Ls[i])) + (st - st[0])) % Ls[i]
             g = np.zeros((6, M))
             g[:, 0] = gains[rr, 0]
-            g[:, 1:] = rng.uniform(0.0, 1.0, M - 1)[None, :]
+            lv_r = np.concatenate([[0.0], rng.uniform(0.0, 1.0, M - 1)])
+            g[:, 1:] = an.cap_random_levels(lv_r, rng)[None, 1:]          # respects hires.max_active_materials
             _f, S_r, _c = an.material_features_at(p)
             G0r, Gbr = an.grams_at_positions(job.sources, st, p)
             xi_r, _ = an.composition_from_grams(g, G0r, Gbr, S_r)

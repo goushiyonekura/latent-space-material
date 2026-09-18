@@ -104,6 +104,11 @@ class VAEMode(ModeController):
         self.jump_min_dist = float(self.p.get("control_jump_min_pca_dist", 0.6))
         self.max_jumps = max(0, int(self.p.get("control_max_jumps_per_step", 3)))
         self.sigma_C_floor = float(self.p.get("control_sigma_floor", 0.30))
+        # --- polyphony cap (docs/FIDELITY_CONTRACT.md "Polyphony cap"); 0 = nothing changes
+        self.cap = int(getattr(analyzer, "max_active_materials", 0))
+        self.groups = np.asarray(getattr(analyzer, "material_of_track", np.arange(self.M)), dtype=np.int64)
+        self.mat_ids = sorted({int(x) for x in self.groups[1:]}) if self.M > 1 else []
+        self.cap_hysteresis = float(self.p.get("control_cap_hysteresis", 0.08))
         # control layout: [level of track 1..M-1 | r PCA coords of the fragment of track 1..M-1]
         self.n_ctrl_tracks = max(0, self.M - 1)
         self.d_u = self.n_ctrl_tracks * (1 + self.r_pca)
@@ -385,6 +390,14 @@ class VAEMode(ModeController):
         self._u_track_pairs: List[Tuple[np.ndarray, np.ndarray]] = []
         self._u_ctrl_tanh: List[np.ndarray] = []
         self._hold_open: Optional[Dict[str, Any]] = None
+        # --- polyphony cap: how often the sounding set changes, and how full it is
+        self._u_sound_counts: List[int] = []
+        self._u_swaps = 0
+        self._u_sound_steps = 0
+        self._u_committed_sound: List[int] = []
+        self._u_committed_swaps = 0
+        self._u_last_committed_set: Optional[frozenset] = None
+        self._u_commit_seconds = 0.0
         self._last_commit_z: Optional[np.ndarray] = None
         self._last_commit_xi: Optional[np.ndarray] = None
         self.latent_traces.append({"unit": unit.index, "mu_H_used": self.mu_H.tolist(),
@@ -560,6 +573,7 @@ class VAEMode(ModeController):
         lv_start = np.asarray(rs["levels"], dtype=np.float64)
         pos_start = np.asarray(rs["positions"], dtype=np.int64)
         next_jump = [int(x) for x in rs["next_jump_frame"]]
+        projector = rs.get("project_levels")
         centers_rows = np.asarray(unit.centers)[rows]
         free = unit.free_mask[rows]
         L_src = [int(x) for x in an.source_lengths]
@@ -591,37 +605,51 @@ class VAEMode(ModeController):
             z_target = z0
             for (f, blk) in blocks:
                 z_target = z[min(int(blk[-1]) + 1, len(rows) - 1)]     # the knot this block settles on
-                levels, frag, u_t = self._decode_controls(z_target)
+                levels, frag, u_t = self._decode_controls(z_target, prev_levels=lv_prev, project=projector)
                 levels[0] = lv_prev[0]
+                snd_prev = set(self._sounding_materials(lv_prev)) if self.cap > 0 else set()
+                snd_now = set(self._sounding_materials(levels)) if self.cap > 0 else set()
+                entering = snd_now - snd_prev
                 # fragment each track would play at f without a jump, in the same PCA coordinates
                 wants: List[Tuple[float, int]] = []
-                cur_coord: Dict[int, np.ndarray] = {}
+                enters: List[Tuple[float, int]] = []
                 for i in range(1, self.M):
+                    want_lvl += (float(u_t[i - 1]) - lv_prev[i]) ** 2      # before the [0,1] clip / cap
+                    got_lvl += (levels[i] - lv_prev[i]) ** 2
+                    if frag[i] < 0:                 # silent material: no fragment, nothing to splice
+                        continue
                     p = self._frag_pca(i)
                     p0, f0 = plan_pos[i]
                     k_now = an.fragment_index_at(i, int((p0 + (f - f0)) % max(1, L_src[i])))
-                    cur_coord[i] = p["coords"][k_now]
-                    d = float(np.sqrt(((p["coords"][frag[i]] - cur_coord[i]) ** 2).sum()))
+                    d = float(np.sqrt(((p["coords"][frag[i]] - p["coords"][k_now]) ** 2).sum()))
                     legal = (jumps_enabled and f >= next_jump[i] and f - plan_last_jump[i] >= min_clip)
-                    if d >= self.jump_min_dist:
+                    fresh = int(self.groups[i]) in entering and levels[i] > 1e-9
+                    if d >= self.jump_min_dist or fresh:
                         n_wanted += 1
                         if legal:
                             n_legal += 1
-                            wants.append((d, i))
+                            # an entering voice is still silent at f: its splice is inaudible, so it
+                            # is taken first and outside the per-step jump cap
+                            (enters if fresh else wants).append((d, i))
                     want_sum += d * d
-                    want_lvl += (float(u_t[i - 1]) - lv_prev[i]) ** 2      # before the [0,1] clip
-                    got_lvl += (levels[i] - lv_prev[i]) ** 2
                 wants.sort(key=lambda x: -x[0])
                 jumps: Dict[int, int] = {}
-                for (d, i) in wants[: self.max_jumps]:
+                for (d, i) in enters + wants[: self.max_jumps]:
                     p = self._frag_pca(i)
                     jumps[i] = int(p["pos"][frag[i]])
                     plan_pos[i] = (jumps[i], f)
                     plan_last_jump[i] = f
                     got_sum += d * d
                 steps.append({"frame": int(f), "jumps": jumps, "levels": levels.tolist()})
+                if self.cap > 0:
+                    self._u_sound_counts.append(len(snd_now))
+                    if snd_now != snd_prev:
+                        self._u_swaps += 1
+                    self._u_sound_steps += 1
                 step_logs.append({"frame": int(f), "jumps": {int(k_): int(v_) for k_, v_ in jumps.items()},
-                                  "tracks_wanting_a_jump": len(wants), "jumps_applied": len(jumps),
+                                  "tracks_wanting_a_jump": len(wants) + len(enters), "jumps_applied": len(jumps),
+                                  "entering_voices": len(enters),
+                                  "sounding_materials": (sorted(snd_now) if self.cap > 0 else None),
                                   "level_change_max": float(np.abs(levels[1:] - lv_prev[1:]).max()) if self.M > 1 else 0.0,
                                   "z": z_target.tolist()})
                 lv_prev = levels
@@ -629,6 +657,13 @@ class VAEMode(ModeController):
             xi_rows, _parts, info = plan_eval(steps, rows)
             xi_stay, _ps, _is = plan_eval([], rows)
             calls = 2
+            # the published plan must describe the published rows: take back the levels the engine
+            # actually used after its own polyphony projection (FIDELITY_CONTRACT cap item 1)
+            used = info.get("levels_used")
+            if used:
+                for s_, lu in zip(steps, used):
+                    if lu is not None:
+                        s_["levels"] = list(lu)
             hm = unit.hold_mask[rows]
             if hm.any():
                 xi_rows = np.array(xi_rows, copy=True)
@@ -747,14 +782,43 @@ class VAEMode(ModeController):
         return out
 
     def _controls(self, levels: Sequence[float], positions: Sequence[int]) -> np.ndarray:
-        """u = [level of every material track | r PCA coords of the fragment it plays]."""
+        """u = [level of every material track | r PCA coords of the fragment it plays].
+
+        Under the polyphony cap most tracks are silent and the fragment they happen to sit on is
+        inaudible; their coordinates would be pure noise in the basis, so they are reported as 0
+        ("the mean fragment").  Without a cap the vector is exactly what it was before."""
         an = self.analyzer
         u = np.zeros(self.d_u)
         for i in range(1, self.M):
             p = self._frag_pca(i)
             u[i - 1] = float(levels[i])
+            if self.cap > 0 and float(levels[i]) <= 1e-9:
+                continue                       # silent: fragment coordinates carry no information
             u[self._u_pca[i]] = p["coords"][an.fragment_index_at(i, int(positions[i]))]
         return u
+
+    # ---- polyphony cap helpers -------------------------------------------------------------
+    def _sounding_materials(self, levels: Sequence[float]) -> List[int]:
+        lv = np.asarray(levels, dtype=np.float64)
+        return [m for m in self.mat_ids if float(lv[self.groups == m].max(initial=0.0)) > 1e-9]
+
+    def _cap_levels(self, levels: np.ndarray, prev_levels: Optional[np.ndarray], project) -> np.ndarray:
+        """Keep the `cap` strongest materials, with a small hysteresis in favour of the ones that
+        are already sounding (`control_cap_hysteresis`): the top-K cut makes the latent -> sound map
+        discontinuous, and the bonus stops a marginal z change from swapping the sounding set.  The
+        engine's own `project_levels` is applied afterwards and then has nothing left to do."""
+        out = np.asarray(levels, dtype=np.float64).copy()
+        if self.cap > 0 and self.mat_ids:
+            strength = {m: float(out[self.groups == m].max(initial=0.0)) for m in self.mat_ids}
+            active = [m for m in self.mat_ids if strength[m] > 1e-9]
+            if len(active) > self.cap:
+                bonus = {m: 0.0 for m in self.mat_ids}
+                if prev_levels is not None and self.cap_hysteresis > 0.0:
+                    for m in self._sounding_materials(prev_levels):
+                        bonus[m] = self.cap_hysteresis
+                for m in sorted(active, key=lambda q: (-(strength[q] + bonus[q]), q))[self.cap:]:
+                    out[self.groups == m] = 0.0
+        return np.asarray(project(out), dtype=np.float64) if project is not None else out
 
     def _encode_controls(self, u: np.ndarray) -> np.ndarray:
         """z = atanh( Pᵀ (u − ū) / s ) in standardized control coordinates (eq. 34 analogue)."""
@@ -762,14 +826,21 @@ class VAEMode(ModeController):
         w = np.clip((self.P.T @ us) / self.s_c, -0.999, 0.999)
         return np.arctanh(w)
 
-    def _decode_controls(self, z: np.ndarray):
-        """u(z) = ū + P (s ⊙ tanh z) -> clipped levels + the nearest fragment of every track.
-        Every decoded point is a legal (levels, fragments) state: nothing is projected afterwards."""
+    def _decode_controls(self, z: np.ndarray, prev_levels: Optional[np.ndarray] = None, project=None):
+        """u(z) = ū + P (s ⊙ tanh z) -> clipped levels (projected onto the polyphony cap) + the
+        nearest fragment of every track that SOUNDS or ENTERS.  A silent material needs no fragment
+        (and no jump); an entering voice may jump to its decoded fragment while still silent, so the
+        splice is inaudible.  Every decoded point is a legal state: nothing is projected in xi."""
         u = self.u_mean + self.u_std * (self.P @ (self.s_c * np.tanh(np.asarray(z, dtype=np.float64))))
         levels = np.zeros(self.M)
-        frag = np.zeros(self.M, dtype=np.int64)
         for i in range(1, self.M):
             levels[i] = float(np.clip(u[i - 1], 0.0, 1.0))
+        if self.cap > 0:
+            levels = self._cap_levels(levels, prev_levels, project)
+        frag = np.full(self.M, -1, dtype=np.int64)
+        for i in range(1, self.M):
+            if self.cap > 0 and levels[i] <= 1e-9:
+                continue                       # silent: no fragment to choose, nothing to splice
             p = self._frag_pca(i)
             d = ((p["coords"] - u[self._u_pca[i]][None, :]) ** 2).sum(axis=1)
             d[~p["ok"]] += 1e6
@@ -782,7 +853,8 @@ class VAEMode(ModeController):
         an = self.analyzer
         st = history.mode_state.get("vae") if hasattr(history, "mode_state") else None
         cb = (st or {}).get("control_basis")
-        if cb and int(cb.get("d_u", -1)) == self.d_u and int(cb.get("k", -1)) == self.k_c:
+        if (cb and int(cb.get("d_u", -1)) == self.d_u and int(cb.get("k", -1)) == self.k_c
+                and int(cb.get("cap", 0)) == self.cap):
             self.P = np.array(cb["P"], dtype=np.float64)
             self.s_c = np.array(cb["s"], dtype=np.float64)
             self.u_mean = np.array(cb["u_mean"], dtype=np.float64)
@@ -834,9 +906,9 @@ class VAEMode(ModeController):
         lat = []
         for j, (lv, po) in enumerate(keep):
             z = self._encode_controls(U[n_fit + j])
-            lv_d, fr_d, _u = self._decode_controls(z)
-            pos_d = np.array([0] + [int(self._frag_pca(i)["pos"][fr_d[i]]) for i in range(1, self.M)],
-                             dtype=np.int64)
+            lv_d, fr_d, _u = self._decode_controls(z, prev_levels=lv, project=None)
+            pos_d = np.array([0] + [int(self._frag_pca(i)["pos"][fr_d[i]]) if fr_d[i] >= 0 else int(po[i])
+                                    for i in range(1, self.M)], dtype=np.int64)
             lv_d[0] = 0.0
             xi_d, _pp = an.fragment_composition(self.sources, pos_d, lv_d, offsets)
             num += float(an.dist2(xi_d.mean(axis=0)[None, :], XI[n_fit + j][None, :])[0])
@@ -850,6 +922,11 @@ class VAEMode(ModeController):
             "control_layout": {"levels": f"tracks 1..{self.M - 1}", "fragment_pca_axes_per_track": self.r_pca,
                                "control_dimension": int(self.d_u)},
             "k": int(k), "states_fit": n_fit, "states_holdout": n_test, "seed": int(seed),
+            "max_active_materials": int(self.cap),
+            "states_are_legal_under_the_cap": bool(self.cap > 0),
+            "mean_sounding_materials_in_the_fit_sample": (float(np.mean([len(self._sounding_materials(
+                np.concatenate([[0.0], Uf[j, : self.n_ctrl_tracks]]))) for j in range(min(400, n_fit))]))
+                if self.cap > 0 else None),
             "singular_values": sv[: min(len(sv), 8)].tolist(),
             "cross_covariance_share_captured_by_k": float((sv[:k] ** 2).sum() / max(1e-300, float((sv ** 2).sum()))),
             "holdout_composition_variance_explained_through_exact_decoder": var_expl,
@@ -1210,6 +1287,13 @@ class VAEMode(ModeController):
             self._u_ctrl_tanh.append(np.abs(np.tanh(z_ctrl)))
             if getattr(self, "_hold_open", None) is not None:
                 self._hold_open["z_last"] = z_ctrl.copy()
+            if self.cap > 0:                 # which materials the COMMITTED sound actually uses
+                snd = frozenset(self._sounding_materials(np.asarray(stats["levels"], dtype=np.float64)))
+                self._u_committed_sound.append(len(snd))
+                if self._u_last_committed_set is not None and snd != self._u_last_committed_set:
+                    self._u_committed_swaps += 1
+                self._u_last_committed_set = snd
+        self._u_commit_seconds += len(rows) * self.hop_s
         if held_mode:
             meta = reference.meta if reference is not None else {}
             hold_info = {"reference_age_steps": int(stats.get("reference_age_steps", 0)),
@@ -1236,7 +1320,8 @@ class VAEMode(ModeController):
             st["Sigma_C"] = self.Sigma_C.tolist()
             st["control_basis"] = {"P": self.P.tolist(), "s": self.s_c.tolist(), "u_mean": self.u_mean.tolist(),
                                    "u_std": self.u_std.tolist(), "loadings": self.loadings_c.tolist(),
-                                   "d_u": int(self.d_u), "k": int(self.k_c), "info": self.control_basis_info}
+                                   "d_u": int(self.d_u), "k": int(self.k_c), "cap": int(self.cap),
+                                   "info": self.control_basis_info}
         st["basis"] = {"V": self.V.tolist(), "U": self.U.tolist(), "s": self.s.tolist(),
                        "loadings": self.loadings.tolist(), "hash": self.basis_hash,
                        "z_mean": self.basis_z_mean.tolist(), "fragment": bool(self.frag),
@@ -1309,6 +1394,32 @@ class VAEMode(ModeController):
                 "jumps_planned": int(self._u_jumps_planned), "jumps_dropped_by_min_clip": int(self._u_jumps_dropped),
                 "note": "share of the decoded control change (levels before the [0,1] clip + fragment moves in "
                         "PCA units) that was legal to apply in the plan"}
+            if self.cap > 0:
+                sc = np.asarray(self._u_sound_counts)
+                cc = np.asarray(self._u_committed_sound)
+                mins = max(1e-9, self._u_commit_seconds / 60.0)
+                stats["polyphony_cap"] = {
+                    "max_active_materials": int(self.cap), "materials": len(self.mat_ids),
+                    "hysteresis": self.cap_hysteresis,
+                    "planned": {
+                        "steps": int(self._u_sound_steps),
+                        "sounding_set_changes": int(self._u_swaps),
+                        "swaps_per_minute": float(self._u_swaps / mins),
+                        "share_at_cap": (float((sc >= self.cap).mean()) if len(sc) else None),
+                        "share_below_cap": (float((sc < self.cap).mean()) if len(sc) else None),
+                        "share_of_steps_by_sounding_count": ({str(int(v)): float((sc == v).mean())
+                                                              for v in np.unique(sc)} if len(sc) else None)},
+                    "committed": {
+                        "commits": int(len(cc)),
+                        "sounding_set_changes": int(self._u_committed_swaps),
+                        "swaps_per_minute": float(self._u_committed_swaps / mins),
+                        "mean_sounding_materials": (float(cc.mean()) if len(cc) else None),
+                        "share_of_commits_by_sounding_count": ({str(int(v)): float((cc == v).mean())
+                                                                for v in np.unique(cc)} if len(cc) else None)},
+                    "note": "the top-K cut makes the latent -> sound map discontinuous; a small z change can "
+                            "swap which materials sound.  'planned' counts the decoder's own steps (internal, "
+                            "one per commit frame of a hold), 'committed' the realized sound; musical time is "
+                            "the committed seconds"}
             stats["control_latent"] = {
                 "k": int(self.k_c), "control_dimension": int(self.d_u),
                 "state_origin": self.control_state_origin,
@@ -1374,7 +1485,14 @@ class VAEMode(ModeController):
                                  "control_jump_min_pca_dist": self.jump_min_dist,
                                  "control_max_jumps_per_step": self.max_jumps,
                                  "control_sigma_floor": self.sigma_C_floor, "hold_move_scale": self.move_scale,
-                                 "control_seed_offset": self.control_seed_offset},
+                                 "control_seed_offset": self.control_seed_offset,
+                                 "control_cap_hysteresis": self.cap_hysteresis},
+                    "polyphony_cap": {"max_active_materials": int(self.cap),
+                                      "materials": len(self.mat_ids),
+                                      "material_of_track": self.groups.tolist(),
+                                      "basis_fitted_on_legal_states": bool(self.cap > 0),
+                                      "silent_fragment_coordinates": ("reported as 0 (the mean fragment) when the cap "
+                                                                      "is on" if self.cap > 0 else "not applicable")},
                     "basis": self.control_basis_info,
                     "state_origin": getattr(self, "control_state_origin", None)},
                 "hold_projection": {

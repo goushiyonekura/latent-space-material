@@ -119,6 +119,8 @@
     "reference_selection": "first",
     "reference_anchor": "block_mean",
     "voices_per_material": 2,
-    "explore_tracks_max": 3
+    "explore_tracks_max": 3,
+    "max_active_materials": 3,
+    "min_sounding_seconds": 2.0
   }
 }

@@ -104,3 +104,47 @@ python3 scripts/closeness.py dev/out/fid_real_<mode> --modes=<mode>
 Report: the fidelity figures before → after on the fixture AND on the real materials, achieved / cos,
 requested move vs flutter, plan_rows calls per hold, run times (also for the v2 / n10 fixtures when
 present), legacy check, new or changed keys, what is unfinished or doubtful.
+
+---
+
+## Polyphony cap — `hires.max_active_materials` (2026-09-17, user decision)
+
+The user will supply 8–12 materials and wants **at most K materials to sound at once** (K = 3 now, a
+parameter to be changed later; 0 = no limit).  Decisions: the two voices of one material count as ONE
+material; while the 0.25 s ramps cross-fade, outgoing and incoming materials may overlap (up to 2K
+sounding for a moment); jumps of a sounding track remain allowed.
+
+Engine (done): `project_levels(levels)` keeps the K materials with the largest level (max over their
+voices) and sets every voice of the others to 0.  It is applied to the levels of EVERY plan step inside
+`plan_rows` (the levels actually used come back in `info["levels_used"]`, one entry per step in frame
+order), to the future steps of the plan-aware lookahead and to the level hints; the realizer's own level
+search never exceeds the cap and tries swaps (one sounding material out, a silent one in).  A hard check
+counts sounding materials on a 50 ms grid outside ramps.  `Analyzer.random_fragment_composition` draws
+random LEGAL states (1..K sounding materials) when the cap is on — `an.cap_random_levels(levels, rng)`
+does the same for your own samplers (no cap: returns the levels unchanged and draws nothing).
+`unit.realizer_state` carries `max_active_materials`, `material_of_track` (track → id of its material =
+index of its first voice; the goal is 0) and `project_levels`.
+
+What every mode must do when `realizer_state["max_active_materials"]` > 0 (with 0 nothing may change):
+
+1. **Publish legal plans**: the `levels` of every step in `Target.meta["plan"]` are the projected ones (use
+   `project_levels`, or `info["levels_used"]` of your final `plan_rows` call) — the published rows and the
+   published plan must describe the same thing.
+2. **Let the law choose WHICH materials sound.**  The cap turns "who sounds" into the main decision.  A silent
+   material can only enter by replacing a sounding one, so your candidate moves need explicit SWAPS: material
+   a out (all its voices to 0), material b in on one voice at a chosen level — and the entering voice may
+   jump to the fragment you want while it is still silent (no audible splice; respect `next_jump_frame`).
+   Level moves / gradients on silent materials are meaningless: spend the evaluations on the ≤ K sounding
+   ones and on a bounded number of swap candidates (pre-rank the entering fragment with
+   `an.fragment_candidates_mix`, whose `others_band` must then be the band energy of the materials that stay).
+3. **Sample legal states**: every random state your law is calibrated on (anchors, bases, reference
+   windows, candidate plans) must respect the cap, otherwise the law asks for mixtures that cannot exist.
+4. Cost per hold stays roughly linear in the number of tracks and must not grow with the number of SILENT
+   materials more than a pre-ranking does.
+5. Record per unit: how often the sounding set changed (swaps per minute), the share of holds with K / fewer
+   than K sounding materials, and your usual fidelity figure next to the no-cap value.
+
+Verify with `dev/fixture_hold_cap2.json` (4 materials, K = 2), `dev/fixture_hold_v2_cap3.json` (4 × 2 voices,
+K = 3), `dev/fixture_hold_n10_cap3.json` (10 materials, K = 3; the case that matters), the usual
+`dev/fixture_hold.json` (no cap: must behave as before) and `python3 dev/compare_legacy.py <mode>`; read
+`hard_checks.polyphony_cap` in the trace (`observed_max_outside_ramps` ≤ K, the time shares per count).

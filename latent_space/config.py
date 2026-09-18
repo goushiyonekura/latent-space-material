@@ -119,7 +119,12 @@ DEFAULTS: Dict[str, Any] = {
                        # law version 2 (docs/FIDELITY_CONTRACT.md): denoising sweeps at decreasing temperature, fragments
                        # from mixture-aware pools first, then levels by the finite-difference Langevin drift
                        "hold_anneal_iterations": 3, "hold_anneal_ratio": 2.0, "hold_final_temperature": 0.4,
-                       "hold_tracks_per_step": 2, "hold_gradient_tracks": 4, "hold_mix_ranking": True},
+                       "hold_tracks_per_step": 2, "hold_gradient_tracks": 4, "hold_mix_ranking": True,
+                       # history term against repetition: visit density of the committed jumps per source (shared by the
+                       # voices of one material) penalises the fragment ranking and enters the chain as a novelty ridge
+                       "hold_repetition_weight": 0.06, "hold_repetition_width_seconds": 2.0,
+                       "hold_repetition_half_life_seconds": 60.0,
+                       "hold_swap_candidates": 2},        # polyphony cap: swap proposals (one material out, a silent one in) per hold
         "vae_latent_dim": 2,
         "vae": {"mu_H_init": 0.5, "sigma_H_init": 0.04, "K_F": 0.1, "ridge_epsilon": 1e-6,
                 "cov_floor": 1e-4, "probe_goal_gain": 0.1, "probe_in_gain": 0.7,
@@ -140,7 +145,8 @@ DEFAULTS: Dict[str, Any] = {
                 # k PLS axes against the exact compositions, decoder -> clipped levels + nearest fragment -> plan_rows
                 "control_latent_dim": 6, "control_fragment_pca": 2, "control_basis_states": 1500,
                 "control_holdout_states": 200, "control_basis_offsets": 3, "control_seed_offset": 5521,
-                "control_jump_min_pca_dist": 0.6, "control_max_jumps_per_step": 3, "control_sigma_floor": 0.30},
+                "control_jump_min_pca_dist": 0.6, "control_max_jumps_per_step": 3, "control_sigma_floor": 0.30,
+                "control_cap_hysteresis": 0.08},    # polyphony cap: decoder-side bonus for the materials that already sound
         "transformer_heads": ["similarity", "contrast", "memory"],
         "transformer": {"sigma_F": 1.0, "tau_H_seconds": 180.0, "alpha_s": 0.25, "alpha_c": 0.25,
                          "alpha_m": 0.25, "alpha_G": 1.0, "cov_diag_floor": 1e-4,
@@ -161,7 +167,10 @@ DEFAULTS: Dict[str, Any] = {
                          "hold_background_scale": 1.0, "hold_temperature": 0.5, "hold_candidates": 3,
                          "hold_selection": "sample",   # 'sample' | 'top'
                          "hold_max_proposals": 2,
-                         "hold_law_version": 2,        # 1 = one token per step (hold v1) | 2 = multi-track selection
+                         # 1 = one token per step (hold v1) | 2 = multi-track selection toward the free target (fid v1) |
+                         # 3 = "what the heads attend to is what you hear": levels = sharpened attention mass per track
+                         "hold_law_version": 3, "hold_level_sharpness": 3.0,
+                         "hold_cap_hysteresis": 0.25,  # polyphony cap: how strongly a sounding material keeps its place in the top-K
                          # law version 2 (docs/FIDELITY_CONTRACT.md): several tracks move per step, levels refined
                          # through plan_rows toward the free head-combined target of eq. (36)/(37)
                          "hold_tracks_max": 3, "hold_refine_evals": 10, "hold_refine_tracks": 2,
@@ -195,7 +204,11 @@ DEFAULTS: Dict[str, Any] = {
                 # positives drawn near the sound (current / committed / mixture candidates +- offset), a non-saturating
                 # generator reward (clipped logit of D on the published plan rows), stronger l2 on the hold discriminator
                 "hold_real_near_share": 0.8, "hold_real_offset_seconds": 4.0, "hold_logit_clip": 6.0,
-                "hold_d_l2": 1e-3, "hold_lr_G_scale": 20.0},
+                "hold_d_l2": 1e-3, "hold_lr_G_scale": 20.0,
+                # polyphony cap: a fifth origin class "swap" is active when hires.max_active_materials > 0; share of real
+                # windows whose sounding set is redrawn; the feature scales of the hold discriminator stay provisional
+                # until this share of the features actually varies (the piece starts from silence)
+                "hold_real_cap_redraw": 0.5, "hold_psi_scale_min_var": 0.25},
     },
     "history": {"enabled": True, "update_rate": 0.10, "recent_event_capacity": 16,
                 "parent_capacity": 8, "cov_regularization": 1e-6,
@@ -258,6 +271,18 @@ DEFAULTS: Dict[str, Any] = {
         # hold mode with many tracks: number of tracks on which the realizer tries its OWN jump candidates per
         # commit (the tracks named by the mode's plan step are always examined); 0 = all tracks
         "explore_tracks_max": 0,
+        # polyphony cap (user decision 2026-09-17): at most this many MATERIALS sound at once (the voices of one
+        # material count once); 0 = no limit.  It holds for the end levels of every commit step; while the 0.25 s
+        # ramps cross-fade, outgoing and incoming materials overlap (up to twice the cap) - allowed by the user.
+        "max_active_materials": 0,
+        "cap_swap_candidates": 2,           # silent materials the realizer tries to swap in per commit (own exploration)
+        # a sounding material keeps its place unless a silent one exceeds it by this level margin (0 = the K loudest
+        # always win; larger = a calmer cast).  Applied step by step along a plan and at every commit.
+        "cap_hysteresis": 0.0,
+        # a material that starts to sound keeps sounding at least this long before it may be silenced (the audible
+        # counterpart of min_clip_seconds: no material appears for half a second and vanishes); 0 = off.  The goal
+        # rise at the end of CONTRACT silences everything regardless (form rule).
+        "min_sounding_seconds": 0.0,
     },
     "numerics": {"gain_bound_tolerance": 1e-9, "motion_relative_margin": 1e-6,
                  "db_rate_subintervals": 128},
@@ -412,6 +437,8 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ValueError("hires.reference_hold_seconds must be >= 0")
     if hz.get("reference_selection", "hold_fit") not in ("hold_fit", "first"):
         raise ValueError("hires.reference_selection must be 'hold_fit' or 'first'")
+    if int(hz.get("max_active_materials", 0)) < 0:
+        raise ValueError("hires.max_active_materials must be >= 0 (0 = no limit)")
     if not (1 <= int(hz.get("voices_per_material", 1)) <= 3):
         raise ValueError("hires.voices_per_material must be 1, 2 or 3")
     if hz.get("reference_anchor", "last_row") not in ("last_row", "block_mean"):

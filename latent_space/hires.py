@@ -55,6 +55,7 @@ class HiresState:
         self.clips: List[List[Clip]] = [[] for _ in range(M)]
         self.last_jump = [start] * M
         self.level = np.zeros(M)
+        self.entered_at: Dict[int, int] = {}       # material id -> frame at which it last started to sound
 
     def curve(self, i: int) -> TrackCurve:
         return TrackCurve(list(self.segments[i]), [], list(self.clips[i]))
@@ -91,6 +92,60 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     anchor_kind = str(hz.get("reference_anchor", "last_row")) if hold_on else "last_row"
     plan_aware = bool(hz.get("plan_aware_lookahead", True))
     explore_max = int(hz.get("explore_tracks_max", 0))
+    cap = int(hz.get("max_active_materials", 0))                       # 0 = no polyphony limit
+    n_swap = max(0, int(hz.get("cap_swap_candidates", 2)))
+    cap_hyst = max(0.0, float(hz.get("cap_hysteresis", 0.0)))
+    dwell = int(round(max(0.0, float(hz.get("min_sounding_seconds", 0.0))) * fs))
+    groups = np.asarray(getattr(job, "voice_of", list(range(unit.M))), dtype=np.int64)   # track -> its material
+    mat_ids = sorted({int(x) for x in groups[1:]})
+
+    def material_strength(lv: np.ndarray) -> Dict[int, float]:
+        return {m_: float(np.max(lv[groups == m_])) for m_ in mat_ids}
+
+    def locked_materials(frame, entered) -> set:
+        """Materials that started to sound less than min_sounding_seconds before `frame`."""
+        if dwell <= 0 or frame is None or not entered:
+            return set()
+        return {int(m_) for m_, f_ in entered.items() if int(frame) - int(f_) < dwell}
+
+    def advance_entries(entered: Dict[int, int], before, after, frame: int) -> Dict[int, int]:
+        """Entry frames after the levels go from `before` to `after` at `frame`."""
+        out_e = dict(entered)
+        sb_, sa_ = material_strength(np.asarray(before, dtype=np.float64)), material_strength(np.asarray(after, dtype=np.float64))
+        for m_ in mat_ids:
+            if sa_[m_] > 1e-9 and sb_[m_] <= 1e-9:
+                out_e[m_] = int(frame)
+            elif sa_[m_] <= 1e-9:
+                out_e.pop(m_, None)
+        return out_e
+
+    def project_levels(lv, prev=None, frame=None, entered=None) -> np.ndarray:
+        """Polyphony cap: at most `cap` materials keep a non-zero level (the voices of one material
+        count once); the materials with the largest level stay, the others go to 0.  With `prev`
+        (the levels before this step) a material that already sounds is ranked `cap_hysteresis`
+        higher, so the cast only changes when a newcomer clearly exceeds it; with `frame` and
+        `entered` a material inside its minimum sounding time can neither be dropped nor silenced
+        by the proposal (it keeps its previous level)."""
+        out = np.asarray(lv, dtype=np.float64).copy()
+        locked = locked_materials(frame, entered)
+        if locked and prev is not None:
+            pv = np.asarray(prev, dtype=np.float64)
+            for m_ in locked:
+                if float(np.max(out[groups == m_])) <= 1e-9:
+                    out[groups == m_] = pv[groups == m_]
+        if cap <= 0:
+            return out
+        st_ = material_strength(out)
+        active = [m_ for m_ in mat_ids if st_[m_] > 1e-9]
+        if len(active) > cap:
+            bonus = {m_: 0.0 for m_ in mat_ids}
+            if prev is not None and cap_hyst > 0.0:
+                sp_ = material_strength(np.asarray(prev, dtype=np.float64))
+                bonus = {m_: (cap_hyst if sp_[m_] > 1e-9 else 0.0) for m_ in mat_ids}
+            order = sorted(active, key=lambda q: (0 if q in locked else 1, -(st_[q] + bonus[q]), q))
+            for m_ in order[cap:]:
+                out[groups == m_] = 0.0
+        return out
     ge = cfg["form"]["goal_exposure"]
     goal_free = ge["policy"] == "free"
     open_cap = float(ge["open_max"]) if not goal_free else 1.0
@@ -185,6 +240,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         last = list(state.last_jump)
         extra: List[List[Clip]] = [[] for _ in range(M)]
         dropped: List[Tuple[int, int]] = []
+        levels_used: List[Any] = []            # per step (frame order): the levels after the polyphony cap
+        entered_sim = dict(state.entered_at)
         lv = np.asarray(level_now, dtype=np.float64).copy()
         g = np.repeat(lv[None, :], len(rws), axis=0)
         for s_ in sorted(steps, key=lambda x: int(x["frame"])):
@@ -197,12 +254,16 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 extra[i_].append(Clip(f0, int(p_)))
                 last[i_] = f0
             if s_.get("levels") is not None:
-                end = np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0)
+                end = project_levels(np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0), lv, f0, entered_sim)
+                entered_sim = advance_entries(entered_sim, lv, end, f0)
+                levels_used.append(end.tolist())
                 m_ = c >= f0
                 sr = np.clip((c[m_] - f0) / float(ramp), 0.0, 1.0)
                 q = sr * sr * sr * (10.0 + sr * (-15.0 + 6.0 * sr))
                 g[m_] = lv[None, :] + (end - lv)[None, :] * q[:, None]
                 lv = end
+            else:
+                levels_used.append(None)
         g[:, 0] = goal_curve.values(c)
         pos = np.zeros((len(rws), M), dtype=np.int64)
         for i_ in range(M):
@@ -211,7 +272,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         _fp, S_p, _cp = an.material_features_at(pos)
         G0p, Gbp = an.grams_at_positions(sources, starts_all[rws], pos)
         xi_p, parts_p = an.composition_from_grams(g, G0p, Gbp, S_p, prev_ratios=prev_for(rws))
-        return xi_p, parts_p, {"dropped_jumps": dropped, "gains": g, "positions": pos}
+        return xi_p, parts_p, {"dropped_jumps": dropped, "gains": g, "positions": pos, "levels_used": levels_used}
 
     # ---- plan-aware lookahead (hold mode): a candidate is "this choice now, then the rest of the mode's
     # plan", not "this choice held for the whole window" - otherwise a plan that changes levels at every
@@ -241,10 +302,14 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             return g
         c = centers[rws]
         prev = np.asarray(levels_end, dtype=np.float64)
+        entered_sim = advance_entries(state.entered_at, level_now, prev, t_now) if dwell > 0 else {}
         for s_ in future:
             if s_.get("levels") is None:
                 continue
-            end = np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0)
+            end = project_levels(np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0), prev,
+                                 int(s_["frame"]), entered_sim)
+            if dwell > 0:
+                entered_sim = advance_entries(entered_sim, prev, end, int(s_["frame"]))
             m_ = c >= int(s_["frame"])
             if m_.any():
                 sr = np.clip((c[m_] - int(s_["frame"])) / float(ramp), 0.0, 1.0)
@@ -302,6 +367,9 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                     "commit_frames": int(commit), "ramp_frames": int(ramp), "hold_frames": int(hold),
                     "min_clip_frames": int(min_clip), "lookahead_frames": int(look), "search_end_frame": int(search_end),
                     "goal_gains": goal_curve.values(centers[rows_ref]),
+                    "max_active_materials": int(cap), "material_of_track": groups.tolist(),
+                    "project_levels": project_levels,
+                    "min_sounding_frames": int(dwell), "entered_at": dict(state.entered_at),
                     "plan_rows": (lambda steps, rws=None, _lv=lv_now, _rr=rows_ref:
                                   plan_rows(steps, _rr if rws is None else rws, _lv)),
                 }
@@ -415,7 +483,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 for i_, p_ in (s_.get("jumps") or {}).items():
                     held["pending"][int(i_)] = (int(t), int(p_))
                 if s_.get("levels") is not None:
-                    hint_levels = np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0)
+                    hint_levels = project_levels(np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0), level,
+                                                 int(t), state.entered_at)
             if bool(hz["position_jumps"]):
                 for i_, (f0_, p0_) in list(held["pending"].items()):
                     if i_ in mat and t - state.last_jump[i_] >= min_clip:
@@ -460,6 +529,12 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         if hint_jumps and hint_jumps not in combos:
             combos.append(dict(hint_jumps))        # the mode's whole plan step is always examined
         # ---- level search on each surviving combination (full window rows)
+        locked_now = locked_materials(t, state.entered_at)
+        swap_in: List[int] = []
+        if cap > 0 and n_swap > 0:
+            silent = [m_ for m_ in mat_ids if float(np.max(level[groups == m_])) <= 1e-9]
+            if silent:
+                swap_in = [int(x) for x in rng.choice(silent, size=min(n_swap, len(silent)), replace=False)]
         best = None
         for jumps in combos:
             if jumps:
@@ -485,12 +560,40 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             step = level_step
             for _sweep in range(max_sweeps):
                 improved = False
+                if cap > 0:
+                    # polyphony cap: a silent material can only come in by replacing a sounding one
+                    st_now = material_strength(lv)
+                    on = [m_ for m_ in mat_ids if st_now[m_] > 1e-9]
+                    if len(on) >= cap and swap_in:
+                        for m_out in on:
+                            if m_out in locked_now:
+                                continue                                   # inside its minimum sounding time
+                            for m_in in swap_in:
+                                if st_now[m_in] > 1e-9:
+                                    continue
+                                trial = lv.copy()
+                                trial[groups == m_out] = 0.0
+                                trial[int(m_in)] = st_now[m_out]          # first voice of the entering material
+                                g = gains_plan(trial, t, rows, level, future)
+                                xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
+                                ev = J_of(xi_t, parts_t, ref, rows)
+                                evals += 1
+                                if ev["J"] < cur_ev["J"] - 1e-6:
+                                    cur_ev, lv, xi_w, parts_w = ev, trial, xi_t, parts_t
+                                    improved = True
+                                    st_now = material_strength(lv)
                 for i in mat:
                     for sign in (1.0, -1.0):
                         trial = lv.copy()
                         trial[i] = float(np.clip(trial[i] + sign * step, 0.0, 1.0))
                         if abs(trial[i] - lv[i]) < 1e-9:
                             continue
+                        if cap > 0 or locked_now:
+                            st_tr = material_strength(trial)
+                            if cap > 0 and sum(1 for m_ in mat_ids if st_tr[m_] > 1e-9) > cap:
+                                continue                                   # would exceed the cap: swaps handle entries
+                            if any(st_tr[m_] <= 1e-9 for m_ in locked_now):
+                                continue                                   # a material inside its minimum sounding time
                         g = gains_plan(trial, t, rows, level, future)
                         xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
                         ev = J_of(xi_t, parts_t, ref, rows)
@@ -577,6 +680,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                           "mode_observe": mstat})
         if hold_on:
             taken = {int(i_): int(p_) for i_, p_ in jumps.items() if hint_jumps.get(i_) == p_}
+            if cap > 0:
+                step_logs[-1]["active_materials"] = int(sum(1 for v_ in material_strength(lv_best).values() if v_ > 1e-9))
             step_logs[-1].update({"reference_is_new": bool(new_ref), "reference_age_steps": int(held["age"]),
                                   "plan_future_steps_assumed": int(len(future)),
                                   "plan_hint": {"jumps": {int(k): int(v) for k, v in hint_jumps.items()},
@@ -585,6 +690,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                                                                             if hint_levels is not None else None)}})
             for i_ in jumps:
                 held["pending"].pop(int(i_), None)
+        state.entered_at = advance_entries(state.entered_at, level, lv_best, int(t))
         level = lv_best.copy()
         level[0] = float(goal_curve.values(np.array([c_end - 1]))[0]) if c_end > unit.start else level[0]
         t = c_end
@@ -599,6 +705,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             if unit.end > t1:
                 state.segments[i].append(Segment("HOLD", t1, unit.end, 0.0, 0.0, "GOAL_HOLD"))
             level[i] = 0.0
+        state.entered_at = {}                      # the goal rise silences every material (form rule)
     else:
         for i in mat:
             a = float(level[i])

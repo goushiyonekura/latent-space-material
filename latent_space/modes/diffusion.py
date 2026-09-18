@@ -245,6 +245,12 @@ _HOLD_DRIFT_LVL = 0.35
 _HOLD_T0 = 0.30
 # holds in which the whole hold could win less than this much field energy carry no fidelity figure
 _HOLD_FID_MIN_SPAN = 5e-3
+# the visit density enters the fragment PRE-RANKING (a squared-feature distance, much smaller
+# than the field energy) scaled by this factor times hold_repetition_weight, and the candidate
+# energy (the novelty ridge) by hold_repetition_weight alone.  At most this many visits per
+# source are kept (the oldest are also faded out by the half life).
+_HOLD_REP_RANK = 4.0
+_HOLD_REP_MEMORY = 96
 
 
 # ---------------------------------------------------------------------------- field parameters
@@ -469,6 +475,22 @@ class DiffusionMode(ModeController):
         # temperature of the LAST annealing sweep as a fraction of T(o) (> 0: the chain stays
         # thermal; the hot sweeps are this times hold_anneal_ratio^(n-1-m))
         self.hold_final_temperature = max(1e-3, float(p.get("hold_final_temperature", 0.4)))
+        # history term against REPETITION (user item, 2026-09-17).  The mixture-aware ranking keeps
+        # landing on the same fragments (measured: 959 jumps in 405 distinct 2 s cells of the
+        # sources, ratio 0.42).  The committed source positions are therefore remembered PER SOURCE
+        # (tracks that share a source -- the second voices -- share the memory) and enter the law
+        # twice: as a ranking penalty of the fragment pool and as a small "novelty ridge" energy of
+        # a candidate jump inside the chain, so the thermal choice feels it too.  The ridge is NOT
+        # part of E_D: the committed-vs-random field-energy statistic stays the pure field.
+        self.hold_repetition_weight = max(0.0, float(p.get("hold_repetition_weight", 0.06)))
+        self.hold_repetition_width_seconds = max(0.05, float(p.get("hold_repetition_width_seconds", 2.0)))
+        self.hold_repetition_half_life_seconds = max(0.1, float(p.get("hold_repetition_half_life_seconds", 60.0)))
+        # polyphony cap (docs/FIDELITY_CONTRACT.md, "Polyphony cap"): how many SWAP candidates
+        # (one sounding material out, a silent one in) the chain proposes per frame visit
+        self.hold_swap_candidates = max(0, int(p.get("hold_swap_candidates", 2)))
+        self._visits: Dict[int, List[Tuple[int, float]]] = {}   # source group -> [(position, seconds)]
+        self._src_group: Dict[int, int] = {}
+        self.rep_stats: List[Dict[str, Any]] = []
         # 1 = the single-pass chain of docs/HOLD_CONTRACT.md (kept so the earlier outputs stay
         # reproducible in behaviour), 2 = the annealed coarse-to-fine generation
         self.hold_law_version = int(p.get("hold_law_version", 2))
@@ -973,6 +995,43 @@ class DiffusionMode(ModeController):
                            P.d[sel], P.beta, np.stack([P.ti, P.tj, P.tl], axis=1), P.o[sel],
                            P.xi_goal[sel], P.W, ev, P.lam_phi, P.lam_2, P.lam_3, P.lam_G, P.eps_D)
 
+    def _source_group(self, track: int) -> int:
+        """Tracks that play the SAME source (a material's second voice) share one visit memory:
+        the analyzer hands them the same fragment bank object (`an.frag_f[i] is an.frag_f[j]`)."""
+        g = self._src_group.get(int(track))
+        if g is not None:
+            return g
+        g = int(track)
+        ff = getattr(self.analyzer, "frag_f", None)
+        if ff is not None and int(track) < len(ff):
+            for j in range(len(ff)):
+                if ff[j] is ff[int(track)]:
+                    g = int(j)
+                    break
+        self._src_group[int(track)] = g
+        return g
+
+    def _visit_density(self, track: int, now_seconds: float, cache: Dict[int, Any]) -> Optional[np.ndarray]:
+        """Visit density (P_i,) of the track's source: a triangular bump of
+        `hold_repetition_width_seconds` around every committed position, faded with the age of the
+        visit (half life `hold_repetition_half_life_seconds` of MUSICAL time).  One array per source
+        group and per hold (the memory does not change while a reference is being built)."""
+        if self.hold_repetition_weight <= 0.0:
+            return None
+        g = self._source_group(track)
+        if g in cache:
+            return cache[g]
+        v = self._visits.get(g)
+        if not v or not hasattr(self.analyzer, "fragment_visit_penalty"):
+            cache[g] = None
+            return None
+        pos = [int(x[0]) for x in v]
+        ages = [max(0.0, float(now_seconds) - float(x[1])) for x in v]
+        cache[g] = self.analyzer.fragment_visit_penalty(
+            int(track), pos, width_seconds=self.hold_repetition_width_seconds, weight=1.0,
+            ages=ages, half_life=self.hold_repetition_half_life_seconds)
+        return cache[g]
+
     def _hold_commit_frames(self, rs: Dict[str, Any], centers: np.ndarray) -> List[int]:
         """The commit frames of one hold: frame + k * commit_frames, k = 0 .. hold/commit - 1,
         truncated at the search end and at the last prepared row."""
@@ -1322,9 +1381,28 @@ class DiffusionMode(ModeController):
                 s_["jumps"] = {i: p for i, p in s_["jumps"].items()
                                if (int(s_["frame"]), int(i)) not in drop}
             xi_p, _parts, info = prows(steps, idx)
-        plan = [{"frame": int(s_["frame"]), "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
-                 "levels": [float(v) for v in np.asarray(s_["levels"], dtype=np.float64)]}
-                for s_ in steps]
+        # the published plan must describe the same thing as the published rows: with the polyphony
+        # cap on, that is the PROJECTED levels the engine actually used (info["levels_used"], one
+        # entry per step in frame order)
+        used = list(info.get("levels_used") or [])
+        plan = []
+        for n_, s_ in enumerate(sorted(steps, key=lambda x: int(x["frame"]))):
+            lv_pub = (np.asarray(used[n_], dtype=np.float64)
+                      if (n_ < len(used) and used[n_] is not None)
+                      else np.asarray(s_["levels"], dtype=np.float64))
+            plan.append({"frame": int(s_["frame"]),
+                         "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
+                         "levels": [float(v) for v in lv_pub]})
+        final_sound = [int(x) for x in sounding(np.asarray(plan[-1]["levels"], dtype=np.float64))] if plan else []
+        # how often the sounding set changes in the PUBLISHED plan (musical time), as opposed to
+        # `swap_acceptances`, which counts accepted swap proposals during the search (internal)
+        plan_swaps = 0
+        prev_set = set(sounding(lv0))
+        for s_ in plan:
+            cur_set = set(sounding(np.asarray(s_["levels"], dtype=np.float64)))
+            if cur_set != prev_set:
+                plan_swaps += 1
+            prev_set = cur_set
         return {"plan": plan, "steps": steps, "xi": xi_p, "path": path, "evaluations": int(evals),
                 "chain": int(chain), "moves": int(moves), "lower_than_stay": int(lower),
                 "drift_informed": int(drift_informed),
@@ -1373,6 +1451,24 @@ class DiffusionMode(ModeController):
         M = unit.M
         mats = list(range(1, M))
         lv0 = np.asarray(rs["levels"], dtype=np.float64)
+        # ---- polyphony cap: at most `cap` MATERIALS may sound at once (the voices of one material
+        # count once).  With the cap on, "which materials sound" is the main decision: level moves
+        # and the finite-difference gradient are spent on the sounding materials only, and a silent
+        # material can enter only through an explicit SWAP candidate (it cannot creep in with a
+        # small level step -- the projection would remove it again).
+        cap = int(rs.get("max_active_materials", 0) or 0)
+        project = rs.get("project_levels")
+        groups = np.asarray(rs.get("material_of_track") or list(range(M)), dtype=np.int64)
+        mat_ids = sorted({int(groups[i]) for i in mats})
+        voices = {m_: [int(i) for i in mats if int(groups[i]) == m_] for m_ in mat_ids}
+        cap_on = cap > 0 and callable(project) and len(mat_ids) > cap
+
+        def strengths(lv) -> Dict[int, float]:
+            return {m_: float(np.max(np.asarray(lv)[voices[m_]])) for m_ in mat_ids}
+
+        def sounding(lv) -> List[int]:
+            st_ = strengths(lv)
+            return [m_ for m_ in mat_ids if st_[m_] > 1e-9]
         njf = [int(x) for x in rs["next_jump_frame"]]
         jumps_on = (bool(rs.get("jumps_enabled", False)) and self.hold_jump_candidates > 0
                     and getattr(self, "sources", None) is not None)
@@ -1393,6 +1489,10 @@ class DiffusionMode(ModeController):
             for k_ in range(K):
                 nl = lv.copy()
                 nl[1:] = np.clip(lv[1:] + deltas[k_][1:], 0.0, 1.0)
+                if cap_on:
+                    # the projection the engine applies inside plan_rows is part of the state: a
+                    # material the cap removes is really silent for the rest of the plan
+                    nl = np.asarray(project(nl), dtype=np.float64)
                 out.append({"frame": int(frames[k_]), "jumps": dict(jumps[k_]), "levels": nl})
                 lv = nl
             return out
@@ -1417,12 +1517,21 @@ class DiffusionMode(ModeController):
         rws_h = idx[sel_h]
         e_stay_hold, _xs, _is = ev(build(), rws_h, P_h)       # the plan that changes nothing
         e_best_seen = float(e_stay_hold)
+        # visit density of every source, computed once per hold (the committed history does not
+        # move while a reference is built) -- the history term against repetition
+        rep_cache: Dict[int, Any] = {}
+        now_s = float(unit.seconds[idx[0]])
+        lam_rep = float(self.hold_repetition_weight)
+        rep_chosen: List[float] = []
+        rep_flips = 0
 
         n_iter = max(1, self.hold_anneal_iterations)
         path: List[Dict[str, Any]] = []
         eps_run = np.zeros(M - 1, dtype=np.float64)
         moves = lower = drift_informed = 0
         lower_final = visits_final = 0
+        swaps = swap_evals = 0
+        cap_counts: List[int] = []
         frag_visits = frag_moves = 0
         drift_steps: List[float] = []
         thermal_steps: List[float] = []
@@ -1460,13 +1569,16 @@ class DiffusionMode(ModeController):
                         pos0r = np.asarray(info_base["positions"][0], dtype=np.int64)
                         lvl_i = max(float(steps_cur[k]["levels"][i]), 1e-3)
                         n_short = max(1, self.hold_jump_candidates)
+                        dens = self._visit_density(i, now_s, rep_cache)
                         if mix_ok:
                             # mixture-aware ranking of EVERY fragment of the track against the
-                            # drift target (the solo band profile ignores what the others play)
+                            # drift target (the solo band profile ignores what the others play),
+                            # with the visited places pushed down the ranking
                             others = an.mixture_band_energy(pos0r, gains0, skip=i)
                             pool = an.fragment_candidates_mix(
                                 i, target_phi, others, lvl_i, n_short + 1,
-                                exclude_near=int(pos0r[i]), exclude_frames=int(2 * min_clip))
+                                exclude_near=int(pos0r[i]), exclude_frames=int(2 * min_clip),
+                                penalty=(None if dens is None else (_HOLD_REP_RANK * lam_rep) * dens))
                         else:
                             pool = self._hold_positions(i, target_phi[1:1 + an.nb], int(pos0r[i]), min_clip)
                         opts: List[Optional[int]] = [None]          # None = leave this track as it is
@@ -1485,17 +1597,123 @@ class DiffusionMode(ModeController):
                         else:
                             jumps[k][i] = int(had)
                         e_arr = np.asarray(es, dtype=np.float64)
-                        a_, T_ = self._hold_select(e_arr, o_f, T_mult)
-                        greedy_gaps.append(float((e_arr[a_] - e_arr.min())
-                                                 / max(1e-12, float(np.std(e_arr)))))
+                        # novelty ridge: the field energy of a candidate jump plus lambda_rep times
+                        # the visit density at the position it would land on.  It is a term of the
+                        # LAW (it comes from the committed history), it is scored like the other
+                        # terms, and it is recorded separately -- E_D itself stays untouched, so the
+                        # committed-vs-random field-energy statistic remains comparable.
+                        rep = np.zeros(len(e_arr))
+                        if dens is not None:
+                            for c_ in range(len(opts)):
+                                q = opts[c_] if c_ > 0 else jumps[k].get(i)
+                                if q is not None:
+                                    rep[c_] = float(dens[an.fragment_index_at(i, int(q))])
+                        score = e_arr + lam_rep * rep
+                        a_, T_ = self._hold_select(score, o_f, T_mult)
+                        rep_flips += int(int(np.argmin(score)) != int(np.argmin(e_arr)))
+                        rep_chosen.append(float(rep[a_]))
+                        greedy_gaps.append(float((score[a_] - score.min())
+                                                 / max(1e-12, float(np.std(score)))))
                         if a_ > 0:
                             jumps[k][i] = int(opts[a_])
                             frag_moves += 1
                         e_base = float(e_arr[a_])
                         xi_base, info_base = xs[a_]
                         steps_cur = build()
+                # ---------------- who sounds: SWAP candidates under the polyphony cap -----------
+                act = sounding(steps_cur[k]["levels"])
+                free_entry = (not cap_on) or len(act) < cap
+                n_swap_here = 0
+                # WHO SOUNDS is the coarsest decision of a hold: swaps are proposed at the hold's
+                # first commit frame only (re-decided in every annealing sweep, so the cold sweeps
+                # can still revise them).  Offering them at every frame let the trio change 2.4
+                # times per 2 s hold (72-84 swaps per minute on the 10-material fixture), which is
+                # exactly the scramble the cap is meant to prevent; the realizer still has its own
+                # swap search for the commits in between.
+                if (cap_on and k == 0 and not free_entry and self.hold_swap_candidates > 0
+                        and o_f > 1e-9):
+                    silent = [m_ for m_ in mat_ids if m_ not in act]
+                    if silent:
+                        tgt_s, _dd = self._hold_drift_target(P_sel, xi_base, o_f, dt)
+                        tphi = tgt_s[:1 + an.nb]
+                        gains0 = np.asarray(info_base["gains"][0], dtype=np.float64)
+                        pos0r = np.asarray(info_base["positions"][0], dtype=np.int64)
+                        st_now = strengths(steps_cur[k]["levels"])
+                        d_prev = (np.asarray(build()[k - 1]["levels"], dtype=np.float64) if k
+                                  else lv0.copy())
+                        for c_ in range(self.hold_swap_candidates):
+                            # who leaves: the quietest sounding material, or a sampled one
+                            a_ = (min(act, key=lambda q: (st_now[q], q)) if c_ % 2 == 0
+                                  else int(act[int(self.rng.integers(0, len(act)))]))
+                            b_ = int(silent[int(self.rng.integers(0, len(silent)))])
+                            vb = voices[b_][0] if len(voices[b_]) == 1 else \
+                                int(voices[b_][int(self.rng.integers(0, len(voices[b_])))])
+                            lvl_b = max(float(st_now[a_]), 0.05)
+                            # the entering fragment is pre-ranked against the drift target with the
+                            # band energy of what STAYS (a is leaving, b is not playing yet)
+                            g_stay = gains0.copy()
+                            for i_ in voices[a_]:
+                                g_stay[i_] = 0.0
+                            p_new = None
+                            if (mix_ok and bool(rs.get("jumps_enabled", False))
+                                    and int(frames[k]) >= njf[vb]
+                                    and not any(vb in jumps[j] for j in range(K) if j != k)):
+                                dens_b = self._visit_density(vb, now_s, rep_cache)
+                                others_b = an.mixture_band_energy(pos0r, g_stay, skip=vb)
+                                pool_b = an.fragment_candidates_mix(
+                                    vb, tphi, others_b, lvl_b, 1, exclude_near=int(pos0r[vb]),
+                                    exclude_frames=int(2 * min_clip),
+                                    penalty=(None if dens_b is None
+                                             else (_HOLD_REP_RANK * lam_rep) * dens_b))
+                                if pool_b:
+                                    p_new = int(pool_b[0])
+                            lv_t = np.asarray(steps_cur[k]["levels"], dtype=np.float64).copy()
+                            for i_ in voices[a_]:
+                                lv_t[i_] = 0.0
+                            lv_t[vb] = float(np.clip(lvl_b, 0.0, 1.0))
+                            d_save_s = deltas[k].copy()
+                            j_save = dict(jumps[k])
+                            deltas[k] = np.zeros(M, dtype=np.float64)
+                            deltas[k][1:] = lv_t[1:] - d_prev[1:]
+                            if p_new is not None:
+                                jumps[k][vb] = p_new
+                            e_s, x_s, i_s = ev(build(), rws, P_sel)
+                            rep_s = 0.0
+                            if p_new is not None:
+                                dn = self._visit_density(vb, now_s, rep_cache)
+                                if dn is not None:
+                                    rep_s = float(dn[an.fragment_index_at(vb, p_new)])
+                            deltas[k] = d_save_s
+                            jumps[k] = j_save
+                            n_swap_here += 1
+                            sc = np.asarray([e_base, e_s + lam_rep * rep_s], dtype=np.float64)
+                            a_sel, _Ts = self._hold_select(sc, o_f, T_mult)
+                            if a_sel == 1:
+                                deltas[k] = np.zeros(M, dtype=np.float64)
+                                deltas[k][1:] = lv_t[1:] - d_prev[1:]
+                                if p_new is not None:
+                                    jumps[k][vb] = p_new
+                                swaps += 1
+                                rep_chosen.append(rep_s)
+                                e_base, xi_base, info_base = float(e_s), x_s, i_s
+                                steps_cur = build()
+                                act = sounding(steps_cur[k]["levels"])
+                                st_now = strengths(steps_cur[k]["levels"])
+                                silent = [m_ for m_ in mat_ids if m_ not in act]
+                                if not silent:
+                                    break
+                swap_evals += n_swap_here
                 # ---------------- fine: the levels, by the finite-difference Langevin drift -----
-                probe = list(mats)
+                # with the cap on, only the materials that sound may move (a level step on a silent
+                # material is undone by the projection); when fewer than `cap` sound, anyone may enter
+                movable = [i for i in mats if (not cap_on) or free_entry
+                           or int(groups[i]) in sounding(steps_cur[k]["levels"])]
+                if not movable:
+                    movable = list(mats)
+                mask = np.zeros(M - 1, dtype=np.float64)
+                for i in movable:
+                    mask[i - 1] = 1.0
+                probe = list(movable)
                 if len(probe) > self.hold_gradient_tracks:
                     pk = self.rng.choice(len(probe), size=self.hold_gradient_tracks, replace=False)
                     probe = [probe[int(x)] for x in sorted(pk)]
@@ -1535,7 +1753,7 @@ class DiffusionMode(ModeController):
                     s_l = min(float(np.sqrt(2.0 * eta * T_est)), 2.0 * sigma0 * o_f)
                     ep = rho * eps_run + s_in * self.rng.standard_normal(M - 1)
                     dn = d_save.copy()
-                    dn[1:] = d_save[1:] - eta * grad + s_l * ep
+                    dn[1:] = d_save[1:] - eta * grad + s_l * (ep * mask)
                     cand_d.append(dn)
                     kinds.append("langevin")
                     if c_ == 0:
@@ -1543,7 +1761,7 @@ class DiffusionMode(ModeController):
                 for _c in range(n_blind):
                     ep = rho * eps_run + s_in * self.rng.standard_normal(M - 1)
                     dn = d_save.copy()
-                    dn[1:] = d_save[1:] + (sigma0 * o_f) * ep
+                    dn[1:] = d_save[1:] + (sigma0 * o_f) * (ep * mask)
                     cand_d.append(dn)
                     kinds.append("level")
                 es = [e_base]
@@ -1578,6 +1796,8 @@ class DiffusionMode(ModeController):
                              "energy_min": float(e_arr.min()), "temperature": float(T_),
                              "drift_target_distance": float(d_drift), "level_gradient_rms": g_rms,
                              "fd_energy_spread": spread_fd, "langevin_temperature": float(T_est),
+                             "repetition_penalty_chosen": (float(np.mean(rep_chosen[-max(1, len(rep_chosen)):]))
+                                                           if rep_chosen else 0.0),
                              "drift_step_levels": float(drift_step),
                              "thermal_step_levels": float(thermal_step),
                              "jumps": {int(i_): int(p_) for i_, p_ in jumps[k].items()}})
@@ -1627,9 +1847,28 @@ class DiffusionMode(ModeController):
                 s_["jumps"] = {i: p for i, p in s_["jumps"].items()
                                if (int(s_["frame"]), int(i)) not in drop}
             xi_p, _parts, info = prows(steps, idx)
-        plan = [{"frame": int(s_["frame"]), "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
-                 "levels": [float(v) for v in np.asarray(s_["levels"], dtype=np.float64)]}
-                for s_ in steps]
+        # the published plan must describe the same thing as the published rows: with the polyphony
+        # cap on, that is the PROJECTED levels the engine actually used (info["levels_used"], one
+        # entry per step in frame order)
+        used = list(info.get("levels_used") or [])
+        plan = []
+        for n_, s_ in enumerate(sorted(steps, key=lambda x: int(x["frame"]))):
+            lv_pub = (np.asarray(used[n_], dtype=np.float64)
+                      if (n_ < len(used) and used[n_] is not None)
+                      else np.asarray(s_["levels"], dtype=np.float64))
+            plan.append({"frame": int(s_["frame"]),
+                         "jumps": {int(i): int(p) for i, p in s_["jumps"].items()},
+                         "levels": [float(v) for v in lv_pub]})
+        final_sound = [int(x) for x in sounding(np.asarray(plan[-1]["levels"], dtype=np.float64))] if plan else []
+        # how often the sounding set changes in the PUBLISHED plan (musical time), as opposed to
+        # `swap_acceptances`, which counts accepted swap proposals during the search (internal)
+        plan_swaps = 0
+        prev_set = set(sounding(lv0))
+        for s_ in plan:
+            cur_set = set(sounding(np.asarray(s_["levels"], dtype=np.float64)))
+            if cur_set != prev_set:
+                plan_swaps += 1
+            prev_set = cur_set
         return {"plan": plan, "steps": steps, "xi": xi_p, "path": path, "evaluations": int(evals),
                 "chain": int(chain), "moves": int(moves), "lower_than_stay": int(lower),
                 "drift_informed": int(drift_informed),
@@ -1641,6 +1880,17 @@ class DiffusionMode(ModeController):
                 "refine_temperature": float(T_h), "n_jumps": int(sum(len(s_["jumps"]) for s_ in steps)),
                 "frames": [int(f) for f in frames],
                 "anneal_iterations": int(n_iter), "frame_visits": int(len(path)),
+                "cap": int(cap), "cap_active": bool(cap_on), "swaps": int(plan_swaps),
+                "swap_acceptances": int(swaps),
+                "swap_candidates_evaluated": int(swap_evals),
+                "sounding_materials_end": int(len(final_sound)),
+                "materials_total": int(len(mat_ids)),
+                "repetition_density_chosen": float(np.mean(rep_chosen)) if rep_chosen else 0.0,
+                "repetition_density_max": float(np.max(rep_chosen)) if rep_chosen else 0.0,
+                "repetition_energy_chosen": float(lam_rep * np.mean(rep_chosen)) if rep_chosen else 0.0,
+                "repetition_changed_winner": int(rep_flips),
+                "repetition_selections": int(len(rep_chosen)),
+                "visits_in_memory": int(sum(len(v) for v in self._visits.values())),
                 "lower_than_stay_final_sweep": (float(lower_final) / visits_final) if visits_final else None,
                 "fragment_visits": int(frag_visits), "fragment_moves": int(frag_moves),
                 "sweep_energies": [float(x) for x in sweep_energies],
@@ -1720,6 +1970,18 @@ class DiffusionMode(ModeController):
             "mean_thermal_step_levels": float(np.mean([r["thermal_step_levels"] for r in runs])),
             "mean_energy_gain_vs_stay": float(np.mean([p["energy_minus_stay"] for p in best["path"]])),
             "energy_fidelity": best.get("energy_fidelity"),
+            "cap": best.get("cap"), "cap_active": best.get("cap_active"),
+            "swaps": best.get("swaps"), "swap_acceptances": best.get("swap_acceptances"),
+            "swap_candidates_evaluated": best.get("swap_candidates_evaluated"),
+            "sounding_materials_end": best.get("sounding_materials_end"),
+            "materials_total": best.get("materials_total"),
+            "repetition_density_chosen": best.get("repetition_density_chosen"),
+            "repetition_density_max": best.get("repetition_density_max"),
+            "repetition_energy_chosen": best.get("repetition_energy_chosen"),
+            "repetition_changed_winner": best.get("repetition_changed_winner"),
+            "repetition_selections": best.get("repetition_selections"),
+            "visits_in_memory": best.get("visits_in_memory"),
+            "repetition_weight": float(self.hold_repetition_weight),
             "lower_than_stay_final_sweep": best.get("lower_than_stay_final_sweep"),
             "energy_stay_hold": best.get("energy_stay_hold"),
             "energy_best_seen": best.get("energy_best_seen"),
@@ -2320,6 +2582,16 @@ class DiffusionMode(ModeController):
         # the ones of THIS commit (they are reset at the end of this call) while the chain
         # statistics belong to the hold the reference was prepared for.
         hstats = (stats or {})
+        if self._hold:
+            # the law's own memory: which places of each SOURCE the committed sound has used, with
+            # the musical time of the visit (shared by the voices of one material)
+            t_vis = float(unit.seconds[idx[0]])
+            for i_, p_ in ((hstats.get("jumps") or {}).items()):
+                g = self._source_group(int(i_))
+                lst = self._visits.setdefault(g, [])
+                lst.append((int(p_), t_vis))
+                if len(lst) > _HOLD_REP_MEMORY:
+                    del lst[:-_HOLD_REP_MEMORY]
         hold_info: Optional[Dict[str, Any]] = None
         if self._hold and self._hold_log:
             hl = self._hold_log
@@ -2344,6 +2616,9 @@ class DiffusionMode(ModeController):
                 "plan_steps": int(hl.get("plan_steps", 0)), "jumps_in_plan": int(hl.get("jumps_in_plan", 0)),
                 "requested_dist2_at_hold_end": hl.get("requested_dist2_at_hold_end"),
                 "jumps_committed_now": len((hstats.get("jumps") or {})),
+                "repetition_density_chosen": hl.get("repetition_density_chosen"),
+                "repetition_energy_chosen": hl.get("repetition_energy_chosen"),
+                "visits_in_memory": hl.get("visits_in_memory"),
             }
 
         frag_stat: Dict[str, Any] = {"available": False}
@@ -2568,6 +2843,33 @@ class DiffusionMode(ModeController):
             "mean_energy_gain_vs_stay": mean("mean_energy_gain_vs_stay"),
             "mean_energy_gain_vs_stay_open": mean("mean_energy_gain_vs_stay", op),
             "energy_fidelity": mean("energy_fidelity"),
+            "polyphony_cap": (int(rows[-1].get("cap") or 0) if rows else 0),
+            "cap_active": bool(rows[-1].get("cap_active")) if rows else False,
+            "swaps_total": int(sum(int(h.get("swaps") or 0) for h in rows)),
+            "swaps_per_minute": (float(sum(int(h.get("swaps") or 0) for h in rows))
+                                 / max(1e-9, (float(rows[-1]["musical_time_seconds"])
+                                              - float(rows[0]["musical_time_seconds"])
+                                              + float(rows[-1].get("hold_seconds") or 2.0)) / 60.0)),
+            "swap_candidates_per_hold": mean("swap_candidates_evaluated"),
+            "swap_acceptances_internal": int(sum(int(h.get("swap_acceptances") or 0) for h in rows)),
+            "swaps_per_hold": mean("swaps"),
+            "holds_at_cap": int(sum(1 for h in rows if h.get("cap")
+                                    and int(h.get("sounding_materials_end") or 0) >= int(h["cap"]))),
+            "holds_below_cap": int(sum(1 for h in rows if h.get("cap")
+                                       and int(h.get("sounding_materials_end") or 0) < int(h["cap"]))),
+            "share_of_holds_at_cap": (float(sum(1 for h in rows if h.get("cap")
+                                                and int(h.get("sounding_materials_end") or 0) >= int(h["cap"])))
+                                      / max(1, len(rows))),
+            "mean_sounding_materials": mean("sounding_materials_end"),
+            "repetition_density_chosen": mean("repetition_density_chosen"),
+            "repetition_energy_chosen": mean("repetition_energy_chosen"),
+            "repetition_changed_winner_rate": (
+                float(sum(int(h.get("repetition_changed_winner") or 0) for h in rows))
+                / max(1, sum(int(h.get("repetition_selections") or 0) for h in rows))),
+            "visits_in_memory_end": (rows[-1].get("visits_in_memory") if rows else None),
+            "repetition_weight": float(self.hold_repetition_weight),
+            "repetition_width_seconds": float(self.hold_repetition_width_seconds),
+            "repetition_half_life_seconds": float(self.hold_repetition_half_life_seconds),
             "energy_fidelity_median": (float(np.median([float(h["energy_fidelity"]) for h in rows
                                                         if h.get("energy_fidelity") is not None]))
                                       if [h for h in rows if h.get("energy_fidelity") is not None] else None),
@@ -2705,7 +3007,33 @@ class DiffusionMode(ModeController):
                                   "hold_tracks_per_step": int(self.hold_tracks_per_step),
                                   "hold_gradient_tracks": int(self.hold_gradient_tracks),
                                   "hold_mix_ranking": bool(self.hold_mix_ranking),
-                                  "hold_final_temperature": float(self.hold_final_temperature)},
+                                  "hold_final_temperature": float(self.hold_final_temperature),
+                                  "hold_repetition_weight": float(self.hold_repetition_weight),
+                                  "hold_repetition_width_seconds": float(self.hold_repetition_width_seconds),
+                                  "hold_repetition_half_life_seconds": float(self.hold_repetition_half_life_seconds)},
+                "repetition_term": (
+                    "the committed source positions are remembered per SOURCE (the voices of one "
+                    "material share the memory, at most " + str(_HOLD_REP_MEMORY) + " visits each, "
+                    "faded with a half life of hold_repetition_half_life_seconds of musical time). "
+                    "They enter the law twice: as an additive penalty on the mixture-aware fragment "
+                    "ranking (weight " + str(_HOLD_REP_RANK) + " x hold_repetition_weight) and as a "
+                    "novelty ridge lambda_rep x visit density on the energy of a candidate jump "
+                    "inside the chain, so the thermal selection feels it as well. It is NOT part of "
+                    "E_D: field_energy / field_term_breakdown and the committed-vs-random-fragment "
+                    "statistic stay the pure field of eq.(28)"),
+                "polyphony_cap_note": (
+                    "when realizer_state['max_active_materials'] > 0 the chain state is the "
+                    "PROJECTED (legal) state, level moves and the finite-difference gradient run "
+                    "over the sounding materials only (over all of them while fewer than K sound), "
+                    "a silent material enters through explicit SWAP candidates (one sounding "
+                    "material out, one voice of a silent one in at the leaving material's level, "
+                    "jumping while still silent to a fragment pre-ranked against the drift target "
+                    "with others_band = what STAYS, repetition penalty included), each scored "
+                    "exactly by the field energy and drawn thermally; meta['plan'] publishes the "
+                    "projected levels (info['levels_used']).  With cap 0 none of this runs."),
+                "swap_candidates_per_frame_visit": int(self.hold_swap_candidates),
+                "source_groups": {str(k): int(v) for k, v in sorted(self._src_group.items())},
+                "visits_per_source_at_end": {str(k): int(len(v)) for k, v in sorted(self._visits.items())},
                 "energy_fidelity_note": (
                     "energy_fidelity = (E_stay - E_plan) / (E_stay - E_best_seen) on the hold rows; "
                     "E_best_seen is the lowest energy of any FULL plan evaluated during that hold "

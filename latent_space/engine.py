@@ -170,6 +170,10 @@ class Job:
         self.analysis_seconds = time.time() - t0
         self.objective = Objective(cfg, self.lim, self.fs)
         self.history = History(self.M, self.analyzer.d_xi, cfg)
+        if bool(cfg["hires"]["enabled"]) and int(cfg["hires"].get("max_active_materials", 0)) > 0:
+            # polyphony cap: the analyzer draws random legal states with it (mode anchors / bases / references)
+            self.analyzer.max_active_materials = int(cfg["hires"]["max_active_materials"])
+            self.analyzer.material_of_track = np.asarray(self.voice_of, dtype=np.int64)
         self.mode = make_mode(self.mode_name, cfg, self.analyzer, self.fs, self.rng, self.objective)
         self.mode.sources = self.sources          # fragment helpers need the PCM (FRAG_CONTRACT)
         self.hires = bool(cfg["hires"]["enabled"])
@@ -749,7 +753,54 @@ class Job:
                         viol.append(f"track{i}:goal_hold_not_exact_in_phase@{p.start}")
             n_switch += sum(1 for sg in cv.segments if sg.label == "SWITCH")
             n_jumps += sum(1 for c in cv.clips if c.out_start > 0)     # the start offset of a second voice is not a jump
-        return {"profile": "hires (steep switches, position jumps; slow-motion rules waived by user authorisation)",
+        cap_report: Dict[str, Any] = {}
+        cap = int(self.cfg["hires"].get("max_active_materials", 0))
+        if cap > 0:
+            # polyphony cap: on a 50 ms grid, count the materials with a sounding voice; outside the gain ramps the
+            # count must not exceed the cap (while ramps cross-fade, up to twice the cap is allowed by the user)
+            stepf = max(1, int(round(float(self.cfg["render"]["csv_step_seconds"]) * self.fs)))
+            fr = np.arange(0, self.total_frames, stepf, dtype=np.int64)
+            groups = np.asarray(self.voice_of, dtype=np.int64)
+            mats = sorted({int(g) for g in groups[1:]})
+            sounding = {m_: np.zeros(len(fr), dtype=bool) for m_ in mats}
+            ramping = np.zeros(len(fr), dtype=bool)
+            for i, cv in enumerate(curves):
+                if i == 0:
+                    continue
+                sounding[int(groups[i])] |= cv.values(fr) > 1e-9
+                for sg in cv.segments:
+                    if sg.kind == "Q5":
+                        a_, b_ = np.searchsorted(fr, [sg.start, sg.end])
+                        ramping[a_:b_] = True
+            count = np.sum([sounding[m_] for m_ in mats], axis=0)
+            steady = ~ramping
+            worst = int(count[steady].max()) if steady.any() else 0
+            if worst > cap:
+                viol.append(f"polyphony_cap_exceeded_outside_ramps:{worst}>{cap}")
+            # minimum sounding time: every sounding interval of a material, except those ended by the goal rise
+            dwell_s = float(self.cfg["hires"].get("min_sounding_seconds", 0.0))
+            shortest = None
+            arrivals = [u.goal_arrival for u in self.form.units if u.goal_arrival is not None]
+            for m_ in mats:
+                on_ = np.concatenate([[False], sounding[m_], [False]])
+                a_idx = np.where(on_[1:] & ~on_[:-1])[0]
+                b_idx = np.where(~on_[1:] & on_[:-1])[0]
+                for a_, b_ in zip(a_idx, b_idx):
+                    end_f = int(fr[min(b_, len(fr) - 1)])
+                    if b_ >= len(fr) or any(abs(end_f - ga) <= self.fs for ga in arrivals):
+                        continue                   # ended by the goal rise or by the end of the piece
+                    dur = (b_ - a_) * stepf / float(self.fs)
+                    shortest = dur if shortest is None else min(shortest, dur)
+            if dwell_s > 0 and shortest is not None and shortest < dwell_s - 0.11:
+                viol.append(f"min_sounding_seconds_violated:{shortest:.2f}<{dwell_s:.2f}")
+            cap_report = {"max_active_materials": cap, "observed_max_outside_ramps": worst,
+                          "min_sounding_seconds": dwell_s, "shortest_sounding_interval_seconds": shortest,
+                          "observed_max_including_ramps": int(count.max()),
+                          "share_of_time_by_active_materials": {str(k): float(np.mean(count == k)) for k in range(int(count.max()) + 1)},
+                          "rule": "voices of one material count once; checked on a 50 ms grid outside gain ramps; "
+                                  "cross-fading ramps may overlap outgoing and incoming materials (user decision)"}
+        return {"polyphony_cap": cap_report,
+                "profile": "hires (steep switches, position jumps; slow-motion rules waived by user authorisation)",
                 "gain_bounds": min_g >= -self.lim.bound_tol and max_g <= 1 + self.lim.bound_tol,
                 "gain_range_observed": [min_g, max_g], "continuity_and_motion_limits": not any("discontinu" in v for v in viol),
                 "slow_motion_rules": "waived", "exact_goals": goal_ok, "switches": n_switch, "position_jumps": n_jumps,

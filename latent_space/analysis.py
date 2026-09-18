@@ -246,8 +246,34 @@ class Analyzer:
         if levels is None:
             levels = rng.uniform(0.0, 1.0, self.M)
             levels[0] = goal_level
+            levels = self.cap_random_levels(levels, rng)
         xi, parts = self.fragment_composition(sources, positions, levels, offsets)
         return xi, parts, {"positions": positions.tolist(), "levels": np.asarray(levels).tolist()}
+
+    def cap_random_levels(self, levels: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Polyphony cap (engine: hires.max_active_materials): a RANDOM legal state has 1..cap sounding
+        materials (the voices of one material count once; a sounding material keeps at least one
+        voice).  No cap configured: the levels are returned unchanged and no random number is drawn."""
+        cap = int(getattr(self, "max_active_materials", 0))
+        if cap <= 0:
+            return levels
+        groups = np.asarray(getattr(self, "material_of_track", np.arange(self.M)))
+        mats = sorted({int(g) for g in groups[1:]})
+        k = int(rng.integers(1, min(cap, len(mats)) + 1))
+        keep = {int(x) for x in rng.choice(mats, size=k, replace=False)}
+        out = np.asarray(levels, dtype=np.float64).copy()
+        for m_ in mats:
+            idx = np.where(groups == m_)[0]
+            if m_ not in keep:
+                out[idx] = 0.0
+            elif len(idx) > 1:                    # each extra voice sounds with probability 1/2
+                drop = [int(i) for i in idx if rng.random() < 0.5]
+                if len(drop) == len(idx):
+                    drop = drop[1:]
+                out[drop] = 0.0
+        if float(out[1:].max()) < 0.3:            # a random legal state is not near-silence
+            out[1 + int(np.argmax(out[1:]))] = float(rng.uniform(0.3, 1.0))
+        return out
 
     def fragment_candidates(self, track: int, target_ratios: np.ndarray, n: int, exclude_near: Optional[int] = None,
                             exclude_frames: int = 0) -> List[int]:
@@ -299,7 +325,7 @@ class Analyzer:
 
     def fragment_candidates_mix(self, track: int, target_phi: np.ndarray, others_band: np.ndarray, level: float, n: int,
                                 exclude_near: Optional[int] = None, exclude_frames: int = 0,
-                                energy_weight: float = 1.0) -> List[int]:
+                                energy_weight: float = 1.0, penalty: Optional[np.ndarray] = None) -> List[int]:
         """Top-n fragment positions of `track` for a target MIXTURE.  `target_phi` = normalized
         [logE, band ratios (nb), ...] of the wanted mixture (the first 1+nb entries of a xi row),
         `others_band` = mixture_band_energy(..., skip=track) of what the other tracks play,
@@ -313,10 +339,31 @@ class Analyzer:
         en = (np.log1p(E / self.E_ref) - self.norm_mean[0]) / self.norm_std[0]
         d = ((rn - tp[None, 1:1 + self.nb]) ** 2).sum(axis=1) + float(energy_weight) * (en - tp[0]) ** 2
         d = d + 4.0 * (self.frag_E[track] < self.silence_energy)
+        if penalty is not None:                   # e.g. fragment_visit_penalty(): keeps a mode from re-choosing the same places
+            d = d + np.asarray(penalty, dtype=np.float64)
         if exclude_near is not None and exclude_frames > 0:
             d = d + 1e6 * (np.abs(self.solo_pos[track] - exclude_near) < exclude_frames)
         order = np.argsort(d)[: max(1, n)]
         return [int(self.solo_pos[track][k]) for k in order]
+
+    def fragment_visit_penalty(self, track: int, visited_positions: Sequence[int], width_seconds: float = 2.0,
+                               weight: float = 1.0, ages: Optional[Sequence[float]] = None,
+                               half_life: Optional[float] = None) -> np.ndarray:
+        """Additive ranking penalty (P_i,) for fragments near positions that were already played:
+        a triangular bump of `width_seconds` around every visited source position (circular),
+        optionally faded with the age of the visit (`ages`, same unit as `half_life`)."""
+        pos = self.solo_pos[track].astype(np.float64)
+        L = float(self.source_lengths[track])
+        w = max(1.0, float(width_seconds) * self.fs)
+        out = np.zeros(len(pos))
+        for k, v in enumerate(visited_positions):
+            dist = np.abs(pos - float(v))
+            dist = np.minimum(dist, L - dist)
+            bump = np.clip(1.0 - dist / w, 0.0, None)
+            if ages is not None and half_life:
+                bump = bump * 0.5 ** (float(ages[k]) / float(half_life))
+            out += bump
+        return float(weight) * out
 
     def enable_window_cache(self, max_entries: int = 256) -> None:
         """Reuse per-track PCM windows / spectra between grams_at_positions calls (hold mode)."""
