@@ -52,8 +52,13 @@ DEFAULTS: Dict[str, Any] = {
         # goal exposure policy (audit §3.4): 'contract_only' keeps the goal track at/below the caps in
         # INTRO/OPEN, rises continuously inside CONTRACT to 1, inherits 1 at REOPEN and descends legally;
         # 'free' lets the goal track move like any material before the goal time.
+        # 'contract_law' (2026-09-23, opt-in): as 'contract_only' before CONTRACT and over the final
+        # goal_rise_seconds, but inside CONTRACT the goal track is a searched track of the law
+        # (level moves only, no jumps, non-decreasing when law_monotonic); the final rise starts
+        # from the level the law reached, GOAL_HOLD stays exact.
         "goal_exposure": {"policy": "contract_only", "intro_max": 0.0, "open_max": 0.0,
-                          "reopen_descend_within_reopen": True},
+                          "reopen_descend_within_reopen": True, "law_monotonic": True,
+                          "law_mobility": 1.0},     # contract_law: goal step = law_mobility * d_lvl * (-dE/dg), |step| <= d_lvl
     },
     "analysis": {
         "window_frames": 2048,
@@ -94,6 +99,7 @@ DEFAULTS: Dict[str, Any] = {
         "mode_error_scale": {"diffusion": 1.0, "vae": 1.0, "transformer": 1.0, "gan": 1.0},
         "w_neff": 0.25, "n_eff_target": 2.0,        # audit E3 (soft, OPEN-like rows only)
         "w_energy": 0.25, "energy_min_ratio": 0.05,
+        "contract_goal_weight_exponent": 2.0,       # E_form CONTRACT weight (1-o)^p; 2.0 = the audited form
     },
     "mode_defaults": {
         "diffusion_particles": 4,
@@ -444,8 +450,8 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     if hz.get("reference_anchor", "last_row") not in ("last_row", "block_mean"):
         raise ValueError("hires.reference_anchor must be 'last_row' or 'block_mean'")
     ge = cfg["form"]["goal_exposure"]
-    if ge["policy"] not in ("contract_only", "free"):
-        raise ValueError("form.goal_exposure.policy must be 'contract_only' or 'free'")
+    if ge["policy"] not in ("contract_only", "free", "contract_law"):
+        raise ValueError("form.goal_exposure.policy must be 'contract_only', 'free' or 'contract_law'")
     for k in ("intro_max", "open_max"):
         if not (0.0 <= float(ge[k]) <= 1.0):
             raise ValueError(f"form.goal_exposure.{k} must be in [0, 1]")

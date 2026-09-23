@@ -339,10 +339,9 @@ class TrackCurve:
         starts = np.array([s.start for s in self.segments])
         idx = np.searchsorted(starts, frames, side="right") - 1
         idx = np.clip(idx, 0, len(self.segments) - 1)
-        for k, seg in enumerate(self.segments):
+        for k in np.unique(idx):                      # only the segments the frames actually hit
+            seg = self.segments[int(k)]
             mask = idx == k
-            if not mask.any():
-                continue
             if seg.kind == "HOLD":
                 out[mask] = seg.a
             else:
@@ -377,10 +376,9 @@ class TrackCurve:
         j = np.zeros(frames.shape, dtype=np.float64)
         starts = np.array([sg.start for sg in self.segments])
         idx = np.clip(np.searchsorted(starts, frames, side="right") - 1, 0, len(self.segments) - 1)
-        for k, seg in enumerate(self.segments):
+        for k in np.unique(idx):                      # only the segments the frames actually hit
+            seg = self.segments[int(k)]
             mask = idx == k
-            if not mask.any():
-                continue
             if seg.kind == "HOLD":
                 g[mask] = seg.a
                 continue
@@ -418,12 +416,13 @@ class TrackCurve:
             return frames % length
         starts = np.array([c.out_start for c in self.clips], dtype=np.int64)
         idx = np.searchsorted(starts, frames, side="right") - 1
-        pos = np.where(idx >= 0, frames, frames)  # placeholder
         out = np.empty(frames.shape, dtype=np.int64)
-        for k, c in enumerate(self.clips):
+        for k in np.unique(idx):                      # only the clips the frames actually hit
+            if k < 0:
+                continue
+            c = self.clips[int(k)]
             m = idx == k
-            if m.any():
-                out[m] = (c.src_start + (frames[m] - c.out_start)) % length
+            out[m] = (c.src_start + (frames[m] - c.out_start)) % length
         m = idx < 0
         if m.any():
             out[m] = frames[m] % length

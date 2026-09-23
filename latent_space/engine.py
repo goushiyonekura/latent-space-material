@@ -708,6 +708,21 @@ class Job:
                 if i == 0 and ge["policy"] != "free" and p.name == "REOPEN" and p.end > p.start and p.start > 0:
                     if g[p.start] != 1.0:
                         viol.append(f"track0:reopen_does_not_inherit_goal@{p.start}")
+                if i == 0 and ge["policy"] == "contract_law" and p.name == "CONTRACT" and p.end > p.start:
+                    seg = g[p.start:p.end]
+                    mono_ok = bool(np.all(np.diff(seg) >= -tol)) if bool(ge.get("law_monotonic", True)) else None
+                    above = seg > tol
+                    entry = int(np.argmax(above)) if bool(above.any()) else None
+                    rise_f = int(round(float(self.cfg["hires"]["goal_rise_seconds"]) * self.fs))
+                    k_rise = max(0, len(seg) - rise_f)
+                    exposure.setdefault("goal_law", []).append({
+                        "contract_start_seconds": p.start / self.fs,
+                        "entry_seconds": (None if entry is None else (p.start + entry) / self.fs),
+                        "level_at_rise_start": float(seg[k_rise]),
+                        "share_of_contract_with_goal": float(above.mean()),
+                        "monotonic": mono_ok})
+                    if mono_ok is False:
+                        viol.append(f"track0:goal_law_not_monotonic@{p.start}")
             # joints crossed with non-zero velocity (bump starts inside a base move)
             for b in cv.bumps:
                 _gg, v, _a, _j = cv.derivatives(np.array([b.start]), self.fs)

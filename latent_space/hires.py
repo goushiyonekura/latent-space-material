@@ -188,13 +188,39 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         if unit.end > cur:
             goal_segs.append(Segment("HOLD", cur, unit.end, g0, g0, "ZERO_HOLD" if g0 <= 1e-12 else "LEVEL_HOLD"))
     goal_curve = TrackCurve(goal_segs)
+    # goal participation (opt-in exposure policy 'contract_law', 2026-09-23): inside CONTRACT and
+    # before the final rise the goal track is searched like a material (level moves only, no jumps,
+    # non-decreasing when law_monotonic); its scripted schedule stays in force before CONTRACT, over
+    # the final rise (which starts from the level the law reached) and in GOAL_HOLD / REOPEN.
+    # Every other policy takes the code paths below unchanged.
+    goal_law = (ge["policy"] == "contract_law" and unit.goal_arrival is not None
+                and rise_start is not None and "CONTRACT" in unit.phase_frames)
+    law_mono = bool(ge.get("law_monotonic", True))
+    law_start = rise_start
+    if goal_law:
+        c0_ = max(int(unit.phase_frames["CONTRACT"][0]), int(cur))          # never inside the REOPEN descent
+        law_start = unit.start + int(np.ceil((c0_ - unit.start) / float(commit))) * commit
+        if law_start >= rise_start:
+            goal_law = False
+    if goal_law:
+        for sg in goal_segs:                     # the scripted pieces before the law takes over
+            if sg.end <= law_start:
+                state.segments[0].append(sg)
+            elif sg.start < law_start:
+                state.segments[0].append(Segment(sg.kind, sg.start, law_start, sg.a,
+                                                 sg.a if sg.kind == "HOLD" else sg.b, sg.label))
 
     def gains_for(levels_end: np.ndarray, t: int, rows: np.ndarray, level_now: np.ndarray):
         c = centers[rows]
         s = np.clip((c - t) / float(ramp), 0.0, 1.0)
         q = s * s * s * (10.0 + s * (-15.0 + 6.0 * s))
         g = level_now[None, :] + (levels_end - level_now)[None, :] * q[:, None]
-        g[:, 0] = goal_curve.values(c)
+        if goal_law:
+            pre_ = c < law_start
+            if pre_.any():
+                g[pre_, 0] = goal_curve.values(c[pre_])
+        else:
+            g[:, 0] = goal_curve.values(c)
         return g
 
     search_end = rise_start if rise_start is not None else unit.end
@@ -228,6 +254,17 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             return flux_prev["ratios"]
         return None
 
+    def comp(g, G0, Gb, S_, prev=None):
+        """Composition rows of a candidate; under the goal law also the rows of the same windows
+        with the goal silent (`parts["xi_materials"]`, same Grams), which the Diffusion law uses to
+        judge the materials' configuration separately from the goal's presence."""
+        xi_, parts_ = an.composition_from_grams(g, G0, Gb, S_, prev_ratios=prev)
+        if goal_law:
+            g_m = g.copy()
+            g_m[:, 0] = 0.0
+            parts_["xi_materials"] = an.composition_from_grams(g_m, G0, Gb, S_, prev_ratios=prev)[0]
+        return xi_, parts_
+
     def plan_rows(steps, rws: np.ndarray, level_now: np.ndarray):
         """EXACT composition rows of a realizable plan (docs/HOLD_CONTRACT.md).  `steps` is a list
         of {"frame": f, "jumps": {track: source_position}, "levels": (M,) end levels or None} with
@@ -255,6 +292,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 last[i_] = f0
             if s_.get("levels") is not None:
                 end = project_levels(np.clip(np.asarray(s_["levels"], dtype=np.float64), 0.0, 1.0), lv, f0, entered_sim)
+                if goal_law:
+                    end[0] = lv[0] if f0 < law_start else (max(float(end[0]), float(lv[0])) if law_mono else end[0])
                 entered_sim = advance_entries(entered_sim, lv, end, f0)
                 levels_used.append(end.tolist())
                 m_ = c >= f0
@@ -264,7 +303,12 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 lv = end
             else:
                 levels_used.append(None)
-        g[:, 0] = goal_curve.values(c)
+        if goal_law:
+            pre_ = c < law_start
+            if pre_.any():
+                g[pre_, 0] = goal_curve.values(c[pre_])
+        else:
+            g[:, 0] = goal_curve.values(c)
         pos = np.zeros((len(rws), M), dtype=np.int64)
         for i_ in range(M):
             cv = TrackCurve([], [], list(state.clips[i_]) + extra[i_])
@@ -272,7 +316,14 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         _fp, S_p, _cp = an.material_features_at(pos)
         G0p, Gbp = an.grams_at_positions(sources, starts_all[rws], pos)
         xi_p, parts_p = an.composition_from_grams(g, G0p, Gbp, S_p, prev_ratios=prev_for(rws))
-        return xi_p, parts_p, {"dropped_jumps": dropped, "gains": g, "positions": pos, "levels_used": levels_used}
+        info_p = {"dropped_jumps": dropped, "gains": g, "positions": pos, "levels_used": levels_used}
+        if goal_law:
+            # the same rows with the goal silent (same Grams): the law judges the materials'
+            # configuration on these and the goal's presence on the full rows (docs/FIDELITY_CONTRACT.md)
+            g_m = g.copy()
+            g_m[:, 0] = 0.0
+            info_p["xi_materials"] = an.composition_from_grams(g_m, G0p, Gbp, S_p, prev_ratios=prev_for(rws))[0]
+        return xi_p, parts_p, info_p
 
     # ---- plan-aware lookahead (hold mode): a candidate is "this choice now, then the rest of the mode's
     # plan", not "this choice held for the whole window" - otherwise a plan that changes levels at every
@@ -311,10 +362,16 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             if dwell > 0:
                 entered_sim = advance_entries(entered_sim, prev, end, int(s_["frame"]))
             m_ = c >= int(s_["frame"])
+            law_step_ = goal_law and int(s_["frame"]) >= law_start
+            if goal_law:
+                end[0] = prev[0] if not law_step_ else (max(float(end[0]), float(prev[0])) if law_mono else end[0])
             if m_.any():
                 sr = np.clip((c[m_] - int(s_["frame"])) / float(ramp), 0.0, 1.0)
                 q = sr * sr * sr * (10.0 + sr * (-15.0 + 6.0 * sr))
-                g[m_, 1:] = prev[None, 1:] + (end[1:] - prev[1:])[None, :] * q[:, None]
+                if law_step_:
+                    g[m_, :] = prev[None, :] + (end - prev)[None, :] * q[:, None]
+                else:
+                    g[m_, 1:] = prev[None, 1:] + (end[1:] - prev[1:])[None, :] * q[:, None]
             prev = end
         return g
 
@@ -367,6 +424,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                     "commit_frames": int(commit), "ramp_frames": int(ramp), "hold_frames": int(hold),
                     "min_clip_frames": int(min_clip), "lookahead_frames": int(look), "search_end_frame": int(search_end),
                     "goal_gains": goal_curve.values(centers[rows_ref]),
+                    "goal_law": bool(goal_law and t >= law_start), "goal_law_monotonic": law_mono,
+                    "goal_law_mobility": float(ge.get("law_mobility", 1.0)), "goal_level": float(level[0]),
                     "max_active_materials": int(cap), "material_of_track": groups.tolist(),
                     "project_levels": project_levels,
                     "min_sounding_frames": int(dwell), "entered_at": dict(state.entered_at),
@@ -376,10 +435,13 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             props = mode.prepare_reference(unit, history, rows_ref, xi_anchor, n_ref) or [R0]
         G0n, Gbn = an.grams_at_positions(sources, st, pos_now)
         g_hold = gains_for(level.copy(), t, rows, level)
-        xi_hold, parts_hold = an.composition_from_grams(g_hold, G0n, Gbn, S, prev_ratios=prev_for(rows))
+        xi_hold, parts_hold = comp(g_hold, G0n, Gbn, S, prev_for(rows))
 
         def J_of(xi_w, parts_w, ref, rws):
-            em = float(mode.window_error(unit, xi_w, rws, ref))
+            if goal_law and getattr(mode, "accepts_xi_materials", False) and parts_w.get("xi_materials") is not None:
+                em = float(mode.window_error(unit, xi_w, rws, ref, xi_materials=parts_w["xi_materials"]))
+            else:
+                em = float(mode.window_error(unit, xi_w, rws, ref))
             fm = unit.free_mask[rws]
             fit = float(an.dist2(xi_w, ref.xi_hat[rws])[fm].mean()) if fm.any() else 0.0
             ef = objective.e_form_rows(unit, xi_w, parts_w, rws)
@@ -444,7 +506,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 _fz, S_z, _cz = an.material_features_at(pos_z)
                 G0z, Gbz = an.grams_at_positions(sources, st, pos_z)
             g_hold = gains_plan(level.copy(), t, rows, level, future)
-            xi_hold, parts_hold = an.composition_from_grams(g_hold, G0z, Gbz, S_z, prev_ratios=prev_for(rows))
+            xi_hold, parts_hold = comp(g_hold, G0z, Gbz, S_z, prev_for(rows))
             init = J_of(xi_hold, parts_hold, ref, rows)
             evals += 1
         ref_hash = _hash_array(ref.xi_hat[rows])
@@ -504,7 +566,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 _f, S_s, _c = an.material_features_at(pos_s)
                 G0s, Gbs = an.grams_at_positions(sources, st_sub, pos_s)
                 g = gains_plan(level.copy(), t, sub, level, future)
-                xi_s, parts_s = an.composition_from_grams(g, G0s, Gbs, S_s, prev_ratios=prev_for(sub))
+                xi_s, parts_s = comp(g, G0s, Gbs, S_s, prev_for(sub))
                 return J_of(xi_s, parts_s, ref, sub)["J"]
 
             beam: List[Tuple[Dict[int, int], float]] = [({}, score({}))]
@@ -535,6 +597,13 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             silent = [m_ for m_ in mat_ids if float(np.max(level[groups == m_])) <= 1e-9]
             if silent:
                 swap_in = [int(x) for x in rng.choice(silent, size=min(n_swap, len(silent)), replace=False)]
+        # goal law: the goal's level is the LAW's decision (the plan's level hint for this commit);
+        # the realizer never searches it itself (its own terms - relation, fit of a jump branch -
+        # moved the goal for reasons unrelated to the goal term)
+        search_tracks = list(mat)
+        goal_plan_level = None
+        if goal_law and t >= law_start and hint_levels is not None:
+            goal_plan_level = max(float(hint_levels[0]), float(level[0])) if law_mono else float(hint_levels[0])
         best = None
         for jumps in combos:
             if jumps:
@@ -544,15 +613,19 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             else:
                 G0w, Gbw, S_w = G0z, Gbz, S_z
             lv = level.copy()
+            if goal_plan_level is not None:
+                lv[0] = goal_plan_level
             g = gains_plan(lv, t, rows, level, future)
-            xi_w, parts_w = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
+            xi_w, parts_w = comp(g, G0w, Gbw, S_w, prev_for(rows))
             cur_ev = J_of(xi_w, parts_w, ref, rows)
             evals += 1
             if hint_levels is not None:
                 trial = lv.copy()
                 trial[1:] = hint_levels[1:]
+                if goal_law and t >= law_start:
+                    trial[0] = max(float(hint_levels[0]), float(lv[0])) if law_mono else float(hint_levels[0])
                 g = gains_plan(trial, t, rows, level, future)
-                xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
+                xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows))
                 ev = J_of(xi_t, parts_t, ref, rows)
                 evals += 1
                 if ev["J"] < cur_ev["J"] - 1e-6:       # the level search then starts from the hinted levels
@@ -575,15 +648,17 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                                 trial[groups == m_out] = 0.0
                                 trial[int(m_in)] = st_now[m_out]          # first voice of the entering material
                                 g = gains_plan(trial, t, rows, level, future)
-                                xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
+                                xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows))
                                 ev = J_of(xi_t, parts_t, ref, rows)
                                 evals += 1
                                 if ev["J"] < cur_ev["J"] - 1e-6:
                                     cur_ev, lv, xi_w, parts_w = ev, trial, xi_t, parts_t
                                     improved = True
                                     st_now = material_strength(lv)
-                for i in mat:
+                for i in search_tracks:
                     for sign in (1.0, -1.0):
+                        if i == 0 and law_mono and sign < 0:
+                            continue                                   # the goal never recedes under the law
                         trial = lv.copy()
                         trial[i] = float(np.clip(trial[i] + sign * step, 0.0, 1.0))
                         if abs(trial[i] - lv[i]) < 1e-9:
@@ -595,7 +670,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                             if any(st_tr[m_] <= 1e-9 for m_ in locked_now):
                                 continue                                   # a material inside its minimum sounding time
                         g = gains_plan(trial, t, rows, level, future)
-                        xi_t, parts_t = an.composition_from_grams(g, G0w, Gbw, S_w, prev_ratios=prev_for(rows))
+                        xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows))
                         ev = J_of(xi_t, parts_t, ref, rows)
                         evals += 1
                         if ev["J"] < cur_ev["J"] - 1e-6:
@@ -616,7 +691,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             state.last_jump[i] = t
             jumps_made += 1
         for i in range(M):
-            if i == 0:
+            if i == 0 and not (goal_law and t >= law_start):
                 continue
             a, b = float(level[i]), float(lv_best[i])
             r_end = min(t + ramp, c_end)
@@ -632,6 +707,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         k_c = np.searchsorted(rows, rows_c)
         xi_c = xi_w[k_c]
         parts_c = {k: (v[k_c] if isinstance(v, np.ndarray) and v.shape[0] == len(rows) else v) for k, v in parts_w.items()}
+        parts_c.pop("xi_materials", None)
         xi_committed[rows_c] = xi_c
         c_committed[rows_c] = parts_c["c"]
         flux_prev["row"] = int(rows_c[-1])
@@ -678,6 +754,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                           "jumps": {int(k): int(v) for k, v in jumps.items()}, "combos": len(combos),
                           "levels": lv_best.tolist(), "history_rho": hlog.get("rho"), "events_committed": len(events),
                           "mode_observe": mstat})
+        if goal_law and t >= law_start:
+            step_logs[-1]["goal_level"] = float(lv_best[0])
         if hold_on:
             taken = {int(i_): int(p_) for i_, p_ in jumps.items() if hint_jumps.get(i_) == p_}
             if cap > 0:
@@ -692,7 +770,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 held["pending"].pop(int(i_), None)
         state.entered_at = advance_entries(state.entered_at, level, lv_best, int(t))
         level = lv_best.copy()
-        level[0] = float(goal_curve.values(np.array([c_end - 1]))[0]) if c_end > unit.start else level[0]
+        if not (goal_law and t >= law_start):
+            level[0] = float(goal_curve.values(np.array([c_end - 1]))[0]) if c_end > unit.start else level[0]
         t = c_end
     # ---- deterministic tail: materials ramp to 0 over the goal rise, goal follows its schedule
     if rise_start is not None:
@@ -711,9 +790,18 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             a = float(level[i])
             if t < unit.end:
                 state.segments[i].append(Segment("HOLD", t, unit.end, a, a, "ZERO_HOLD" if a <= 1e-12 else "LEVEL_HOLD"))
-    state.segments[0].extend(goal_segs)
+    if goal_law:
+        a0 = float(level[0])                     # the final rise starts from the level the law reached
+        if a0 >= 1.0 - 1e-12:
+            state.segments[0].append(Segment("HOLD", rise_start, t1, 1.0, 1.0, "LEVEL_HOLD"))
+        else:
+            state.segments[0].append(Segment("Q5", rise_start, t1, a0, 1.0, "MOVE"))
+        if unit.end > t1:
+            state.segments[0].append(Segment("HOLD", t1, unit.end, 1.0, 1.0, "GOAL_HOLD"))
+    else:
+        state.segments[0].extend(goal_segs)
     state.level = level.copy()
-    state.level[0] = float(goal_curve.values(np.array([unit.end - 1]))[0])
+    state.level[0] = 1.0 if goal_law else float(goal_curve.values(np.array([unit.end - 1]))[0])
     # ---- final unit composition at the actual positions
     curves = [TrackCurve([sg for sg in state.segments[i] if sg.start >= unit.start and sg.end <= unit.end], [], list(state.clips[i]))
               for i in range(M)]
@@ -791,6 +879,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         "unit_reference": {"id": R0.id, "hash": _hash_array(R0.xi_hat), "proposals": len(props0)},
         "steps": step_logs, "commits": n_commits, "history_updates": n_commits, "step_evaluations": total_evals,
         "jumps": jumps_made, "fragment_vocabulary": frag,
+        **({"goal_law": True, "goal_law_start_frame": int(law_start)} if goal_law else {}),
         "realization_summary": {
             "mean_initial_joint_objective": float(np.mean(J0s)) if J0s else None,
             "mean_final_joint_objective": float(np.mean(J1s)) if J1s else None,

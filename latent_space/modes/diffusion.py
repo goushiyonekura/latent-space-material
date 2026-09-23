@@ -217,6 +217,7 @@ this module behaves exactly as before, bit for bit (`dev/compare_legacy.py diffu
 """
 from __future__ import annotations
 
+import copy
 import itertools
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -263,10 +264,10 @@ class FieldParams:
 
     __slots__ = ("d_phi", "M", "d_xi", "n_pairs", "phi_anchor", "cG", "w", "s", "d", "beta",
                  "ti", "tj", "tl", "o", "xi_goal", "W", "rows", "pair_mask", "n_free",
-                 "lam_phi", "lam_2", "lam_3", "lam_G", "eps_D")
+                 "lam_phi", "lam_2", "lam_3", "lam_G", "eps_D", "goal_exp")
 
     def __init__(self, d_phi, M, d_xi, phi_anchor, cG, w, s, d, beta, triples, o, xi_goal, W,
-                 rows, lam_phi, lam_2, lam_3, lam_G, eps_D):
+                 rows, lam_phi, lam_2, lam_3, lam_G, eps_D, goal_exp=2.0):
         self.d_phi = int(d_phi)
         self.M = int(M)
         self.d_xi = int(d_xi)
@@ -290,6 +291,7 @@ class FieldParams:
         self.lam_3 = float(lam_3)
         self.lam_G = float(lam_G)
         self.eps_D = float(eps_D)
+        self.goal_exp = float(goal_exp)         # weight (1-o)^p of the goal term; 2.0 = the audited form
 
 
 def field_terms(P: FieldParams, xi: np.ndarray, want_grad: bool = False):
@@ -324,7 +326,7 @@ def field_terms(P: FieldParams, xi: np.ndarray, want_grad: bool = False):
     t_ridge = P.eps_D * (xi * xi).sum(axis=1)
 
     dg = xi - P.xi_goal
-    gw = (1.0 - o) ** 2
+    gw = (1.0 - o) ** 2 if P.goal_exp == 2.0 else (1.0 - o) ** P.goal_exp
     t_goal = P.lam_G * gw * ((dg * dg) @ P.W)
 
     e = t_anchor + t_pair + t_triple + t_ridge + t_goal
@@ -355,6 +357,20 @@ def _eval_mask(P: FieldParams, n: int) -> np.ndarray:
 def field_energy(P: FieldParams, xi: np.ndarray) -> float:
     """<.> of eq. (28): the mean of the row energy over the evaluation (non-hold) rows."""
     e, _, _ = field_terms(P, xi, want_grad=False)
+    return float(e[_eval_mask(P, len(e))].mean())
+
+
+def field_energy_goal_law(P: FieldParams, xi_full: np.ndarray, xi_mat: Optional[np.ndarray]) -> float:
+    """Exposure policy 'contract_law': the anchor / pair / triple / ridge terms are evaluated on the
+    MATERIAL-ONLY rows (the same windows with the goal silent) and only the lam_G (1-o)^2 term on the
+    full rows.  Otherwise a loud goal lowers the material terms for reasons unrelated to convergence
+    (every material share shrinks; a goal-dominated mixture is trivially 'typical'), which made the
+    law raise the goal to 1 at the first CONTRACT commit."""
+    if xi_mat is None:
+        return field_energy(P, xi_full)
+    e_m, _, parts_m = field_terms(P, xi_mat, want_grad=False)
+    _, _, parts_f = field_terms(P, xi_full, want_grad=False)
+    e = e_m - parts_m["goal"] + parts_f["goal"]
     return float(e[_eval_mask(P, len(e))].mean())
 
 
@@ -391,6 +407,7 @@ class DiffusionMode(ModeController):
         self.tau = float(p.get("step", 0.01))
         self.T_per_o = float(p.get("temperature_per_openness", 0.05))
         self.kappa_E = float(p.get("kappa_E", 0.25))
+        self.goal_exp = float((cfg.get("objective") or {}).get("contract_goal_weight_exponent", 2.0))
         self.kappa_M = float(p.get("kappa_M", 0.5))
         self.anchor_nongoal = float(p.get("anchor_nongoal_gain", 0.4))
         self.anchor_goal = float(p.get("anchor_goal_gain", 0.1))
@@ -703,7 +720,7 @@ class DiffusionMode(ModeController):
         return FieldParams(self.d_phi, unit.M, self.d_xi, self.phi_anchor[idx], self.cG[idx],
                            coef["w"], coef["s"], coef["d"], coef["beta"], self.triples,
                            unit.o[idx], unit.xi_goal[idx], self.Wv, ev,
-                           self.lam_phi, self.lam_2, self.lam_3, self.lam_G, self.eps_D)
+                           self.lam_phi, self.lam_2, self.lam_3, self.lam_G, self.eps_D, goal_exp=self.goal_exp)
 
     # ------------------------------------------------------------------ fragment vocabulary
     def _fragment_ready(self) -> bool:
@@ -836,7 +853,7 @@ class DiffusionMode(ModeController):
                            rep(coef["w"][k]), coef["s"], rep(coef["d"][k]), coef["beta"], self.triples,
                            np.full(n_rep, float(unit.o[row])), rep(unit.xi_goal[row]), self.Wv,
                            np.ones(n_rep, dtype=bool), self.lam_phi, self.lam_2, self.lam_3,
-                           self.lam_G, self.eps_D)
+                           self.lam_G, self.eps_D, goal_exp=self.goal_exp)
 
     def _frag_time_process(self, unit: UnitContext, idx: np.ndarray, coef: Dict[str, Any],
                            xi_current: np.ndarray, n_prop: int) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -993,7 +1010,8 @@ class DiffusionMode(ModeController):
             ev = np.ones(len(sel), dtype=bool)
         return FieldParams(P.d_phi, P.M, P.d_xi, P.phi_anchor[sel], P.cG[sel], P.w[sel], P.s,
                            P.d[sel], P.beta, np.stack([P.ti, P.tj, P.tl], axis=1), P.o[sel],
-                           P.xi_goal[sel], P.W, ev, P.lam_phi, P.lam_2, P.lam_3, P.lam_G, P.eps_D)
+                           P.xi_goal[sel], P.W, ev, P.lam_phi, P.lam_2, P.lam_3, P.lam_G, P.eps_D,
+                           goal_exp=P.goal_exp)
 
     def _source_group(self, track: int) -> int:
         """Tracks that play the SAME source (a material's second voice) share one visit memory:
@@ -1451,6 +1469,11 @@ class DiffusionMode(ModeController):
         M = unit.M
         mats = list(range(1, M))
         lv0 = np.asarray(rs["levels"], dtype=np.float64)
+        # exposure policy 'contract_law' (engine flag): the goal level is a coordinate of the plan
+        # (level moves only, never jumps; non-decreasing when the engine says so)
+        goal_law = bool(rs.get("goal_law", False))
+        goal_mono = bool(rs.get("goal_law_monotonic", True))
+        goal_mob = float(rs.get("goal_law_mobility", 1.0))
         # ---- polyphony cap: at most `cap` MATERIALS may sound at once (the voices of one material
         # count once).  With the cap on, "which materials sound" is the main decision: level moves
         # and the finite-difference gradient are spent on the sounding materials only, and a silent
@@ -1489,6 +1512,8 @@ class DiffusionMode(ModeController):
             for k_ in range(K):
                 nl = lv.copy()
                 nl[1:] = np.clip(lv[1:] + deltas[k_][1:], 0.0, 1.0)
+                if goal_law:
+                    nl[0] = float(np.clip(lv[0] + deltas[k_][0], lv[0] if goal_mono else 0.0, 1.0))
                 if cap_on:
                     # the projection the engine applies inside plan_rows is part of the state: a
                     # material the cap removes is really silent for the rest of the plan
@@ -1504,6 +1529,8 @@ class DiffusionMode(ModeController):
             nonlocal evals
             xi_, _p_, info_ = prows(steps_, rws_)
             evals += 1
+            if goal_law:                         # material terms on the goal-silent rows, goal term on the full rows
+                return field_energy_goal_law(P_, xi_, info_.get("xi_materials")), xi_, info_
             return float(field_energy(P_, xi_)), xi_, info_
 
         # rows each frame is scored on (the rows its move can still change) and the hold rows
@@ -1727,8 +1754,21 @@ class DiffusionMode(ModeController):
                     e_h, _xh, _ih = ev(build(), rws, P_sel)
                     e_fd.append(e_h)
                     grad[i - 1] = sgn * (e_h - e_base) / _HOLD_FD_H
+                grad0 = 0.0
+                if goal_law:
+                    # the goal's own finite-difference slope (upward probe; a downward probe is a
+                    # no-op under the monotonic rule)
+                    sgn0 = 1.0 if float(steps_cur[k]["levels"][0]) + _HOLD_FD_H <= 1.0 else -1.0
+                    if sgn0 > 0 or not goal_mono:
+                        deltas[k] = d_save.copy()
+                        deltas[k][0] += sgn0 * _HOLD_FD_H
+                        e_h0, _xh0, _ih0 = ev(build(), rws, P_sel)
+                        e_fd.append(e_h0)
+                        grad0 = sgn0 * (e_h0 - e_base) / _HOLD_FD_H
                 deltas[k] = d_save.copy()
                 g_rms = float(np.sqrt(np.mean(grad * grad)))
+                if goal_law:
+                    g_rms = float(np.sqrt((np.sum(grad * grad) + grad0 * grad0) / (len(grad) + 1)))
                 spread_fd = float(np.std(e_fd))
                 T_est = max(0.0, _HOLD_T0 * self.hold_temperature_scale * T_mult * o_f * spread_fd)
                 d_lvl = _HOLD_DRIFT_LVL * self.hold_move_scale * o_f
@@ -1744,6 +1784,14 @@ class DiffusionMode(ModeController):
                     etas.append(eta)
                     dn = d_save.copy()
                     dn[1:] = d_save[1:] - eta * grad
+                    if goal_law:
+                        # the goal coordinate moves with an ABSOLUTE mobility (Langevin: step =
+                        # mobility x force), not with the RMS-normalised step of the materials: the
+                        # normalisation rescales a near-zero slope to a full step whenever the other
+                        # gradients are small too, which raised the goal at o = 1 where the law asks
+                        # for nothing.  d_lvl per unit gradient (a gradient of -1 = the strongest the
+                        # (1-o)^2 goal term can produce) gives the step budget d_lvl; clipped to it.
+                        dn[0] = d_save[0] - float(np.clip(goal_mob * d_lvl * grad0, -d_lvl, d_lvl))
                     cand_d.append(dn)
                     kinds.append("drift")
                     if c_ == 0:
@@ -1754,6 +1802,8 @@ class DiffusionMode(ModeController):
                     ep = rho * eps_run + s_in * self.rng.standard_normal(M - 1)
                     dn = d_save.copy()
                     dn[1:] = d_save[1:] - eta * grad + s_l * (ep * mask)
+                    if goal_law:
+                        dn[0] = d_save[0] - float(np.clip(goal_mob * d_lvl * grad0, -d_lvl, d_lvl))   # absolute mobility, no noise
                     cand_d.append(dn)
                     kinds.append("langevin")
                     if c_ == 0:
@@ -1870,6 +1920,8 @@ class DiffusionMode(ModeController):
                 plan_swaps += 1
             prev_set = cur_set
         return {"plan": plan, "steps": steps, "xi": xi_p, "path": path, "evaluations": int(evals),
+                "gains": np.asarray(info["gains"], dtype=np.float64),
+                "xi_materials": info.get("xi_materials"),
                 "chain": int(chain), "moves": int(moves), "lower_than_stay": int(lower),
                 "drift_informed": int(drift_informed),
                 "drift_step_levels": float(np.mean(drift_steps)) if drift_steps else 0.0,
@@ -1909,13 +1961,16 @@ class DiffusionMode(ModeController):
         hold_f = max(commit, int(rs["hold_frames"]))
         xa = np.asarray(xi_anchor, dtype=np.float64).ravel()
         runs = [self._hold_chain(unit, idx, rs, c) for c in range(max(1, int(n_prop)))]
+        goal_law = bool(rs.get("goal_law", False))
         for r in runs:
-            r["field_energy"] = float(field_energy(P_full, r["xi"]))
+            r["field_energy"] = (field_energy_goal_law(P_full, r["xi"], r.get("xi_materials")) if goal_law
+                                 else float(field_energy(P_full, r["xi"])))
         order = np.argsort([r["field_energy"] for r in runs])   # the field decides which plan leads
         e_anchor = float(field_energy(P_full, np.repeat(xa[None, :], len(idx), axis=0)))
         stay0 = [{"frame": t0, "jumps": {}, "levels": np.asarray(rs["levels"], dtype=np.float64)}]
         xi_stay, _p, _i = rs["plan_rows"](stay0, idx)
-        e_stay = float(field_energy(P_full, xi_stay))
+        e_stay = (field_energy_goal_law(P_full, xi_stay, _i.get("xi_materials")) if goal_law
+                  else float(field_energy(P_full, xi_stay)))
         self.hold_plans_evaluated_total += 1
 
         base_full = self._unit_ideal(unit)
@@ -2454,8 +2509,10 @@ class DiffusionMode(ModeController):
         return targets
 
     # ------------------------------------------------------------------ connection to real gains (§7.3)
+    accepts_xi_materials = True          # exposure policy 'contract_law' (engine passes goal-silent rows)
+
     def window_error(self, unit: UnitContext, xi_rows: np.ndarray, rows: np.ndarray,
-                     target: Target) -> float:
+                     target: Target, xi_materials: Optional[np.ndarray] = None) -> float:
         """Eq. (30) restricted to the commit window: mean d_xi^2 on the free rows of the window
         against the FROZEN reference + kappa_E * field energy of the realized composition on the
         same rows.  The per-term breakdown (anchor / pair / triple / ridge / goal) is kept for
@@ -2480,7 +2537,16 @@ class DiffusionMode(ModeController):
         m = unit.free_mask[idx]
         d = unit.analyzer.dist2(xi_rows, target.xi_hat[idx])
         fit = float(d[m].mean()) if m.any() else 0.0
-        e, _, parts = field_terms(P, xi_rows, want_grad=False)
+        if xi_materials is not None:
+            # 'contract_law': material terms on the goal-silent rows, goal term on the full rows
+            # (same split as field_energy_goal_law; otherwise a loud goal lowers the material terms)
+            e, _, parts = field_terms(P, xi_materials, want_grad=False)
+            _, _, parts_f = field_terms(P, xi_rows, want_grad=False)
+            e = e - parts["goal"] + parts_f["goal"]
+            parts = dict(parts)
+            parts["goal"] = parts_f["goal"]
+        else:
+            e, _, parts = field_terms(P, xi_rows, want_grad=False)
         ev = _eval_mask(P, len(e))
         e_field = float(e[ev].mean())
         bd = {k: float(v[ev].mean()) for k, v in parts.items()}

@@ -14,3 +14,9 @@ output_frag/*/result.wav
 output_hold/*/result.wav
 output_hold_v1_backup/
 output_fid/*/result.wav
+output_diff001/*/result.wav
+materials/
+diffusion-materials-001.zip
+output_diff002/*/result.wav
+diffusion-materials-*.zip
+output_diff00*/*1cycle*/state_trace.json

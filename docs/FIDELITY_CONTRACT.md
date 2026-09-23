@@ -148,3 +148,17 @@ Verify with `dev/fixture_hold_cap2.json` (4 materials, K = 2), `dev/fixture_hold
 K = 3), `dev/fixture_hold_n10_cap3.json` (10 materials, K = 3; the case that matters), the usual
 `dev/fixture_hold.json` (no cap: must behave as before) and `python3 dev/compare_legacy.py <mode>`; read
 `hard_checks.polyphony_cap` in the trace (`observed_max_outside_ramps` ≤ K, the time shares per count).
+
+## ゴール露出方針 `contract_law`（2026-09-23、opt-in）— 方式への契約
+
+`form.goal_exposure.policy == "contract_law"` のとき、実現層は CONTRACT の最初の確定境界から最終立ち上がり（`goal_rise_seconds` 前）までの保持で
+`unit.realizer_state` に次を加える：
+
+- `goal_law: bool` — この保持でゴール音源（トラック 0）の音量を計画の座標として動かしてよい。
+- `goal_law_monotonic: bool` — true なら音量は非減少（計画内でも、確定後も下げられない）。
+- `goal_level: float` — 保持開始時のゴール音量（下限）。
+
+契約：計画 `{"frame", "jumps", "levels"}` の `levels[0]` がゴールの終了音量で、実現層はその確定のヒント `levels[0]` をそのまま採用する（実現層はゴールを探索しない）。位置ジャンプはトラック 0 に対して不可（`plan_rows` が落とす）。
+`plan_rows` は `levels[0]` を単調に丸めてから厳密行を返す（`levels_used` に反映）。`goal_law` が false の保持では `levels[0]` は無視され
+従来の台本どおり。方式は不可逆な座標に対称雑音を載せないこと（歯車になる）。Diffusion は実装済み（ゴール座標はドリフトのみ、絶対移動度 Δg = −d_lvl·∂E/∂g、|Δg| ≤ d_lvl。場のエネルギーはアンカー・ペア・三者・リッジを `plan_rows` の `info["xi_materials"]`＝ゴールを消した同じ窓の配合で、ゴール項だけを全体配合で評価する。実現層は `window_error(..., xi_materials=)` で同じ分離を渡す。方式は `accepts_xi_materials = True` を宣言するとこの引数を受ける）。ゴール項の重み (1−o)^p の指数 p は `objective.contract_goal_weight_exponent`（既定 2）で、形式項と Diffusion のゴール項が同じ値を使う。
+VAE／Transformer／GAN は未対応（`levels[0]` を動かさない＝実現層の形式項だけが効く）。

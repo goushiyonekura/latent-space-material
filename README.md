@@ -241,3 +241,31 @@ python3 scripts/sweep_fid.py vae --holds=4 --opens=90,150,210         # 周期�
   発音数ごとの時間割合を記録。
 - 効果（素材 10 本の fixture、上限 3）：顔ぶれの入れ替えは規則なしで毎分 76／84／82／24 回（diffusion／vae／transformer／gan、発音区間の中央値
   0.5〜1.0 s）→ `min_sounding_seconds: 2` で 40／63／38／18 回（中央値 2.0〜4.8 s）。
+
+## 実素材 13 本の Diffusion 生成（2026-09-23 利用者指示）
+
+利用者提供の `diffusion-materials-001.zip`（MP3 13 本、44.1 kHz／320 kbps、18〜129 s）を `materials/diffusion-001/` に展開し、
+`sh scripts/prepare_inputs.sh materials/diffusion-001 inputs/diffusion-001` で WAV 化（スクリプトは `SRC_DIR OUT_DIR` 引数を受ける。引数なしは従来どおり）。
+設定 `project.diff001.diffusion.json`（= fid＋上限の設定に素材 13 本、OPEN 150 s＝周期 180 s、4 周期、全長 872 s）、出力 `output_diff001/diffusion/`。
+結果：BEST_EFFORT、ハード検査合格、ゴール 4 回とも完全一致、ゲージ 8.7、正味の達成率 +0.99、場エネルギー 0.21〜0.26（合法ランダム 0.47〜0.84）、
+3 素材が鳴る時間 83%、顔ぶれの入れ替え 50 回／分。詳細は `docs/HANDOFF_20260917.md` §15。
+
+同時に `latent_space/curves.py` の曲線参照（`base_values / derivatives / positions`）を、全セグメント走査から該当区間だけの走査に変えた。
+全曲レンダリングとハード検査（最終段）の費用がセグメント数に比例して増えていたため（13 本・15 分で所要 52 分、うち最終段 26 分）。
+出力はビット一致（従来 fixture 3 本＝`dev/compare_legacy.py`、短形式と全長の再生成）。所要 52.3 → 43.0 分（実現層 25 分は不変、最終段 26 → 18 分）。
+
+同日、素材を 24 本に増やした `diffusion-materials-002.zip`（追加 11 本は papillon／prism の viola・violin 別ステム）でも同じ形式で生成した：
+`materials/diffusion-002/` → `inputs/diffusion-002/`、設定 `project.diff002.diffusion.json`（**1 声**：2 声＝49 トラックはメモリ 13 GB 超の見込み）、
+出力 `output_diff002/diffusion/`。BEST_EFFORT、ハード検査合格、場エネルギー 0.25〜0.33（合法ランダム 0.62〜1.50）、3 素材が鳴る時間 78%、
+顔ぶれの入れ替え 63 回／分（発音区間の中央値 2.0 s）、所要 37 分。詳細は `docs/HANDOFF_20260917.md` §16。
+
+## ゴール露出方針 `contract_law`（2026-09-23 夕、利用者指示「案 d」。opt-in、既定は無変更）
+
+`form.goal_exposure.policy: "contract_law"` にすると、CONTRACT の間だけゴール音源が**法則の選べる素材**になる：実現層はトラック 0 を素材と同じ
+「探索されるトラック」として扱い（音量のみ、位置ジャンプなし、`law_monotonic` で非減少）、最終立ち上がり（`hires.goal_rise_seconds`）は法則が到達した
+音量から 1 へ、GOAL_HOLD は厳密のまま。Diffusion の保持連鎖は計画にゴール音量の座標を持ち、場のエネルギーは**素材の項（アンカー・ペア・三者・リッジ）を
+ゴール抜きの配合**（`plan_rows` の `info["xi_materials"]`）で、**ゴール項 λ_G(1−o)² d²(ξ, ξ_goal) だけを全体の配合**で評価する。ゴール座標は雑音なしの
+ドリフトだけで、絶対移動度 Δg = −d_lvl·∂E/∂g（|Δg| ≤ d_lvl）で動く。実現層が方式に渡す評価（`window_error(..., xi_materials=)`）も同じ分離。
+`objective.contract_goal_weight_exponent`（既定 2.0＝従来）で CONTRACT の重み (1−o)^p の指数を変えられる（形式項と Diffusion のゴール項の両方。大きくするとゴールの出現が後ろへ寄り急になる。180 s 形式で 2:30 頃なら p≈40）。他の三方式は未対応（計画のゴール音量を
+動かさない）。契約は `docs/FIDELITY_CONTRACT.md` 末尾、経過と結果は `docs/HANDOFF_20260917.md` §17。従来設定の出力はビット一致
+（従来 fixture 3 本、保持経路 107 s、1 周期 T2.0）。

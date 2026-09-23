@@ -1,0 +1,135 @@
+{
+  "spec_version": "1.1",
+  "mode": "diffusion",
+  "seed": 48291,
+  "materials": [
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/luminusity_7_02.10.047_02.29.381.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/luminasity_8_02.29.381_02.47.541.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/luminasity_9_02.47.541_03.07.094.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/luminasity_10_03.07.094_03.27.266.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/luminasity_11_03.27.266_03.50.423.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/luminasity_14_04.39.213_04.59.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/papillon_1_00.00.000_01.29.318.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/papillon_2_01.29.318_03.06.429.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/papillon_4_04.34.344_06.43.645.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/papillon_5_06.43.645_08.13.352.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/prism_1_00.00.000_01.28.904.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/prism_2_01.28.904_02.38.937.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/prism_3_04.46.624_06.25.707.wav"
+  ],
+  "goal": "/Users/goushiyonekura/Claude/latent-space-material/inputs/diffusion-001/material_GOAL_001.wav",
+  "base_level": {
+    "policy": "shared_static_peak_bound",
+    "sample_peak_cap": 0.85
+  },
+  "form": {
+    "cycles": 4,
+    "timing_policy": "adaptive",
+    "intro_seconds": 12,
+    "open_seconds": 150,
+    "contract_seconds": 30,
+    "goal_hold_seconds": 5,
+    "reopen_seconds": 30,
+    "final_reopen": true,
+    "goal_exposure": {
+      "policy": "contract_only",
+      "intro_max": 0.0,
+      "open_max": 0.0
+    }
+  },
+  "analysis": {
+    "window_frames": 2048,
+    "hop_seconds": 0.1,
+    "spectral_bands": 24,
+    "band_edges_hz": [
+      0.0,
+      40.0,
+      52.6,
+      69.3,
+      91.1,
+      119.9,
+      157.8,
+      207.6,
+      273.1,
+      359.4,
+      472.9,
+      622.2,
+      818.7,
+      1077.3,
+      1417.5,
+      1865.1,
+      2454.1,
+      3229.1,
+      4248.9,
+      5590.7,
+      7356.2,
+      9679.2,
+      12735.9,
+      16757.9
+    ],
+    "model_step_seconds": 0.5
+  },
+  "search": {
+    "candidate_bank_target": 16,
+    "max_total_candidates_per_cycle": 64,
+    "targets_per_round": 4
+  },
+  "history": {
+    "enabled": true,
+    "update_rate": 0.1,
+    "recent_event_capacity": 16,
+    "parent_capacity": 8
+  },
+  "render": {
+    "format": "WAV_FLOAT32",
+    "processing_precision": "float64",
+    "block_frames": 8192,
+    "master": {
+      "enabled": true,
+      "compressor": {
+        "enabled": true,
+        "threshold_dbfs": -20.0,
+        "ratio": 3.0,
+        "attack_ms": 10.0,
+        "release_ms": 250.0,
+        "knee_db": 6.0
+      },
+      "normalize_peak_dbfs": -1.0,
+      "limiter": {
+        "enabled": true,
+        "ceiling_dbfs": -1.0,
+        "lookahead_ms": 5.0,
+        "release_ms": 80.0
+      }
+    }
+  },
+  "calibration_status": "UNVERIFIED",
+  "mode_defaults": {
+    "vae_latent_dim": 4
+  },
+  "hires": {
+    "enabled": true,
+    "commit_seconds": 0.5,
+    "lookahead_seconds": 4.0,
+    "ramp_seconds": 0.25,
+    "switch_seconds": 0.05,
+    "position_jumps": true,
+    "jump_candidates": 3,
+    "min_clip_seconds": 2.0,
+    "level_step": 0.12,
+    "max_sweeps": 3,
+    "n_reference_proposals": 1,
+    "goal_rise_seconds": 12.0,
+    "fragment_vocabulary": true,
+    "clip_feature_seconds": 2.0,
+    "beam_width": 3,
+    "candidate_rows": 8,
+    "reference_hold_seconds": 2.0,
+    "reference_selection": "first",
+    "reference_anchor": "block_mean",
+    "voices_per_material": 2,
+    "explore_tracks_max": 3,
+    "max_active_materials": 3,
+    "min_sounding_seconds": 2.0
+  }
+}

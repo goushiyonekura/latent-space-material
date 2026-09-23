@@ -47,6 +47,7 @@ class Objective:
         self.n_eff_target = float(o.get("n_eff_target", 2.0))
         self.w_energy = float(o.get("w_energy", 0.25))
         self.energy_min_ratio = float(o.get("energy_min_ratio", 0.05))
+        self.goal_exp = float(o.get("contract_goal_weight_exponent", 2.0))
         self.rel = dict(cfg.get("realization", {}))
 
     # ------------------------------------------------------------------ E_form
@@ -62,7 +63,8 @@ class Objective:
         c = parts["c"]
         nongoal = c[:, 1:].sum(axis=1)
         pen = np.zeros(len(rows))
-        pen[contract] = (1.0 - o[contract]) ** 2 * d2_goal[contract]
+        oc = 1.0 - o[contract]
+        pen[contract] = (oc ** 2 if self.goal_exp == 2.0 else oc ** self.goal_exp) * d2_goal[contract]
         short = np.maximum(self.open_target - nongoal[opening], 0.0)
         pen[opening] = (o[opening] ** 2) * short ** 2
         # audit E3: effective number of participating materials and mixture energy (OPEN-like rows)
