@@ -39,6 +39,7 @@ class Analyzer:
         self.eps = float(a["feature_epsilon"])
         self.std_floor = float(a["feature_std_floor"])
         self.sigma_F = float(a.get("sigma_F", cfg["mode_defaults"]["transformer"].get("sigma_F", 1.0)))
+        self.occ_threshold = float(a.get("occupancy_threshold", 0.25))
         self.w_phi = float(obj["w_phi"])
         self.w_c = float(obj["w_c"])
         self.w_R = float(obj["w_R"])
@@ -215,11 +216,15 @@ class Analyzer:
         self.frag_rows = n
         self.frag_f: List[np.ndarray] = []
         self.frag_E: List[np.ndarray] = []
+        # sparsity convergence: occupancy of the clip that follows each position = the share of its
+        # hops whose solo energy exceeds occupancy_threshold x the source's median (non-silent) energy
+        self.frag_occ: List[np.ndarray] = []
         for i in range(self.M):
             j = next((k for k in range(i) if self.solo_f[k] is self.solo_f[i]), None)
             if j is not None:                      # second voice of the same source
                 self.frag_f.append(self.frag_f[j])
                 self.frag_E.append(self.frag_E[j])
+                self.frag_occ.append(self.frag_occ[j])
                 continue
             f = self.solo_f[i]
             E = self.solo_E[i]
@@ -227,6 +232,56 @@ class Analyzer:
             idx = (np.arange(P)[:, None] + np.arange(n)[None, :]) % P
             self.frag_f.append(f[idx].mean(axis=1))
             self.frag_E.append(E[idx].mean(axis=1))
+            nz = E[E >= self.silence_energy]
+            med = float(np.median(nz)) if len(nz) else float(self.silence_energy)
+            self.frag_occ.append((E[idx] > self.occ_threshold * med).mean(axis=1))
+        # the goal's own occupancy on the continuous clock, per analysis row (the target of the pull)
+        L0 = int(self.source_lengths[0])
+        k0 = np.clip(np.round((self.starts % L0) / float(self.solo_hop)).astype(np.int64), 0, len(self.frag_occ[0]) - 1)
+        self.goal_occ_all = self.frag_occ[0][k0]
+
+    def occupancy_at(self, positions: np.ndarray) -> np.ndarray:
+        """Clip occupancy (n, M) of every track at explicit source positions (nearest fragment)."""
+        positions = np.asarray(positions, dtype=np.int64)
+        out = np.zeros(positions.shape, dtype=np.float64)
+        for i in range(self.M):
+            k = np.clip(np.round(positions[:, i] / float(self.solo_hop)).astype(np.int64), 0, len(self.frag_occ[i]) - 1)
+            out[:, i] = self.frag_occ[i][k]
+        return out
+
+    @staticmethod
+    def presence_terms(gains: np.ndarray, solo_f: np.ndarray, occ: np.ndarray, occ_goal: np.ndarray,
+                       w_phi: float, w_occ: float, eps: float = 1e-6, d_empty: float = 1.7):
+        """Per row, over the SOUNDING materials (gain > eps, the goal excluded): their number, the mean
+        spectral distance of their solo fragment features to the goal's own solo features at the same
+        row, and the mean squared occupancy difference to the goal's.  Levels do not enter beyond
+        presence, so lowering a material's level changes nothing until it is silent."""
+        g = np.asarray(gains, dtype=np.float64)
+        on = (g[:, 1:] > eps).astype(np.float64)                      # (n, M-1)
+        n_s = on.sum(axis=1)
+        f = np.asarray(solo_f, dtype=np.float64)                       # (n, M, d_phi)
+        d_spec_i = w_phi * ((f[:, 1:, :] - f[:, :1, :]) ** 2).mean(axis=2)          # (n, M-1)
+        d_occ_i = w_occ * (np.asarray(occ)[:, 1:] - np.asarray(occ_goal)[:, None]) ** 2
+        denom = np.maximum(n_s, 1.0)
+        spec = (d_spec_i * on).sum(axis=1) / denom
+        occ_t = (d_occ_i * on).sum(axis=1) / denom
+        # an empty set is not "distance 0": silence is as far from the goal as a poor material, scaled by
+        # the goal's absence (with the goal fully in, no material is needed)
+        empty = n_s <= 0
+        spec = np.where(empty, d_empty * (1.0 - np.clip(g[:, 0], 0.0, 1.0)), spec)
+        occ_t = np.where(empty, 0.0, occ_t)
+        return n_s, spec, occ_t
+
+    @staticmethod
+    def sparsity_terms(c: np.ndarray, occ: np.ndarray, occ_goal: np.ndarray, eps: float = 1e-12):
+        """Per row: effective number of sources N_eff (all tracks, goal included) and the
+        contribution-weighted mixture occupancy; used by the 'sparsity' convergence measure."""
+        c = np.asarray(c, dtype=np.float64)
+        tot = c.sum(axis=1)
+        p = c / (tot[:, None] + eps)
+        neff = np.where(tot > 1e-9, 1.0 / (np.sum(p * p, axis=1) + eps), 1.0)
+        occ_mix = np.where(tot > 1e-9, (c * occ).sum(axis=1) / (tot + eps), occ_goal)
+        return neff, occ_mix
 
     def fragment_composition(self, sources: Sequence[np.ndarray], positions: np.ndarray, levels: np.ndarray,
                              offsets: np.ndarray):

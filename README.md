@@ -269,3 +269,9 @@ python3 scripts/sweep_fid.py vae --holds=4 --opens=90,150,210         # 周期�
 `objective.contract_goal_weight_exponent`（既定 2.0＝従来）で CONTRACT の重み (1−o)^p の指数を変えられる（形式項と Diffusion のゴール項の両方。大きくするとゴールの出現が後ろへ寄り急になる。180 s 形式で 2:30 頃なら p≈40）。他の三方式は未対応（計画のゴール音量を
 動かさない）。契約は `docs/FIDELITY_CONTRACT.md` 末尾、経過と結果は `docs/HANDOFF_20260917.md` §17。従来設定の出力はビット一致
 （従来 fixture 3 本、保持経路 107 s、1 周期 T2.0）。
+
+## 2026-09-23 のまとめと引き継ぎ
+
+ゴール露出方針 `contract_law`（CONTRACT 中はゴール音量を Diffusion の法則が選ぶ）と収束の物差し `convergence: sparsity / presence`、指数の分離
+（素材側 p、ゴール進入 q）、抜ける手（drop）を opt-in で実装。現在の状態・設定キー・結果・留保・次の候補は `docs/HANDOFF_20260923.md`（§13 が
+次セッション冒頭の再出力ブロック）、詳細経緯は `docs/HANDOFF_20260917.md` §15〜§17。

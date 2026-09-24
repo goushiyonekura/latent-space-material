@@ -48,6 +48,15 @@ class Objective:
         self.w_energy = float(o.get("w_energy", 0.25))
         self.energy_min_ratio = float(o.get("energy_min_ratio", 0.05))
         self.goal_exp = float(o.get("contract_goal_weight_exponent", 2.0))
+        ge = cfg.get("form", {}).get("goal_exposure", {}) or {}
+        self.convergence = str(ge.get("convergence", "share"))
+        self.sp_w_neff = float(ge.get("sparsity_w_neff", 0.25))
+        self.sp_w_occ = float(ge.get("sparsity_w_occ", 1.0))
+        self.pr_w_count = float(ge.get("presence_w_count", 0.25))
+        self.pr_w_goal = float(ge.get("presence_w_goal", 1.0))
+        self.pr_d_empty = float(ge.get("presence_empty_distance", 1.7))
+        q = ge.get("law_entry_exponent")
+        self.entry_exp = float(q) if q is not None else self.goal_exp
         self.rel = dict(cfg.get("realization", {}))
 
     # ------------------------------------------------------------------ E_form
@@ -64,7 +73,13 @@ class Objective:
         nongoal = c[:, 1:].sum(axis=1)
         pen = np.zeros(len(rows))
         oc = 1.0 - o[contract]
-        pen[contract] = (oc ** 2 if self.goal_exp == 2.0 else oc ** self.goal_exp) * d2_goal[contract]
+        if self.convergence == "presence" and parts.get("solo_f") is not None and parts.get("gains") is not None:
+            mat_t, goal_t = self.presence_terms(unit, parts, rows)
+            pen[contract] = (oc ** self.goal_exp) * mat_t[contract] + (oc ** self.entry_exp) * goal_t[contract]
+        else:
+            if self.convergence == "sparsity" and parts.get("occ") is not None:
+                d2_goal = self.sparsity_distance(unit, xi, parts, rows)
+            pen[contract] = (oc ** 2 if self.goal_exp == 2.0 else oc ** self.goal_exp) * d2_goal[contract]
         short = np.maximum(self.open_target - nongoal[opening], 0.0)
         pen[opening] = (o[opening] ** 2) * short ** 2
         # audit E3: effective number of participating materials and mixture energy (OPEN-like rows)
@@ -76,6 +91,31 @@ class Objective:
             en_pen = np.maximum(self.energy_min_ratio - E, 0.0) ** 2 / max(1e-12, self.energy_min_ratio ** 2)
             pen[opening] += (o[opening] ** 2) * (self.w_neff * neff_pen[opening] + self.w_energy * en_pen[opening])
         return pen
+
+    def sparsity_distance(self, unit, xi: np.ndarray, parts: Dict[str, np.ndarray], rows: np.ndarray) -> np.ndarray:
+        """'sparsity' convergence measure per row: spectral distance to the goal (phi block only) +
+        w_neff (N_eff - 1)^2 (fewer simultaneous sources; the goal is one source) + w_occ (occupancy of
+        the mixture - the goal's occupancy)^2 (sparser passages).  The contribution-share block of
+        d_xi^2, which is what lowered the materials' levels, is not used."""
+        an = unit.analyzer
+        rows = np.asarray(rows)
+        dphi = xi[:, :an.d_phi] - unit.xi_goal[rows][:, :an.d_phi]
+        d_spec = an.w_phi * (dphi ** 2).mean(axis=1)
+        neff, occ_mix = an.sparsity_terms(parts["c"], parts["occ"], an.goal_occ_all[rows])
+        return d_spec + self.sp_w_neff * (neff - 1.0) ** 2 + self.sp_w_occ * (occ_mix - an.goal_occ_all[rows]) ** 2
+
+    def presence_terms(self, unit, parts: Dict[str, np.ndarray], rows: np.ndarray):
+        """'presence' convergence: (material terms, goal term) per row.  Material terms = mean over the
+        sounding materials of solo spectral distance + w_occ occupancy difference, + w_count (n-1)^2;
+        goal term = w_goal (1 - goal level)^2.  They take different openness exponents (p and q)."""
+        an = unit.analyzer
+        rows = np.asarray(rows)
+        n_s, spec, occ_t = an.presence_terms(parts["gains"], parts["solo_f"], parts["occ"], an.goal_occ_all[rows],
+                                             an.w_phi, self.sp_w_occ, d_empty=self.pr_d_empty)
+        g = np.asarray(parts["gains"], dtype=np.float64)[:, 0]
+        mat = spec + occ_t + self.pr_w_count * (n_s - (1.0 - g)) ** 2      # count target 1 - goal level
+        goal = self.pr_w_goal * (1.0 - g) ** 2
+        return mat, goal
 
     def e_form(self, unit, xi: np.ndarray, parts: Dict[str, np.ndarray]) -> float:
         fm = unit.free_mask

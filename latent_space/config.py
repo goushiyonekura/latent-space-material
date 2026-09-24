@@ -58,7 +58,23 @@ DEFAULTS: Dict[str, Any] = {
         # from the level the law reached, GOAL_HOLD stays exact.
         "goal_exposure": {"policy": "contract_only", "intro_max": 0.0, "open_max": 0.0,
                           "reopen_descend_within_reopen": True, "law_monotonic": True,
-                          "law_mobility": 1.0},     # contract_law: goal step = law_mobility * d_lvl * (-dE/dg), |step| <= d_lvl
+                          "law_mobility": 1.0,      # contract_law: goal step = law_mobility * d_lvl * (-dE/dg), |step| <= d_lvl
+                          "law_step_floor": 0.0,    # contract_law: the goal's step budget uses max(o, floor) (0 = the law's o-scaling)
+                          # convergence measure of the CONTRACT pull (2026-09-23 user decision):
+                          # 'share' = d_xi^2 to the goal composition (spectrum + contribution shares + relations; lowers levels)
+                          # 'sparsity' = spectrum + N_eff -> 1 (fewer simultaneous sources) + occupancy -> the goal's (sparser passages);
+                          #   the contribution-share block is dropped
+                          "convergence": "share", "sparsity_w_neff": 0.25, "sparsity_w_occ": 1.0,
+                          # 'presence' = per-source, presence-based (2026-09-23 user decision): mean over the SOUNDING
+                          #   materials of (solo spectral distance to the goal + w_occ (occupancy - goal's)^2)
+                          #   + presence_w_count (n_sounding - 1)^2, weighted (1-o)^p, plus presence_w_goal (1-g)^2
+                          #   weighted (1-o)^q with q = law_entry_exponent (None = p).  Levels do not enter, so the
+                          #   pull acts by moving fragments, dropping sources and bringing the goal in.
+                          "presence_w_count": 0.25, "presence_w_goal": 1.0, "law_entry_exponent": None,
+                          # presence: the count target is (1 - goal level) (the last source leaves as the goal takes over)
+                          # and an EMPTY set counts as distance presence_empty_distance x (1 - goal level): silence is as
+                          # far from the goal as a poor material (90th percentile of the per-source distances = 1.7)
+                          "presence_empty_distance": 1.7},
     },
     "analysis": {
         "window_frames": 2048,
@@ -69,6 +85,7 @@ DEFAULTS: Dict[str, Any] = {
         "feature_std_floor": 0.02,
         "feature_epsilon": 1e-12,
         "model_step_seconds": 0.1,        # audit B6/C6: model-internal time step, separate from the hop
+        "occupancy_threshold": 0.25,      # sparsity convergence: a hop 'sounds' if its energy > this x the source's median
     },
     "search": {
         "candidate_bank_target": 16,
@@ -452,6 +469,8 @@ def validate_config(cfg: Dict[str, Any]) -> None:
     ge = cfg["form"]["goal_exposure"]
     if ge["policy"] not in ("contract_only", "free", "contract_law"):
         raise ValueError("form.goal_exposure.policy must be 'contract_only', 'free' or 'contract_law'")
+    if ge.get("convergence", "share") not in ("share", "sparsity", "presence"):
+        raise ValueError("form.goal_exposure.convergence must be 'share', 'sparsity' or 'presence'")
     for k in ("intro_max", "open_max"):
         if not (0.0 <= float(ge[k]) <= 1.0):
             raise ValueError(f"form.goal_exposure.{k} must be in [0, 1]")

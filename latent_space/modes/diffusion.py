@@ -360,7 +360,39 @@ def field_energy(P: FieldParams, xi: np.ndarray) -> float:
     return float(e[_eval_mask(P, len(e))].mean())
 
 
-def field_energy_goal_law(P: FieldParams, xi_full: np.ndarray, xi_mat: Optional[np.ndarray]) -> float:
+def sparsity_goal_term(P: FieldParams, xi_full: np.ndarray, sp: Dict[str, Any]) -> np.ndarray:
+    """Per-row goal term of the 'sparsity' convergence measure (form.goal_exposure.convergence):
+    lam_G (1-o)^p [ spectral distance to the goal + w_neff (N_eff - 1)^2 + w_occ (occupancy - goal's)^2 ].
+    The contribution-share block of d_xi^2 is not used (it lowered every material's level)."""
+    from ..analysis import Analyzer
+    d_phi, M = P.d_phi, P.M
+    dphi = xi_full[:, :d_phi] - P.xi_goal[:, :d_phi]
+    d_spec = (dphi * dphi) @ P.W[:d_phi]
+    neff, occ_mix = Analyzer.sparsity_terms(xi_full[:, d_phi:d_phi + M], sp["occ"], sp["occ_goal"])
+    gw = (1.0 - P.o) ** 2 if P.goal_exp == 2.0 else (1.0 - P.o) ** P.goal_exp
+    return P.lam_G * gw * (d_spec + float(sp["w_neff"]) * (neff - 1.0) ** 2
+                           + float(sp["w_occ"]) * (occ_mix - sp["occ_goal"]) ** 2)
+
+
+def presence_goal_term(P: FieldParams, pr: Dict[str, Any]) -> np.ndarray:
+    """Per-row goal term of the 'presence' convergence measure: lam_G [ (1-o)^p (mean over the sounding
+    materials of solo spectral distance to the goal + w_occ occupancy difference + w_count (n-1)^2)
+    + (1-o)^q w_goal (1 - goal level)^2 ].  Levels enter only as presence, so the pull acts by moving
+    fragments, dropping sources and bringing the goal in - never by lowering a level."""
+    from ..analysis import Analyzer
+    w_phi = float(P.W[: P.d_phi].sum())
+    n_s, spec, occ_t = Analyzer.presence_terms(pr["gains"], pr["solo_f"], pr["occ"], pr["occ_goal"], w_phi, float(pr["w_occ"]),
+                                              d_empty=float(pr.get("d_empty", 1.7)))
+    g = np.asarray(pr["gains"], dtype=np.float64)[:, 0]
+    mat = spec + occ_t + float(pr["w_count"]) * (n_s - (1.0 - g)) ** 2      # count target 1 - goal level
+    goal = float(pr["w_goal"]) * (1.0 - g) ** 2
+    om = 1.0 - P.o
+    q = float(pr["q"]) if pr.get("q") is not None else P.goal_exp
+    return P.lam_G * (om ** P.goal_exp * mat + om ** q * goal)
+
+
+def field_energy_goal_law(P: FieldParams, xi_full: np.ndarray, xi_mat: Optional[np.ndarray],
+                          sp: Optional[Dict[str, Any]] = None, pr: Optional[Dict[str, Any]] = None) -> float:
     """Exposure policy 'contract_law': the anchor / pair / triple / ridge terms are evaluated on the
     MATERIAL-ONLY rows (the same windows with the goal silent) and only the lam_G (1-o)^2 term on the
     full rows.  Otherwise a loud goal lowers the material terms for reasons unrelated to convergence
@@ -369,8 +401,14 @@ def field_energy_goal_law(P: FieldParams, xi_full: np.ndarray, xi_mat: Optional[
     if xi_mat is None:
         return field_energy(P, xi_full)
     e_m, _, parts_m = field_terms(P, xi_mat, want_grad=False)
-    _, _, parts_f = field_terms(P, xi_full, want_grad=False)
-    e = e_m - parts_m["goal"] + parts_f["goal"]
+    if pr is not None:
+        t_goal = presence_goal_term(P, pr)
+    elif sp is not None:
+        t_goal = sparsity_goal_term(P, xi_full, sp)
+    else:
+        _, _, parts_f = field_terms(P, xi_full, want_grad=False)
+        t_goal = parts_f["goal"]
+    e = e_m - parts_m["goal"] + t_goal
     return float(e[_eval_mask(P, len(e))].mean())
 
 
@@ -408,6 +446,13 @@ class DiffusionMode(ModeController):
         self.T_per_o = float(p.get("temperature_per_openness", 0.05))
         self.kappa_E = float(p.get("kappa_E", 0.25))
         self.goal_exp = float((cfg.get("objective") or {}).get("contract_goal_weight_exponent", 2.0))
+        _ge = (cfg.get("form") or {}).get("goal_exposure") or {}
+        self.sp_w_neff = float(_ge.get("sparsity_w_neff", 0.25))
+        self.sp_w_occ = float(_ge.get("sparsity_w_occ", 1.0))
+        self.pr_w_count = float(_ge.get("presence_w_count", 0.25))
+        self.pr_w_goal = float(_ge.get("presence_w_goal", 1.0))
+        self.pr_d_empty = float(_ge.get("presence_empty_distance", 1.7))
+        self.entry_exp = _ge.get("law_entry_exponent")
         self.kappa_M = float(p.get("kappa_M", 0.5))
         self.anchor_nongoal = float(p.get("anchor_nongoal_gain", 0.4))
         self.anchor_goal = float(p.get("anchor_goal_gain", 0.1))
@@ -1474,6 +1519,25 @@ class DiffusionMode(ModeController):
         goal_law = bool(rs.get("goal_law", False))
         goal_mono = bool(rs.get("goal_law_monotonic", True))
         goal_mob = float(rs.get("goal_law_mobility", 1.0))
+        goal_floor = float(rs.get("goal_law_step_floor", 0.0))
+        sparsity = (str(rs.get("convergence", "share")) == "sparsity" and hasattr(an, "goal_occ_all"))
+        sp_w = {"w_neff": float(rs.get("sparsity_w_neff", 0.25)), "w_occ": float(rs.get("sparsity_w_occ", 1.0))}
+
+        def sp_of(info_, rws_):
+            if not sparsity:
+                return None
+            return dict(sp_w, occ=an.occupancy_at(np.asarray(info_["positions"], dtype=np.int64)), occ_goal=an.goal_occ_all[rws_])
+        presence = (str(rs.get("convergence", "share")) == "presence" and hasattr(an, "goal_occ_all"))
+        pr_w = {"w_occ": float(rs.get("sparsity_w_occ", 1.0)), "w_count": float(rs.get("presence_w_count", 0.25)),
+                "w_goal": float(rs.get("presence_w_goal", 1.0)), "q": rs.get("entry_exponent"),
+                "d_empty": float(rs.get("presence_empty_distance", 1.7))}
+
+        def pr_of(info_, rws_):
+            if not presence:
+                return None
+            pos_ = np.asarray(info_["positions"], dtype=np.int64)
+            return dict(pr_w, gains=np.asarray(info_["gains"], dtype=np.float64), solo_f=an.material_features_at(pos_)[0],
+                        occ=an.occupancy_at(pos_), occ_goal=an.goal_occ_all[rws_])
         # ---- polyphony cap: at most `cap` MATERIALS may sound at once (the voices of one material
         # count once).  With the cap on, "which materials sound" is the main decision: level moves
         # and the finite-difference gradient are spent on the sounding materials only, and a silent
@@ -1530,7 +1594,7 @@ class DiffusionMode(ModeController):
             xi_, _p_, info_ = prows(steps_, rws_)
             evals += 1
             if goal_law:                         # material terms on the goal-silent rows, goal term on the full rows
-                return field_energy_goal_law(P_, xi_, info_.get("xi_materials")), xi_, info_
+                return field_energy_goal_law(P_, xi_, info_.get("xi_materials"), sp_of(info_, rws_), pr_of(info_, rws_)), xi_, info_
             return float(field_energy(P_, xi_)), xi_, info_
 
         # rows each frame is scored on (the rows its move can still change) and the hold rows
@@ -1730,6 +1794,32 @@ class DiffusionMode(ModeController):
                                 if not silent:
                                     break
                 swap_evals += n_swap_here
+                # ---------------- presence convergence: DROP candidates (a source leaves) ---------
+                # the presence measure is flat in the levels, so a source can only leave in one move;
+                # offered at the hold's first frame like the swaps, decided thermally by the field
+                if presence and k == 0 and o_f > 1e-9:
+                    act_d = sounding(steps_cur[k]["levels"])
+                    d_prev_d = (np.asarray(build()[k - 1]["levels"], dtype=np.float64) if k else lv0.copy())
+                    for a_ in list(act_d):
+                        if len(act_d) <= 1:
+                            break
+                        lv_t = np.asarray(steps_cur[k]["levels"], dtype=np.float64).copy()
+                        for i_ in voices[a_]:
+                            lv_t[i_] = 0.0
+                        d_save_s = deltas[k].copy()
+                        deltas[k] = np.zeros(M, dtype=np.float64)
+                        deltas[k][1:] = lv_t[1:] - d_prev_d[1:]
+                        e_s, x_s, i_s = ev(build(), rws, P_sel)
+                        deltas[k] = d_save_s
+                        sc = np.asarray([e_base, e_s], dtype=np.float64)
+                        a_sel, _Ts = self._hold_select(sc, o_f, T_mult)
+                        if a_sel == 1:
+                            deltas[k] = np.zeros(M, dtype=np.float64)
+                            deltas[k][1:] = lv_t[1:] - d_prev_d[1:]
+                            e_base, xi_base, info_base = float(e_s), x_s, i_s
+                            steps_cur = build()
+                            act_d = sounding(steps_cur[k]["levels"])
+                            swaps += 1
                 # ---------------- fine: the levels, by the finite-difference Langevin drift -----
                 # with the cap on, only the materials that sound may move (a level step on a silent
                 # material is undone by the projection); when fewer than `cap` sound, anyone may enter
@@ -1791,7 +1881,8 @@ class DiffusionMode(ModeController):
                         # gradients are small too, which raised the goal at o = 1 where the law asks
                         # for nothing.  d_lvl per unit gradient (a gradient of -1 = the strongest the
                         # (1-o)^2 goal term can produce) gives the step budget d_lvl; clipped to it.
-                        dn[0] = d_save[0] - float(np.clip(goal_mob * d_lvl * grad0, -d_lvl, d_lvl))
+                        d_g = _HOLD_DRIFT_LVL * self.hold_move_scale * max(o_f, goal_floor)   # law_step_floor: late steps keep a budget
+                        dn[0] = d_save[0] - float(np.clip(goal_mob * d_g * grad0, -d_g, d_g))
                     cand_d.append(dn)
                     kinds.append("drift")
                     if c_ == 0:
@@ -1803,7 +1894,8 @@ class DiffusionMode(ModeController):
                     dn = d_save.copy()
                     dn[1:] = d_save[1:] - eta * grad + s_l * (ep * mask)
                     if goal_law:
-                        dn[0] = d_save[0] - float(np.clip(goal_mob * d_lvl * grad0, -d_lvl, d_lvl))   # absolute mobility, no noise
+                        d_g = _HOLD_DRIFT_LVL * self.hold_move_scale * max(o_f, goal_floor)
+                        dn[0] = d_save[0] - float(np.clip(goal_mob * d_g * grad0, -d_g, d_g))   # absolute mobility, no noise
                     cand_d.append(dn)
                     kinds.append("langevin")
                     if c_ == 0:
@@ -1921,7 +2013,7 @@ class DiffusionMode(ModeController):
             prev_set = cur_set
         return {"plan": plan, "steps": steps, "xi": xi_p, "path": path, "evaluations": int(evals),
                 "gains": np.asarray(info["gains"], dtype=np.float64),
-                "xi_materials": info.get("xi_materials"),
+                "xi_materials": info.get("xi_materials"), "positions": np.asarray(info["positions"], dtype=np.int64),
                 "chain": int(chain), "moves": int(moves), "lower_than_stay": int(lower),
                 "drift_informed": int(drift_informed),
                 "drift_step_levels": float(np.mean(drift_steps)) if drift_steps else 0.0,
@@ -1962,14 +2054,34 @@ class DiffusionMode(ModeController):
         xa = np.asarray(xi_anchor, dtype=np.float64).ravel()
         runs = [self._hold_chain(unit, idx, rs, c) for c in range(max(1, int(n_prop)))]
         goal_law = bool(rs.get("goal_law", False))
+        sparsity = (str(rs.get("convergence", "share")) == "sparsity" and hasattr(an, "goal_occ_all"))
+        sp_w = {"w_neff": float(rs.get("sparsity_w_neff", 0.25)), "w_occ": float(rs.get("sparsity_w_occ", 1.0))}
+
+        def sp_of(positions_):
+            if not sparsity or positions_ is None:
+                return None
+            return dict(sp_w, occ=an.occupancy_at(np.asarray(positions_, dtype=np.int64)), occ_goal=an.goal_occ_all[idx])
+        presence = (str(rs.get("convergence", "share")) == "presence" and hasattr(an, "goal_occ_all"))
+        pr_w = {"w_occ": float(rs.get("sparsity_w_occ", 1.0)), "w_count": float(rs.get("presence_w_count", 0.25)),
+                "w_goal": float(rs.get("presence_w_goal", 1.0)), "q": rs.get("entry_exponent"),
+                "d_empty": float(rs.get("presence_empty_distance", 1.7))}
+
+        def pr_of(positions_, gains_):
+            if not presence or positions_ is None or gains_ is None:
+                return None
+            pos_ = np.asarray(positions_, dtype=np.int64)
+            return dict(pr_w, gains=np.asarray(gains_, dtype=np.float64), solo_f=an.material_features_at(pos_)[0],
+                        occ=an.occupancy_at(pos_), occ_goal=an.goal_occ_all[idx])
         for r in runs:
-            r["field_energy"] = (field_energy_goal_law(P_full, r["xi"], r.get("xi_materials")) if goal_law
+            r["field_energy"] = (field_energy_goal_law(P_full, r["xi"], r.get("xi_materials"), sp_of(r.get("positions")),
+                                                       pr_of(r.get("positions"), r.get("gains"))) if goal_law
                                  else float(field_energy(P_full, r["xi"])))
         order = np.argsort([r["field_energy"] for r in runs])   # the field decides which plan leads
         e_anchor = float(field_energy(P_full, np.repeat(xa[None, :], len(idx), axis=0)))
         stay0 = [{"frame": t0, "jumps": {}, "levels": np.asarray(rs["levels"], dtype=np.float64)}]
         xi_stay, _p, _i = rs["plan_rows"](stay0, idx)
-        e_stay = (field_energy_goal_law(P_full, xi_stay, _i.get("xi_materials")) if goal_law
+        e_stay = (field_energy_goal_law(P_full, xi_stay, _i.get("xi_materials"), sp_of(_i.get("positions")),
+                                        pr_of(_i.get("positions"), _i.get("gains"))) if goal_law
                   else float(field_energy(P_full, xi_stay)))
         self.hold_plans_evaluated_total += 1
 
@@ -2512,7 +2624,8 @@ class DiffusionMode(ModeController):
     accepts_xi_materials = True          # exposure policy 'contract_law' (engine passes goal-silent rows)
 
     def window_error(self, unit: UnitContext, xi_rows: np.ndarray, rows: np.ndarray,
-                     target: Target, xi_materials: Optional[np.ndarray] = None) -> float:
+                     target: Target, xi_materials: Optional[np.ndarray] = None,
+                     occ_rows: Optional[np.ndarray] = None, conv_parts: Optional[Dict[str, Any]] = None) -> float:
         """Eq. (30) restricted to the commit window: mean d_xi^2 on the free rows of the window
         against the FROZEN reference + kappa_E * field energy of the realized composition on the
         same rows.  The per-term breakdown (anchor / pair / triple / ridge / goal) is kept for
@@ -2541,10 +2654,20 @@ class DiffusionMode(ModeController):
             # 'contract_law': material terms on the goal-silent rows, goal term on the full rows
             # (same split as field_energy_goal_law; otherwise a loud goal lowers the material terms)
             e, _, parts = field_terms(P, xi_materials, want_grad=False)
-            _, _, parts_f = field_terms(P, xi_rows, want_grad=False)
-            e = e - parts["goal"] + parts_f["goal"]
+            if conv_parts is not None and hasattr(unit.analyzer, "goal_occ_all"):
+                t_goal = presence_goal_term(P, {"gains": conv_parts["gains"], "solo_f": conv_parts["solo_f"], "occ": conv_parts["occ"],
+                                                "occ_goal": unit.analyzer.goal_occ_all[idx], "w_occ": self.sp_w_occ,
+                                                "w_count": self.pr_w_count, "w_goal": self.pr_w_goal, "q": self.entry_exp,
+                                                "d_empty": self.pr_d_empty})
+            elif occ_rows is not None and hasattr(unit.analyzer, "goal_occ_all"):
+                t_goal = sparsity_goal_term(P, xi_rows, {"occ": occ_rows, "occ_goal": unit.analyzer.goal_occ_all[idx],
+                                                          "w_neff": self.sp_w_neff, "w_occ": self.sp_w_occ})
+            else:
+                _, _, parts_f = field_terms(P, xi_rows, want_grad=False)
+                t_goal = parts_f["goal"]
+            e = e - parts["goal"] + t_goal
             parts = dict(parts)
-            parts["goal"] = parts_f["goal"]
+            parts["goal"] = t_goal
         else:
             e, _, parts = field_terms(P, xi_rows, want_grad=False)
         ev = _eval_mask(P, len(e))

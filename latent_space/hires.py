@@ -196,6 +196,9 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
     goal_law = (ge["policy"] == "contract_law" and unit.goal_arrival is not None
                 and rise_start is not None and "CONTRACT" in unit.phase_frames)
     law_mono = bool(ge.get("law_monotonic", True))
+    conv_mode = str(ge.get("convergence", "share")) if hasattr(an, "frag_occ") else "share"
+    conv_sparsity = conv_mode == "sparsity"
+    conv_presence = conv_mode == "presence"
     law_start = rise_start
     if goal_law:
         c0_ = max(int(unit.phase_frames["CONTRACT"][0]), int(cur))          # never inside the REOPEN descent
@@ -254,15 +257,21 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             return flux_prev["ratios"]
         return None
 
-    def comp(g, G0, Gb, S_, prev=None):
+    def comp(g, G0, Gb, S_, prev=None, pos_=None):
         """Composition rows of a candidate; under the goal law also the rows of the same windows
         with the goal silent (`parts["xi_materials"]`, same Grams), which the Diffusion law uses to
-        judge the materials' configuration separately from the goal's presence."""
+        judge the materials' configuration separately from the goal's presence; under the sparsity
+        convergence also the clip occupancy of every track at its position (`parts["occ"]`)."""
         xi_, parts_ = an.composition_from_grams(g, G0, Gb, S_, prev_ratios=prev)
         if goal_law:
             g_m = g.copy()
             g_m[:, 0] = 0.0
             parts_["xi_materials"] = an.composition_from_grams(g_m, G0, Gb, S_, prev_ratios=prev)[0]
+        if (conv_sparsity or conv_presence) and pos_ is not None:
+            parts_["occ"] = an.occupancy_at(pos_)
+        if conv_presence and pos_ is not None:
+            parts_["gains"] = g
+            parts_["solo_f"] = an.material_features_at(pos_)[0]
         return xi_, parts_
 
     def plan_rows(steps, rws: np.ndarray, level_now: np.ndarray):
@@ -317,6 +326,11 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         G0p, Gbp = an.grams_at_positions(sources, starts_all[rws], pos)
         xi_p, parts_p = an.composition_from_grams(g, G0p, Gbp, S_p, prev_ratios=prev_for(rws))
         info_p = {"dropped_jumps": dropped, "gains": g, "positions": pos, "levels_used": levels_used}
+        if conv_sparsity or conv_presence:
+            parts_p["occ"] = an.occupancy_at(pos)
+        if conv_presence:
+            parts_p["gains"] = g
+            parts_p["solo_f"] = an.material_features_at(pos)[0]
         if goal_law:
             # the same rows with the goal silent (same Grams): the law judges the materials'
             # configuration on these and the goal's presence on the full rows (docs/FIDELITY_CONTRACT.md)
@@ -426,6 +440,12 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                     "goal_gains": goal_curve.values(centers[rows_ref]),
                     "goal_law": bool(goal_law and t >= law_start), "goal_law_monotonic": law_mono,
                     "goal_law_mobility": float(ge.get("law_mobility", 1.0)), "goal_level": float(level[0]),
+                    "goal_law_step_floor": float(ge.get("law_step_floor", 0.0)),
+                    "convergence": conv_mode,
+                    "sparsity_w_neff": float(ge.get("sparsity_w_neff", 0.25)), "sparsity_w_occ": float(ge.get("sparsity_w_occ", 1.0)),
+                    "presence_w_count": float(ge.get("presence_w_count", 0.25)), "presence_w_goal": float(ge.get("presence_w_goal", 1.0)),
+                    "presence_empty_distance": float(ge.get("presence_empty_distance", 1.7)),
+                    "entry_exponent": ge.get("law_entry_exponent"),
                     "max_active_materials": int(cap), "material_of_track": groups.tolist(),
                     "project_levels": project_levels,
                     "min_sounding_frames": int(dwell), "entered_at": dict(state.entered_at),
@@ -435,13 +455,17 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             props = mode.prepare_reference(unit, history, rows_ref, xi_anchor, n_ref) or [R0]
         G0n, Gbn = an.grams_at_positions(sources, st, pos_now)
         g_hold = gains_for(level.copy(), t, rows, level)
-        xi_hold, parts_hold = comp(g_hold, G0n, Gbn, S, prev_for(rows))
+        xi_hold, parts_hold = comp(g_hold, G0n, Gbn, S, prev_for(rows), pos_now)
 
         def J_of(xi_w, parts_w, ref, rws):
+            kw = {}
             if goal_law and getattr(mode, "accepts_xi_materials", False) and parts_w.get("xi_materials") is not None:
-                em = float(mode.window_error(unit, xi_w, rws, ref, xi_materials=parts_w["xi_materials"]))
-            else:
-                em = float(mode.window_error(unit, xi_w, rws, ref))
+                kw["xi_materials"] = parts_w["xi_materials"]
+                if conv_sparsity and parts_w.get("occ") is not None:
+                    kw["occ_rows"] = parts_w["occ"]
+                if conv_presence and parts_w.get("solo_f") is not None:
+                    kw["conv_parts"] = {"occ": parts_w["occ"], "gains": parts_w["gains"], "solo_f": parts_w["solo_f"]}
+            em = float(mode.window_error(unit, xi_w, rws, ref, **kw)) if kw else float(mode.window_error(unit, xi_w, rws, ref))
             fm = unit.free_mask[rws]
             fit = float(an.dist2(xi_w, ref.xi_hat[rws])[fm].mean()) if fm.any() else 0.0
             ef = objective.e_form_rows(unit, xi_w, parts_w, rws)
@@ -500,13 +524,15 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
             future = sorted([s_ for s_ in (ref.meta.get("plan") or []) if int(s_.get("frame", -1)) > int(t)],
                             key=lambda s_: int(s_["frame"]))
         G0z, Gbz, S_z = G0n, Gbn, S                # Grams of "no jump now"
+        pos_zz = pos_now
         if future:
             if any(s_.get("jumps") for s_ in future):
                 pos_z = positions_plan(st, None, future)
                 _fz, S_z, _cz = an.material_features_at(pos_z)
                 G0z, Gbz = an.grams_at_positions(sources, st, pos_z)
+                pos_zz = pos_z
             g_hold = gains_plan(level.copy(), t, rows, level, future)
-            xi_hold, parts_hold = comp(g_hold, G0z, Gbz, S_z, prev_for(rows))
+            xi_hold, parts_hold = comp(g_hold, G0z, Gbz, S_z, prev_for(rows), pos_zz)
             init = J_of(xi_hold, parts_hold, ref, rows)
             evals += 1
         ref_hash = _hash_array(ref.xi_hat[rows])
@@ -566,7 +592,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 _f, S_s, _c = an.material_features_at(pos_s)
                 G0s, Gbs = an.grams_at_positions(sources, st_sub, pos_s)
                 g = gains_plan(level.copy(), t, sub, level, future)
-                xi_s, parts_s = comp(g, G0s, Gbs, S_s, prev_for(sub))
+                xi_s, parts_s = comp(g, G0s, Gbs, S_s, prev_for(sub), pos_s)
                 return J_of(xi_s, parts_s, ref, sub)["J"]
 
             beam: List[Tuple[Dict[int, int], float]] = [({}, score({}))]
@@ -610,13 +636,15 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 pos_j = positions_plan(st, jumps, future)
                 _fj, S_w, _cj = an.material_features_at(pos_j)
                 G0w, Gbw = an.grams_at_positions(sources, st, pos_j)
+                pos_w = pos_j
             else:
                 G0w, Gbw, S_w = G0z, Gbz, S_z
+                pos_w = pos_zz
             lv = level.copy()
             if goal_plan_level is not None:
                 lv[0] = goal_plan_level
             g = gains_plan(lv, t, rows, level, future)
-            xi_w, parts_w = comp(g, G0w, Gbw, S_w, prev_for(rows))
+            xi_w, parts_w = comp(g, G0w, Gbw, S_w, prev_for(rows), pos_w)
             cur_ev = J_of(xi_w, parts_w, ref, rows)
             evals += 1
             if hint_levels is not None:
@@ -625,7 +653,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                 if goal_law and t >= law_start:
                     trial[0] = max(float(hint_levels[0]), float(lv[0])) if law_mono else float(hint_levels[0])
                 g = gains_plan(trial, t, rows, level, future)
-                xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows))
+                xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows), pos_w)
                 ev = J_of(xi_t, parts_t, ref, rows)
                 evals += 1
                 if ev["J"] < cur_ev["J"] - 1e-6:       # the level search then starts from the hinted levels
@@ -648,13 +676,30 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                                 trial[groups == m_out] = 0.0
                                 trial[int(m_in)] = st_now[m_out]          # first voice of the entering material
                                 g = gains_plan(trial, t, rows, level, future)
-                                xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows))
+                                xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows), pos_w)
                                 ev = J_of(xi_t, parts_t, ref, rows)
                                 evals += 1
                                 if ev["J"] < cur_ev["J"] - 1e-6:
                                     cur_ev, lv, xi_w, parts_w = ev, trial, xi_t, parts_t
                                     improved = True
                                     st_now = material_strength(lv)
+                if conv_presence and goal_law and t >= law_start:
+                    # presence convergence: a source can only LEAVE (level -> 0 in one move); lowering it
+                    # step by step changes nothing until it is silent, so the search offers the drop itself
+                    st_now = material_strength(lv)
+                    for m_out in [m_ for m_ in mat_ids if st_now[m_] > 1e-9]:
+                        if m_out in locked_now:
+                            continue
+                        trial = lv.copy()
+                        trial[groups == m_out] = 0.0
+                        g = gains_plan(trial, t, rows, level, future)
+                        xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows), pos_w)
+                        ev = J_of(xi_t, parts_t, ref, rows)
+                        evals += 1
+                        if ev["J"] < cur_ev["J"] - 1e-6:
+                            cur_ev, lv, xi_w, parts_w = ev, trial, xi_t, parts_t
+                            improved = True
+                            st_now = material_strength(lv)
                 for i in search_tracks:
                     for sign in (1.0, -1.0):
                         if i == 0 and law_mono and sign < 0:
@@ -670,7 +715,7 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                             if any(st_tr[m_] <= 1e-9 for m_ in locked_now):
                                 continue                                   # a material inside its minimum sounding time
                         g = gains_plan(trial, t, rows, level, future)
-                        xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows))
+                        xi_t, parts_t = comp(g, G0w, Gbw, S_w, prev_for(rows), pos_w)
                         ev = J_of(xi_t, parts_t, ref, rows)
                         evals += 1
                         if ev["J"] < cur_ev["J"] - 1e-6:
@@ -708,6 +753,9 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
         xi_c = xi_w[k_c]
         parts_c = {k: (v[k_c] if isinstance(v, np.ndarray) and v.shape[0] == len(rows) else v) for k, v in parts_w.items()}
         parts_c.pop("xi_materials", None)
+        parts_c.pop("occ", None)
+        parts_c.pop("gains", None)
+        parts_c.pop("solo_f", None)
         xi_committed[rows_c] = xi_c
         c_committed[rows_c] = parts_c["c"]
         flux_prev["row"] = int(rows_c[-1])

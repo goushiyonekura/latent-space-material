@@ -162,3 +162,10 @@ K = 3), `dev/fixture_hold_n10_cap3.json` (10 materials, K = 3; the case that mat
 `plan_rows` は `levels[0]` を単調に丸めてから厳密行を返す（`levels_used` に反映）。`goal_law` が false の保持では `levels[0]` は無視され
 従来の台本どおり。方式は不可逆な座標に対称雑音を載せないこと（歯車になる）。Diffusion は実装済み（ゴール座標はドリフトのみ、絶対移動度 Δg = −d_lvl·∂E/∂g、|Δg| ≤ d_lvl。場のエネルギーはアンカー・ペア・三者・リッジを `plan_rows` の `info["xi_materials"]`＝ゴールを消した同じ窓の配合で、ゴール項だけを全体配合で評価する。実現層は `window_error(..., xi_materials=)` で同じ分離を渡す。方式は `accepts_xi_materials = True` を宣言するとこの引数を受ける）。ゴール項の重み (1−o)^p の指数 p は `objective.contract_goal_weight_exponent`（既定 2）で、形式項と Diffusion のゴール項が同じ値を使う。
 VAE／Transformer／GAN は未対応（`levels[0]` を動かさない＝実現層の形式項だけが効く）。
+
+**収束の物差し（`form.goal_exposure.convergence`、2026-09-23）**：`share`（既定、d_ξ² 全体）、`sparsity`（スペクトル＋N_eff＋占有率）、`presence`
+（音源ごと・在否ベース）。実現層は候補ごとに `parts["occ"]`（占有率）、`parts["gains"]`、`parts["solo_f"]`（単独特徴）を付け、`window_error(...,
+occ_rows=)`（sparsity）または `window_error(..., conv_parts={"occ","gains","solo_f"})`（presence）で渡す。方式は `Analyzer.sparsity_terms` /
+`Analyzer.presence_terms` を使って Diffusion と同じ式（`sparsity_goal_term` / `presence_goal_term`）を評価すること。`presence` では素材は一手で
+0 にしないと抜けられないので、方式は drop 候補（鳴っている素材を 1 本消す）を計画に持つこと（Diffusion は保持の最初のフレームで熱的に選ぶ）。
+指数：素材側 p＝`objective.contract_goal_weight_exponent`、ゴール進入 q＝`form.goal_exposure.law_entry_exponent`（None＝p）。
