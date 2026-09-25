@@ -74,7 +74,16 @@ DEFAULTS: Dict[str, Any] = {
                           # presence: the count target is (1 - goal level) (the last source leaves as the goal takes over)
                           # and an EMPTY set counts as distance presence_empty_distance x (1 - goal level): silence is as
                           # far from the goal as a poor material (90th percentile of the per-source distances = 1.7)
-                          "presence_empty_distance": 1.7},
+                          "presence_empty_distance": 1.7,
+                          # presence refinements (2026-09-23 user decision "C + B"; 0 / false = previous behaviour):
+                          # B presence_w_level: while any material sounds, lam_G w (1 - level of the loudest sounding
+                          #   material)^2, without an openness factor - the level is not a convergence path, so a lone
+                          #   material cannot fade to near-silence while it still counts as present; the chain may then
+                          #   drop the LAST sounding material once the goal sounds (the handover is a drop, not a fade)
+                          # C presence_goal_push_entry: the goal's own slope from the material block (count target 1 - g,
+                          #   empty-set rule) takes the entry weight (1-o)^q instead of (1-o)^p, so nothing pushes the
+                          #   goal before its entry window (a monotonic goal never comes back down)
+                          "presence_w_level": 0.0, "presence_goal_push_entry": False},
     },
     "analysis": {
         "window_frames": 2048,
@@ -471,6 +480,10 @@ def validate_config(cfg: Dict[str, Any]) -> None:
         raise ValueError("form.goal_exposure.policy must be 'contract_only', 'free' or 'contract_law'")
     if ge.get("convergence", "share") not in ("share", "sparsity", "presence"):
         raise ValueError("form.goal_exposure.convergence must be 'share', 'sparsity' or 'presence'")
+    if float(ge.get("presence_w_level", 0.0)) < 0.0:
+        raise ValueError("form.goal_exposure.presence_w_level must be >= 0 (0 = off)")
+    if not isinstance(ge.get("presence_goal_push_entry", False), bool):
+        raise ValueError("form.goal_exposure.presence_goal_push_entry must be true or false")
     for k in ("intro_max", "open_max"):
         if not (0.0 <= float(ge[k]) <= 1.0):
             raise ValueError(f"form.goal_exposure.{k} must be in [0, 1]")

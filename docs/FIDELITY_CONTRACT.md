@@ -169,3 +169,16 @@ occ_rows=)`（sparsity）または `window_error(..., conv_parts={"occ","gains",
 `Analyzer.presence_terms` を使って Diffusion と同じ式（`sparsity_goal_term` / `presence_goal_term`）を評価すること。`presence` では素材は一手で
 0 にしないと抜けられないので、方式は drop 候補（鳴っている素材を 1 本消す）を計画に持つこと（Diffusion は保持の最初のフレームで熱的に選ぶ）。
 指数：素材側 p＝`objective.contract_goal_weight_exponent`、ゴール進入 q＝`form.goal_exposure.law_entry_exponent`（None＝p）。
+
+**presence の補正 C＋B（2026-09-23 夜、利用者判断、opt-in。既定＝従来とビット一致）**：seed 違いの生成で、在否の物差しが音量を見ないために
+(1) 最後の素材が「鳴っている」扱いのまま音量だけ ≈0 まで下がり（計画そのものが下げる。実現層は従うだけ）、(2) 連鎖が素材 0 本の状態を試す途中で
+空集合の項（素材側の指数 p で 1:00 頃から効く）がゴールを押し上げ、単調規則でそのまま残る、の二つが起き、重なると「早く入った小さなゴールだけが
+鳴る静かな区間」になった（素材 003・seed 1 の 2:05〜2:31 は出力のほぼ 100% がゴール）。
+
+- **B** `form.goal_exposure.presence_w_level`（既定 0＝無効）：素材が 1 本でも鳴っている行に λ_G·w·(1 − 最大の素材音量)²（`Analyzer.presence_level_term`）。
+  開放度の係数なし（音量は収束の経路ではないので CONTRACT 中ずっと保つ）。形式項（`objective.py`）と Diffusion の `presence_goal_term`（連鎖の評価・
+  統計・`window_error`）の両方に入る。B が有効なら、ゴールが鳴っている（計画の音量 > 0.01）保持では連鎖の drop 候補が最後の 1 本も消せる
+  （フェードで抜けられなくなるため、受け渡しは drop）。
+- **C** `form.goal_exposure.presence_goal_push_entry`（既定 false）：連鎖がゴール座標を動かす勾配を `presence_goal_slope_term` から取る。
+  素材ブロックのゴール依存分（本数の目標 1 − g、空集合の距離）を進入の重み (1−o)^q で数えるので、進入の窓より前にはゴールを押す力がない。
+  場の項はゴールを消した行で評価されるので、この差分では消える（計画の評価は増えない）。素材側が見る物差しは従来どおり。

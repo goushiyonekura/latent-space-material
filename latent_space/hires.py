@@ -445,6 +445,8 @@ def run_unit_hires(job, unit: UnitContext, state: HiresState) -> Realization:
                     "sparsity_w_neff": float(ge.get("sparsity_w_neff", 0.25)), "sparsity_w_occ": float(ge.get("sparsity_w_occ", 1.0)),
                     "presence_w_count": float(ge.get("presence_w_count", 0.25)), "presence_w_goal": float(ge.get("presence_w_goal", 1.0)),
                     "presence_empty_distance": float(ge.get("presence_empty_distance", 1.7)),
+                    "presence_w_level": float(ge.get("presence_w_level", 0.0)),
+                    "presence_goal_push_entry": bool(ge.get("presence_goal_push_entry", False)),
                     "entry_exponent": ge.get("law_entry_exponent"),
                     "max_active_materials": int(cap), "material_of_track": groups.tolist(),
                     "project_levels": project_levels,

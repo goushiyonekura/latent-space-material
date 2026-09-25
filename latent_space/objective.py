@@ -55,6 +55,7 @@ class Objective:
         self.pr_w_count = float(ge.get("presence_w_count", 0.25))
         self.pr_w_goal = float(ge.get("presence_w_goal", 1.0))
         self.pr_d_empty = float(ge.get("presence_empty_distance", 1.7))
+        self.pr_w_level = float(ge.get("presence_w_level", 0.0))
         q = ge.get("law_entry_exponent")
         self.entry_exp = float(q) if q is not None else self.goal_exp
         self.rel = dict(cfg.get("realization", {}))
@@ -76,6 +77,9 @@ class Objective:
         if self.convergence == "presence" and parts.get("solo_f") is not None and parts.get("gains") is not None:
             mat_t, goal_t = self.presence_terms(unit, parts, rows)
             pen[contract] = (oc ** self.goal_exp) * mat_t[contract] + (oc ** self.entry_exp) * goal_t[contract]
+            if self.pr_w_level > 0.0:
+                # 'B': a sounding material keeps its level (no openness factor - not a convergence path)
+                pen[contract] += self.pr_w_level * unit.analyzer.presence_level_term(parts["gains"])[contract]
         else:
             if self.convergence == "sparsity" and parts.get("occ") is not None:
                 d2_goal = self.sparsity_distance(unit, xi, parts, rows)

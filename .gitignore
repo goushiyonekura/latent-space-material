@@ -20,3 +20,7 @@ diffusion-materials-001.zip
 output_diff002/*/result.wav
 diffusion-materials-*.zip
 output_diff00*/*1cycle*/state_trace.json
+output_diff00*/*/result.wav
+xml-diffusion.zip
+xml-*.zip
+.claude/launch.json

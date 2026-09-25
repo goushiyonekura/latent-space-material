@@ -388,7 +388,29 @@ def presence_goal_term(P: FieldParams, pr: Dict[str, Any]) -> np.ndarray:
     goal = float(pr["w_goal"]) * (1.0 - g) ** 2
     om = 1.0 - P.o
     q = float(pr["q"]) if pr.get("q") is not None else P.goal_exp
-    return P.lam_G * (om ** P.goal_exp * mat + om ** q * goal)
+    out = P.lam_G * (om ** P.goal_exp * mat + om ** q * goal)
+    w_lvl = float(pr.get("w_level", 0.0))
+    if w_lvl > 0.0:
+        # 'B' (presence_w_level): the loudest sounding material keeps its level; no openness factor
+        out = out + P.lam_G * w_lvl * Analyzer.presence_level_term(pr["gains"])
+    return out
+
+
+def presence_goal_slope_term(P: FieldParams, pr: Dict[str, Any]) -> np.ndarray:
+    """'C' (presence_goal_push_entry): the part of the presence term the GOAL coordinate follows.  The
+    material block's dependence on the goal level (count target 1 - g, empty-set distance) is weighted
+    by the entry schedule (1-o)^q like the goal term itself, so before the entry window nothing pushes
+    the goal (a monotonic goal would keep any early rise).  Only differences of this quantity in the
+    goal level are used; the goal-independent parts cancel."""
+    from ..analysis import Analyzer
+    w_phi = float(P.W[: P.d_phi].sum())
+    n_s, spec, occ_t = Analyzer.presence_terms(pr["gains"], pr["solo_f"], pr["occ"], pr["occ_goal"], w_phi, float(pr["w_occ"]),
+                                              d_empty=float(pr.get("d_empty", 1.7)))
+    g = np.asarray(pr["gains"], dtype=np.float64)[:, 0]
+    mat = spec + occ_t + float(pr["w_count"]) * (n_s - (1.0 - g)) ** 2
+    goal = float(pr["w_goal"]) * (1.0 - g) ** 2
+    q = float(pr["q"]) if pr.get("q") is not None else P.goal_exp
+    return P.lam_G * (1.0 - P.o) ** q * (mat + goal)
 
 
 def field_energy_goal_law(P: FieldParams, xi_full: np.ndarray, xi_mat: Optional[np.ndarray],
@@ -452,6 +474,7 @@ class DiffusionMode(ModeController):
         self.pr_w_count = float(_ge.get("presence_w_count", 0.25))
         self.pr_w_goal = float(_ge.get("presence_w_goal", 1.0))
         self.pr_d_empty = float(_ge.get("presence_empty_distance", 1.7))
+        self.pr_w_level = float(_ge.get("presence_w_level", 0.0))
         self.entry_exp = _ge.get("law_entry_exponent")
         self.kappa_M = float(p.get("kappa_M", 0.5))
         self.anchor_nongoal = float(p.get("anchor_nongoal_gain", 0.4))
@@ -1530,7 +1553,10 @@ class DiffusionMode(ModeController):
         presence = (str(rs.get("convergence", "share")) == "presence" and hasattr(an, "goal_occ_all"))
         pr_w = {"w_occ": float(rs.get("sparsity_w_occ", 1.0)), "w_count": float(rs.get("presence_w_count", 0.25)),
                 "w_goal": float(rs.get("presence_w_goal", 1.0)), "q": rs.get("entry_exponent"),
-                "d_empty": float(rs.get("presence_empty_distance", 1.7))}
+                "d_empty": float(rs.get("presence_empty_distance", 1.7)),
+                "w_level": float(rs.get("presence_w_level", 0.0))}
+        keep_level = presence and pr_w["w_level"] > 0.0                        # 'B'
+        push_entry = presence and bool(rs.get("presence_goal_push_entry", False))   # 'C'
 
         def pr_of(info_, rws_):
             if not presence:
@@ -1538,6 +1564,11 @@ class DiffusionMode(ModeController):
             pos_ = np.asarray(info_["positions"], dtype=np.int64)
             return dict(pr_w, gains=np.asarray(info_["gains"], dtype=np.float64), solo_f=an.material_features_at(pos_)[0],
                         occ=an.occupancy_at(pos_), occ_goal=an.goal_occ_all[rws_])
+
+        def goal_slope_energy(P_, info_, rws_) -> float:
+            """'C': the presence quantity the goal coordinate follows (see presence_goal_slope_term)."""
+            t_ = presence_goal_slope_term(P_, pr_of(info_, rws_))
+            return float(t_[_eval_mask(P_, len(t_))].mean())
         # ---- polyphony cap: at most `cap` MATERIALS may sound at once (the voices of one material
         # count once).  With the cap on, "which materials sound" is the main decision: level moves
         # and the finite-difference gradient are spent on the sounding materials only, and a silent
@@ -1800,8 +1831,11 @@ class DiffusionMode(ModeController):
                 if presence and k == 0 and o_f > 1e-9:
                     act_d = sounding(steps_cur[k]["levels"])
                     d_prev_d = (np.asarray(build()[k - 1]["levels"], dtype=np.float64) if k else lv0.copy())
+                    # 'B': a held level cannot fade out, so once the goal sounds the LAST source may be
+                    # dropped too (the handover is a drop); before that at least one source stays
+                    min_left = 0 if (keep_level and float(steps_cur[k]["levels"][0]) > 0.01) else 1
                     for a_ in list(act_d):
-                        if len(act_d) <= 1:
+                        if len(act_d) <= min_left:
                             break
                         lv_t = np.asarray(steps_cur[k]["levels"], dtype=np.float64).copy()
                         for i_ in voices[a_]:
@@ -1855,6 +1889,11 @@ class DiffusionMode(ModeController):
                         e_h0, _xh0, _ih0 = ev(build(), rws, P_sel)
                         e_fd.append(e_h0)
                         grad0 = sgn0 * (e_h0 - e_base) / _HOLD_FD_H
+                        if push_entry:
+                            # 'C': the goal follows the presence block with the entry weight (1-o)^q;
+                            # the field terms are on goal-silent rows and cancel in this difference
+                            grad0 = sgn0 * (goal_slope_energy(P_sel, _ih0, rws)
+                                            - goal_slope_energy(P_sel, info_base, rws)) / _HOLD_FD_H
                 deltas[k] = d_save.copy()
                 g_rms = float(np.sqrt(np.mean(grad * grad)))
                 if goal_law:
@@ -2064,7 +2103,8 @@ class DiffusionMode(ModeController):
         presence = (str(rs.get("convergence", "share")) == "presence" and hasattr(an, "goal_occ_all"))
         pr_w = {"w_occ": float(rs.get("sparsity_w_occ", 1.0)), "w_count": float(rs.get("presence_w_count", 0.25)),
                 "w_goal": float(rs.get("presence_w_goal", 1.0)), "q": rs.get("entry_exponent"),
-                "d_empty": float(rs.get("presence_empty_distance", 1.7))}
+                "d_empty": float(rs.get("presence_empty_distance", 1.7)),
+                "w_level": float(rs.get("presence_w_level", 0.0))}
 
         def pr_of(positions_, gains_):
             if not presence or positions_ is None or gains_ is None:
@@ -2658,7 +2698,7 @@ class DiffusionMode(ModeController):
                 t_goal = presence_goal_term(P, {"gains": conv_parts["gains"], "solo_f": conv_parts["solo_f"], "occ": conv_parts["occ"],
                                                 "occ_goal": unit.analyzer.goal_occ_all[idx], "w_occ": self.sp_w_occ,
                                                 "w_count": self.pr_w_count, "w_goal": self.pr_w_goal, "q": self.entry_exp,
-                                                "d_empty": self.pr_d_empty})
+                                                "d_empty": self.pr_d_empty, "w_level": self.pr_w_level})
             elif occ_rows is not None and hasattr(unit.analyzer, "goal_occ_all"):
                 t_goal = sparsity_goal_term(P, xi_rows, {"occ": occ_rows, "occ_goal": unit.analyzer.goal_occ_all[idx],
                                                           "w_neff": self.sp_w_neff, "w_occ": self.sp_w_occ})

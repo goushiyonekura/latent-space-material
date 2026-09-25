@@ -1,0 +1,92 @@
+{
+  "spec_version": "1.1",
+  "mode": "diffusion",
+  "seed": 48291,
+  "materials": [
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_01.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_02.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_03.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_04.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_05.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_06.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_07.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_08.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_09.wav",
+    "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/material_10.wav"
+  ],
+  "goal": "/Users/goushiyonekura/Claude/latent-space-material/dev/fixtures_n10/goal.wav",
+  "form": {
+    "cycles": 2,
+    "intro_seconds": 8,
+    "open_seconds": 10,
+    "contract_seconds": 24,
+    "goal_hold_seconds": 3,
+    "reopen_seconds": 20,
+    "goal_exposure": {
+      "policy": "contract_law",
+      "convergence": "presence",
+      "law_step_floor": 0.3,
+      "law_entry_exponent": 8.0,
+      "presence_w_level": 2.0,
+      "presence_goal_push_entry": true
+    }
+  },
+  "search": {
+    "candidate_bank_target": 8,
+    "max_total_candidates_per_cycle": 24,
+    "max_search_rounds": 3
+  },
+  "calibration_status": "UNVERIFIED",
+  "hires": {
+    "enabled": true,
+    "fragment_vocabulary": true,
+    "jump_candidates": 3,
+    "reference_hold_seconds": 2.0,
+    "reference_selection": "first",
+    "reference_anchor": "block_mean",
+    "n_reference_proposals": 1,
+    "explore_tracks_max": 3,
+    "max_active_materials": 3
+  },
+  "render": {
+    "master": {
+      "enabled": true
+    }
+  },
+  "analysis": {
+    "spectral_bands": 24,
+    "band_edges_hz": [
+      0.0,
+      40.0,
+      51.1,
+      65.2,
+      83.2,
+      106.3,
+      135.7,
+      173.2,
+      221.2,
+      282.4,
+      360.6,
+      460.3,
+      587.7,
+      750.4,
+      958.0,
+      1223.1,
+      1561.6,
+      1993.8,
+      2545.5,
+      3249.9,
+      4149.3,
+      5297.6,
+      6763.6,
+      8635.3
+    ],
+    "model_step_seconds": 0.5
+  },
+  "mode_defaults": {
+    "vae_latent_dim": 3
+  },
+  "objective": {
+    "contract_goal_weight_exponent": 2.0
+  }
+}

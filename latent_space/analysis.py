@@ -273,6 +273,16 @@ class Analyzer:
         return n_s, spec, occ_t
 
     @staticmethod
+    def presence_level_term(gains: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Per row (goal_exposure.presence_w_level, 'B'): (1 - level of the loudest sounding material)^2,
+        0 when no material sounds.  The presence measure is flat in the levels, so without this nothing
+        keeps a sounding material audible; with it the loudest one is held near full level and a source
+        leaves by being dropped, not by fading."""
+        m = np.asarray(gains, dtype=np.float64)[:, 1:]
+        top = m.max(axis=1) if m.shape[1] else np.zeros(m.shape[0])
+        return np.where(top > eps, (1.0 - np.clip(top, 0.0, 1.0)) ** 2, 0.0)
+
+    @staticmethod
     def sparsity_terms(c: np.ndarray, occ: np.ndarray, occ_goal: np.ndarray, eps: float = 1e-12):
         """Per row: effective number of sources N_eff (all tracks, goal included) and the
         contribution-weighted mixture occupancy; used by the 'sparsity' convergence measure."""
