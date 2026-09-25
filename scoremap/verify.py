@@ -85,7 +85,9 @@ def split_chain(e, pos, onotes, used, staff=None):
             chain.append(o)
             total += o.dur
             p = p + o.dur
-            if not e.rest and total < e.dur and not any(t.get("type") == "start" for t in o.el.findall("tie")):
+            has_start = any(t.get("type") == "start" for t in o.el.findall("tie")) or \
+                (o.el.find("cue") is not None and any(t.get("type") == "start" for t in o.el.iter("tied")))   # cue notes carry <tied> only
+            if not e.rest and total < e.dur and not has_start:
                 return None
         return chain if total == e.dur and len(chain) > 1 else None
     for first in [o for o in onotes.get((pos, st), []) if id(o) not in used and _pitch(o.el) == _pitch(e.el)
@@ -133,6 +135,39 @@ def _subtract(iv, cuts):
     return segs
 
 
+NOTE_ORDER = ["grace", "cue", "chord", "pitch", "unpitched", "rest", "duration", "tie", "instrument", "footnote", "level",
+              "voice", "type", "dot", "accidental", "time-modification", "stem", "notehead", "notehead-text", "staff",
+              "beam", "notations", "lyric", "play", "listen"]
+DIR_ORDER = ["direction-type", "offset", "footnote", "level", "voice", "staff", "sound", "listening"]
+ATTR_ORDER = ["footnote", "level", "divisions", "key", "time", "staves", "part-symbol", "instruments", "clef",
+              "staff-details", "transpose", "for-part", "directive", "measure-style"]
+
+
+def structure_problems(root: ET.Element):
+    """Content-model checks that a MusicXML reader (Sibelius) enforces: child order of note / direction /
+    attributes, and the note kinds (a cue note has a duration and no <tie>; a grace note has no duration; a
+    regular note has a duration)."""
+    out = []
+    for tag, order in (("note", NOTE_ORDER), ("direction", DIR_ORDER), ("attributes", ATTR_ORDER)):
+        for el in root.iter(tag):
+            idx = [order.index(c.tag) if c.tag in order else 99 for c in el]
+            if any(b < a for a, b in zip(idx, idx[1:])):
+                out.append((tag, "children out of order: " + " ".join(c.tag for c in el)))
+    for n in root.iter("note"):
+        cue, grace, dur, tie = n.find("cue") is not None, n.find("grace") is not None, n.find("duration") is not None, n.find("tie") is not None
+        if cue and tie:
+            out.append(("note", "cue note with <tie>"))
+        if cue and not dur:
+            out.append(("note", "cue note without duration"))
+        if grace and dur:
+            out.append(("note", "grace note with duration"))
+        if not cue and not grace and not dur:
+            out.append(("note", "note without duration"))
+        if n.find("pitch") is None and n.find("rest") is None and n.find("unpitched") is None:
+            out.append(("note", "note without pitch / rest"))
+    return out
+
+
 def main(argv):
     out_dir, out_path, rep_path = argv[0], argv[1], argv[2]
     score_dir = argv[argv.index("--scores") + 1] if "--scores" in argv else "materials/scores-diffusion"
@@ -176,6 +211,7 @@ def main(argv):
     starts = [Fr(0)]
     for L in bars:
         starts.append(starts[-1] + Fr(L).limit_denominator(1 << 16))
+    start_off = Fr(rep.get("start_quarters", 0)).limit_denominator(1 << 10)   # the score may begin later than position 0
     synthetic = {o["pid"] for o in rep.get("out_parts", []) if o.get("synthetic")}
     policy = rep.get("merge", {}).get("policy", "move" if moves else None)
     cap = rep.get("merge", {}).get("voices")
@@ -201,7 +237,7 @@ def main(argv):
             if moved:
                 n_moved += 1
             a, b = Fr(pl["a"]), Fr(pl["b"])
-            x = Fr(pl["x"]).limit_denominator(1 << 16)
+            x = Fr(pl["x"]).limit_denominator(1 << 16) - start_off
             open_tuplets = [g for g in sc.groups if g.part == ppid and g.kind == "tuplet" and (g.start < a < g.end or g.start < b < g.end)] \
                 if rep.get("cut_rules", {}).get("cut_tuplets") else []
             src_notes = [e for e in sp.elems if e.kind == "note" and a <= e.pos < b]
@@ -301,7 +337,7 @@ def main(argv):
             sc = srcs[pmat]
             sp = sc.part(ppid)
             a, b = Fr(pl["a"]), Fr(pl["b"])
-            x = Fr(pl["x"]).limit_denominator(1 << 16)
+            x = Fr(pl["x"]).limit_denominator(1 << 16) - start_off
             skip = {g.members[-1] for g in sc.groups
                     if g.part == ppid and g.kind in ("wedge", "octave") and g.start < a and g.end == a}
             for e in sp.elems:
@@ -458,8 +494,11 @@ def main(argv):
             want_len = starts[k + 1] - starts[k]
             if m.length != want_len:
                 problems.append((mat, pid, float(m.start), f"bar {m.number} length {m.length} != {want_len}"))
+    struct = structure_problems(ET.parse(out_path).getroot())
+    for kind_, msg in struct[:20]:
+        problems.append((None, None, 0.0, f"structure: {kind_}: {msg}"))
     res = {"checked_notes": n_checked, "of_which_rebeamed": n_rebeamed[0], "notes_written_as_tied_notes": n_split[0],
-           "checked_directions": n_dirs[0], "edge_spanner_changes": n_edge, "problems": len(problems)}
+           "checked_directions": n_dirs[0], "edge_spanner_changes": n_edge, "structure_problems": len(struct), "problems": len(problems)}
     if moves or n_moved:
         res.update({"moved_passages": n_moved, "accidentals_added": n_acc[0], "rests_removed_or_split": n_rest_removed[0],
                     "tuplet_notes_approximated": n_approx[0], "rule_violations": rule})

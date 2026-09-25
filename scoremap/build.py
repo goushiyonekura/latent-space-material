@@ -12,6 +12,8 @@ instrument kind, up to N voices at once per staff (luminasity passages at most M
 once per staff, U=1: one passage at a time with its own voices); nothing is cut unless the cut rules say so.
 --staff-mm: staff height of the page layout (default 2.9 mm; with --merge the largest height that fits A2; with
 --voices 4.5 mm).
+--start Q: the score begins at position Q (earlier, empty bars dropped; time labels stay absolute).
+--hide-empty: on every page a staff without a note is hidden (staff-details print-object="no").
 --tight: notate each fragment from the clean position nearest to its heard start to the one nearest to its heard end
 (default: the cheapest option, which completes phrases).  --cut-beams / --cut-tuplets: a cut may fall inside a
 beam group (re-beamed) / a tuplet (written with approximate plain values).  User rules of 2026-09-25.
@@ -167,6 +169,23 @@ def main(argv):
     total = Fr(int(np.ceil(end)))
     bars = layout.barlines(placed, total)
     # extra barlines chosen by the user (page breaks inside long bars; notes they cut are tied)
+    if "--find-cut" in argv:
+        # diagnostic: positions (1/8 grid) in LO,HI that cut no tuplet / tremolo, with what else they would cut
+        lo_, hi_ = (Fr(v) for v in get("--find-cut", "0,0").split(","))
+        groups = [(p.out(max(g.start, p.piece.a)), p.out(min(g.end, p.piece.b)), g.kind) for p in placed
+                  for g in p.score.groups if g.kind in ("beam", "tuplet", "tremolo", "gliss") and not g.open_end
+                  and g.part == p.piece.pid and g.start < p.piece.b and g.end > p.piece.a]
+        notes_ = [(p.out(e.pos), p.out(min(e.end, p.piece.b))) for p in placed for e in p.score.part(p.piece.pid).elems
+                  if e.kind == "note" and not e.rest and not e.grace and not e.chord and e.dur > 0 and p.piece.a <= e.pos < p.piece.b]
+        print("earliest passage start:", float(min(p.x for p in placed)))
+        q = lo_
+        while q <= hi_:
+            kinds = Counter(k for (s_, e_, k) in groups if s_ < q < e_)
+            if not kinds.get("tuplet") and not kinds.get("tremolo"):
+                nn = sum(1 for (s_, e_) in notes_ if s_ < q < e_)
+                print(f"  {float(q):8.3f}: beams {kinds.get('beam', 0):2d} gliss {kinds.get('gliss', 0)} notes cut (tied) {nn:2d}")
+            q += Fr(1, 8)
+        return None
     cuts = [Fr(c).limit_denominator(1 << 10) for c in get("--cuts", "").split(",") if c.strip()]
     moved_cuts = []
     if cuts:
@@ -274,8 +293,12 @@ def main(argv):
         lay = emit.Layout.for_staff(emit.fit_staff_mm(parts))
     else:
         lay = emit.Layout()
-    emit.write(out_path, title, parts, placed, bars, defaults, dropped=dropped, layout=lay,
-               page_breaks=cuts + extra_pages, pages_only=bool(voices))
+    start_q = Fr(get("--start", "0")).limit_denominator(1 << 10)
+    facts = emit.write(out_path, title, parts, placed, bars, defaults, dropped=dropped, layout=lay,
+                       page_breaks=cuts + extra_pages, pages_only=bool(voices), start=(start_q if start_q > 0 else None),
+                       hide_empty="--hide-empty" in argv)
+    if start_q > 0:
+        bars = [Fr(b).limit_denominator(1 << 10) for b in facts["bars"]]
 
     conflicts = [(op.material, x, st) for op in parts for (x, st) in op.clef_conflicts]
     kept = {(id(p.frag)) for p in placed}
@@ -293,7 +316,8 @@ def main(argv):
            "cuts": [float(c) for c in cuts], "notes_cut_by_barlines": int(sum(op.notes_cut for op in parts)),
            "beam_groups_cut_by_barlines": int(sum(op.beams_cut for op in parts)),
            "dense_parts": [(op.material, op.src_pid, op.max_simultaneous) for op in parts if op.max_simultaneous > 4],
-           "staff_mm": lay.staff_mm,
+           "staff_mm": lay.staff_mm, "start_quarters": float(start_q), "pages": facts["pages"], "page_starts": facts["page_starts"],
+           "hidden_staves_per_page": facts["hidden_staves_per_page"], "hide_empty": "--hide-empty" in argv,
            "cut_rules": {"tight": tight, "cut_beams": cut_beams, "cut_tuplets": cut_tuplets},
            "beams_cut_at_edges": int(sum(op.beams_cut_at_edges for op in parts)),
            "tuplets_dissolved": int(sum(op.tuplets_dissolved for op in parts)),

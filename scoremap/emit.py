@@ -162,9 +162,10 @@ def split_note(el: ET.Element, parts: List[Tuple[Fr, str, int]], is_rest: bool) 
                     e.remove(x)
             stop = had_tie_stop if first else True
             start = had_tie_start if last else True
-            if stop:
+            is_cue = e.find("cue") is not None                # a cue note may carry <tied> (notation) but no <tie>
+            if stop and not is_cue:
                 ET.SubElement(e, "tie", type="stop")
-            if start:
+            if start and not is_cue:
                 ET.SubElement(e, "tie", type="start")
             for nt in list(e.findall("notations")):
                 for x in list(nt):
@@ -1417,7 +1418,16 @@ def systems_of(bars: List[Fr], lay: Layout, forced: Optional[set] = None) -> Lis
 
 def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bars: List[Fr], defaults: Optional[ET.Element],
           time_labels: bool = True, dropped: Optional[List[tuple]] = None, layout: Optional[Layout] = None,
-          page_breaks: Optional[List[Fr]] = None, pages_only: bool = False):
+          page_breaks: Optional[List[Fr]] = None, pages_only: bool = False, start: Optional[Fr] = None,
+          hide_empty: bool = False) -> dict:
+    """Returns layout facts for the report: bars used, staves hidden per page.  `start`: the score begins at this
+    position (earlier bars are dropped; time labels keep the absolute time).  `hide_empty`: on every page a staff
+    without a note is hidden (<staff-details print-object="no">); the time labels and the tempo mark sit on the
+    first staff shown on the page."""
+    if start is not None:
+        bars = [b for b in bars if b > start]
+        bars.insert(0, start)
+        page_breaks = [b for b in (page_breaks or []) if b > start]
     root = ET.Element("score-partwise", version="3.1")
     wk = ET.SubElement(root, "work")
     ET.SubElement(wk, "work-title").text = title
@@ -1473,6 +1483,8 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
     lane_dropped: Dict[int, List[tuple]] = defaultdict(list)
     for f, pid in (dropped or []):
         lane_dropped[f.lane].append((f, pid))
+    # pass 1: the events of every part
+    built = []
     for idx, op in enumerate(parts):
         labels = []
         abbr = {p.pid: (p.score_part.findtext("part-abbreviation") or p.name).strip() for p in op.score.parts}
@@ -1486,6 +1498,36 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
         evs, n_cut = split_at_barlines(evs, bars)
         op.notes_cut = n_cut
         op.beams_cut = rebeam_at_barlines(evs, bars)
+        built.append((evs, active))
+    # pages and, when asked, the staves that have a note on each page
+    page_idx = sorted(sys_starts)
+    page_range = [(bars[page_idx[k]], bars[page_idx[k + 1]] if k + 1 < len(page_idx) else bars[-1]) for k in range(len(page_idx))]
+    page_of_bar = {}
+    for k, bi in enumerate(page_idx):
+        nxt = page_idx[k + 1] if k + 1 < len(page_idx) else len(bars) - 1
+        for b_ in range(bi, nxt):
+            page_of_bar[b_] = k
+    visible: Dict[tuple, List[bool]] = {}
+    for idx, op in enumerate(parts):
+        evs, active = built[idx]
+        for st in range(1, op.staves + 1):
+            vis = []
+            for (lo, hi) in page_range:
+                vis.append((not hide_empty) or any(e.kind == "note" and e.staff == st and e.el.find("rest") is None
+                                                    and lo <= e.pos < hi for e in evs))
+            visible[(idx, st)] = vis
+    label_target = []                                         # per page: (part index, staff) that carries the time labels
+    for k in range(len(page_idx)):
+        tgt = next(((idx, st) for idx, op in enumerate(parts) for st in range(1, op.staves + 1) if visible[(idx, st)][k]), None)
+        if tgt is None:                                       # a page without any note: keep one staff for the time labels
+            tgt = (0, 1)
+            visible[(0, 1)][k] = True
+        label_target.append(tgt)
+    hidden_per_page = [sum(1 for key, vis in visible.items() if not vis[k]) for k in range(len(page_idx))]
+    # pass 2: the measures
+    for idx, op in enumerate(parts):
+        evs, active = built[idx]
+        hidden_now = {st: False for st in range(1, op.staves + 1)}
         part_el = ET.SubElement(root, "part", id=op.pid)
         # static attributes from the source part's first attributes
         fa = op.part.first_attributes
@@ -1516,6 +1558,7 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
             t = ET.SubElement(at, "time", {"print-object": "no"})
             ET.SubElement(t, "beats").text = str(beats)
             ET.SubElement(t, "beat-type").text = str(den)
+            sd_els: Dict[str, ET.Element] = {}
             if bi == 0:
                 ET.SubElement(at, "staves").text = str(op.staves)
                 if fa is not None:
@@ -1538,23 +1581,36 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
                                 s2 = ET.Element("staff-details", number=num)
                                 s2.append(copy.deepcopy(sd.find("staff-lines")))
                                 at.append(s2)
-                if idx == 0:
-                    pass
-            # tempo and time labels on the very first part
-            if idx == 0:
+                                sd_els[num] = s2
+            if hide_empty and bi in sys_starts:
+                # a staff without a note on this page is hidden (shown again on a page where it has one)
+                pg = page_of_bar[bi]
+                for st in range(1, op.staves + 1):
+                    want_hidden = not visible[(idx, st)][pg]
+                    if want_hidden != hidden_now[st] or (bi == 0 and want_hidden):
+                        sd = sd_els.get(str(st))
+                        if sd is None:
+                            sd = ET.SubElement(at, "staff-details", number=str(st))
+                        sd.set("print-object", "no" if want_hidden else "yes")
+                        hidden_now[st] = want_hidden
+            # tempo and time labels on the first staff shown on the page
+            tgt_idx, tgt_st = label_target[page_of_bar[bi]]
+            if idx == tgt_idx:
                 if bi == 0:
                     d = ET.SubElement(m, "direction", placement="above")
                     dt = ET.SubElement(d, "direction-type")
                     mt = ET.SubElement(dt, "metronome")
                     ET.SubElement(mt, "beat-unit").text = "quarter"
                     ET.SubElement(mt, "per-minute").text = "60"
-                    ET.SubElement(d, "staff").text = "1"
+                    ET.SubElement(d, "staff").text = str(tgt_st)
                     ET.SubElement(d, "sound", tempo="60")
                 if time_labels:
                     sec = float(b0)
                     lab = f"{int(sec // 60)}:{sec % 60:04.1f}"
-                    m.append(_words(lab, 1, op.main_voice.get(1, "1"), size=f"{lay.time_pt:g}", style="italic"))
+                    m.append(_words(lab, tgt_st, op.main_voice.get(tgt_st, "1"), size=f"{lay.time_pt:g}", style="italic"))
             _emit_measure(m, op, evs, active, b0, b1)
+    facts = {"bars": [float(b) for b in bars], "pages": len(page_idx), "page_starts": [float(bars[bi]) for bi in page_idx],
+             "hidden_staves_per_page": hidden_per_page, "staves_total": sum(op.staves for op in parts)}
     tree = ET.ElementTree(root)
     ET.indent(tree, space=" ")
     with open(path, "wb") as f:
@@ -1562,6 +1618,7 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
         f.write(b'<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" '
                 b'"http://www.musicxml.org/dtds/partwise.dtd">\n')
         tree.write(f, encoding="utf-8", xml_declaration=False)
+    return facts
 
 
 def _emit_measure(m: ET.Element, op: OutPart, evs: List[Ev], active: Dict[int, List[Tuple[Fr, Fr]]], b0: Fr, b1: Fr):
