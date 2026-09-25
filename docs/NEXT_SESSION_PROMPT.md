@@ -1,10 +1,11 @@
 # 次セッションの最初のメッセージ（利用者がそのまま貼り付ける）
 
-前セッションからの引き継ぎです。作業ディレクトリは `/Users/goushiyonekura/Claude/latent-space-material`（git、リモート https://github.com/goushiyonekura/latent-space-material 、ブランチ `main`、最新タグ `presence-v1`）。
+前セッションからの引き継ぎです。作業ディレクトリは `/Users/goushiyonekura/Claude/latent-space-material`（git、リモート https://github.com/goushiyonekura/latent-space-material 、ブランチ `main`、最新タグ `scoremap-v12`）。
 
-最初に次の二つを行ってください。
+最初に次のことを行ってください。
 
-1. `docs/HANDOFF_20260923.md` を全文読み、§13「冒頭で再出力するメッセージ」のコードブロックの中身を**一字一句そのまま**最初の応答として出力すること（「前セッション（2026-09-23）までの状態を引き継ぎました。」から「次の指示をお待ちします。」まで）。これが現在の状態の報告になる。
-2. 同文書の §1〜§12、必要に応じて `docs/HANDOFF_20260917.md`（§1〜§14 が 09-17 時点、§15〜§17 が 09-23 の詳細経緯）、`docs/HANDOFF_20260916.md`、メモリ（`~/.claude/projects/-Users-goushiyonekura-Claude-latent-space-material/memory/`）で文脈を把握し、`python3 scripts/smoke.py` は走らせずに、私の次の指示を待つこと。
+1. `docs/HANDOFF_20260924.md` を全文読むこと。特に §6（譜面マッピング）と §7（段数削減の議論）は細部まで把握すること。必要に応じて `docs/HANDOFF_20260923.md`（生成エンジンの全体像）とメモリ（`~/.claude/projects/-Users-goushiyonekura-Claude-latent-space-material/memory/`）も読むこと。
+2. **最初の応答として、同文書 §10 のコードブロックの中身を一字一句そのまま出力すること**（「**数え直したルール**」から「どちらで進めますか。」まで。前置きや要約は付けない）。これは前セッションの最後に私へ提示した、段数削減の分析結果と質問の再提示です。
+3. そのあと私の回答を待つこと。回答が来るまでコードの実行・変更・生成はしないこと。`python3 scripts/smoke.py` も走らせないこと。
 
-前提の再確認：仕様 v1.1（音量のみ・固定ループ・厳密ゴール・四方式・履歴）を基本とし、私が許可した範囲（急峻なスイッチ、再生位置ジャンプ・切り貼り、出力ダイナミクス、実現層の自由度、同じ素材の 2 か所同時再生、同時発音は最大 3 素材＝設定で変更可、最小クリップ 2 秒、加工＝EQ は不可）で実装済み。素材は 24 本（`materials/diffusion-002/`、1 声、温度 2.0）。ゴール露出方針 `contract_law` と収束の物差し `presence` は opt-in で、既定設定の出力はビット一致。元に戻す可能性があるため、各版はタグ（`hires-v1` / `frag-v1` / `fid-v1` / `cap-v1` / `goallaw-v1` / `presence-v1`）と旧設定・出力で保持されている。GUI・インフラ・大規模学習・網羅的テストは作らない。実働部分と未達を明記して報告すること。
+前提の再確認：素材マップ（`output_diff003/diffusion_1cycle_slow_law_T2_presence_keep_s3`）を元譜面から改変なしで写した譜面マッピング（MusicXML、現行 v12：`output_diff003/diffusion_1cycle_slow_law_T2_presence_keep_s3/scoremap/scoremap_keep_s3.musicxml`）を作っている。元譜面の音符・リズム・連桁・スラーなどの表記は絶対に改変しない。段数削減は「他のパートのフレーズ（断片 1 つ分のパッセージ）を丸ごと、同じ楽器の luminasity の下の段の、その楽器がしばらく休んでいる所へ移す。そこにある luminasity の休符は消してよい。フレーズの途中の一瞬の休符への割り込みや一部だけの移植は不可。音が重なる所へは移さない」というルールで進める。報告は日本語で、実働部分と未達を明記すること。
