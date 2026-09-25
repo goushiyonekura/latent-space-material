@@ -47,7 +47,7 @@ def repeats_of(score):
 
 ANCHOR_FILE = "dev/out/align/anchors.json"
 WEIGHTS = {"lum": dict(w_onset=2.0, w_pons=1.0, w_chroma=0.5), "pap": dict(w_onset=0.3, w_pons=1.0, w_chroma=1.5),
-           "prism": dict(w_onset=2.0, w_pons=1.0, w_chroma=0.5)}
+           "prism": dict(w_onset=2.0, w_pons=1.0, w_chroma=0.5, steps=align.STEPS_STEADY)}   # steps: 2026-09-25 (§12.5)
 
 
 def weights_of(sec):

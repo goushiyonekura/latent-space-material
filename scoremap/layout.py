@@ -30,6 +30,9 @@ class Placed:
     cut_from: object = None  # the end the heard audio asked for (source quarters), when the piece ends earlier
     head_from: object = None # the start the heard audio asked for, when the piece starts later
     layer: int = 0           # voice layer (0 = the source's voices; >0 = overlapping an earlier fragment of the part)
+    dst: object = None       # (lane, pid) of the output part this piece is written in when it was moved to another
+                             # part's staff (staff reduction, scoremap.merge); None = its own part
+    staff_shift: int = 0     # added to the source staff numbers to get the output staff (1 for a moved piece)
 
     @property
     def end(self) -> Fr:
@@ -38,12 +41,37 @@ class Placed:
     def out(self, q: Fr) -> Fr:
         return self.x + (q - self.piece.a)
 
+    @property
+    def moved(self) -> bool:
+        return self.dst is not None
+
+    def out_staff(self, st: int) -> int:
+        return st + self.staff_shift
+
 
 def snap(t: float) -> Fr:
     return Fr(round(t / float(GRID))) * GRID
 
 
-def place(frags_by_lane: Dict[int, List[Fragment]], scores: Dict[int, mxl.Score], policy: str = "overlap") -> Tuple[List[Placed], List[tuple]]:
+LOST_WEIGHT = 1.0      # "tight": weight of heard seconds left out against unheard seconds written (1 = symmetric)
+
+
+def select_option(f: Fragment, opts, select: str):
+    """The option to notate a fragment-part with: "cheapest" (the cost of extract.options: cheap tails, whole
+    phrases) or "tight" (user rule 2026-09-25: the notated start and end nearest to the heard start and end, in
+    audio seconds; heard seconds left out weighted LOST_WEIGHT; soft cuts as a small tie-breaker)."""
+    if select == "cheapest" or len(opts) == 1:
+        return opts[0]
+
+    def dist(o):
+        lost = max(0.0, o.t_start - f.s0) + max(0.0, f.s1 - o.t_end)
+        extra = max(0.0, f.s0 - o.t_start) + max(0.0, o.t_end - f.s1)
+        return LOST_WEIGHT * lost + extra + 0.25 * o.penalty
+    return min(opts, key=lambda o: (dist(o), o.cost))
+
+
+def place(frags_by_lane: Dict[int, List[Fragment]], scores: Dict[int, mxl.Score], policy: str = "overlap",
+          select: str = "cheapest") -> Tuple[List[Placed], List[tuple]]:
     """Every fragment keeps its reference at its map time (grid).
 
     policy "overlap" (user decision 2026-09-24, second revision): every fragment is notated in full with its
@@ -61,7 +89,7 @@ def place(frags_by_lane: Dict[int, List[Fragment]], scores: Dict[int, mxl.Score]
             for f in sorted(frags, key=lambda f: f.t0):
                 w = snap(f.t0)
                 for pid, opts in f.options.items():
-                    o = opts[0]
+                    o = select_option(f, opts, select)
                     first = True
                     for pc in o.pieces:
                         pl = Placed(f, pc, w + pc.ref, scores[lane], first, 0.0)

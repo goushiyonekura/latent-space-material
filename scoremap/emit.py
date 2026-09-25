@@ -10,7 +10,7 @@ boundary.  Each passage gets a small label (source, bar/beat, dynamic and techni
 import copy
 import re
 import xml.etree.ElementTree as ET
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from fractions import Fraction as Fr
 from typing import Dict, List, Optional, Tuple
@@ -42,6 +42,14 @@ class OutPart:
     beams_cut: int = 0                                        # beam groups divided by a barline
     layout: object = None
     clef_conflicts: List[tuple] = field(default_factory=list)  # (x, staff): a clef change while another layer sounds
+    ins_suffix: str = "I1"                                    # score-instrument of this part used for moved notes
+    deleted_rests: List[dict] = field(default_factory=list)   # rests of this part removed / split under a moved passage
+    accidentals_added: int = 0                                # key-signature accidentals made explicit on moved notes
+    moved_pieces: int = 0                                     # passages of other parts written on this part's staff 2
+    synthetic: bool = False                                   # a packed staff (scoremap.merge.pack): no source part of its own
+    beams_cut_at_edges: int = 0                               # beam groups re-formed because a passage edge cut them
+    tuplets_dissolved: int = 0                                # tuplet groups cut by a passage edge (written plain)
+    tuplet_notes_approximated: int = 0                        # notes of those groups written with approximate values
 
 
 # ------------------------------------------------------------------ helpers
@@ -251,6 +259,11 @@ def split_at_barlines(evs: List["Ev"], bars: List[Fr]) -> Tuple[List["Ev"], int]
     return out, n_cut
 
 
+def _pitch_key(el: ET.Element):
+    pp = el.find("pitch")
+    return None if pp is None else (pp.findtext("step"), pp.findtext("alter") or "0", pp.findtext("octave"))
+
+
 def _drop_tie(el: ET.Element, typ: str):
     for t in list(el.findall("tie")):
         if t.get("type") == typ:
@@ -305,36 +318,126 @@ def rebeam_at_barlines(evs: List["Ev"], bars: List[Fr]) -> int:
             segs.append(cur)
             levels = max(len(e.el.findall("beam")) for e in g)
             for si, sg in enumerate(segs):
-                for level in range(1, levels + 1):
-                    # runs of notes that carried this beam level (not hooks) in the original group
-                    runs, run = [], []
-                    for e in sg:
-                        b = lv(e.el, level)
-                        v = (b.text or "").strip() if b is not None else ""
-                        if v in ("begin", "continue", "end"):
-                            run.append(e)
-                            if v == "end":
-                                runs.append(run); run = []
-                        else:
-                            if run:
-                                runs.append(run); run = []
-                    if run:
-                        runs.append(run)
-                    for r in runs:
-                        if len(r) >= 2:
-                            for k2, e in enumerate(r):
-                                lv(e.el, level).text = "begin" if k2 == 0 else ("end" if k2 == len(r) - 1 else "continue")
-                        else:
-                            e = r[0]
-                            if level == 1 or len(sg) == 1:
-                                for b in list(e.el.findall("beam")):
-                                    e.el.remove(b)
-                            else:
-                                lv(e.el, level).text = "backward hook" if e is sg[-1] else "forward hook"
+                _reform_beams([e.el for e in sg], levels)
     return n_cut
 
 
-def _rest_el(dur: Fr, typ: str, staff: int, voice: str, measure_rest: bool = False) -> ET.Element:
+def _beam_level(el, level):
+    for b in el.findall("beam"):
+        if b.get("number", "1") == str(level):
+            return b
+    return None
+
+
+def _reform_beams(sg: List[ET.Element], levels: int):
+    """Re-form the beams of the notes `sg` (one side of a divided group, in order): every level's runs get
+    begin / continue / end; a run of one note loses its beams (level 1) or becomes a hook."""
+    for level in range(1, levels + 1):
+        # runs of notes that carried this beam level (not hooks) in the original group
+        runs, run = [], []
+        for el in sg:
+            b = _beam_level(el, level)
+            v = (b.text or "").strip() if b is not None else ""
+            if v in ("begin", "continue", "end"):
+                run.append(el)
+                if v == "end":
+                    runs.append(run); run = []
+            else:
+                if run:
+                    runs.append(run); run = []
+        if run:
+            runs.append(run)
+        for r in runs:
+            if len(r) >= 2:
+                for k2, el in enumerate(r):
+                    _beam_level(el, level).text = "begin" if k2 == 0 else ("end" if k2 == len(r) - 1 else "continue")
+            else:
+                el = r[0]
+                if level == 1 or len(sg) == 1:
+                    for b in list(el.findall("beam")):
+                        el.remove(b)
+                else:
+                    _beam_level(el, level).text = "backward hook" if el is sg[-1] else "forward hook"
+
+
+def rebeam_edges(notes: List[ET.Element]) -> int:
+    """Beam groups cut by the edges of a copied passage (user rule 2026-09-25): a group whose 'begin' or 'end'
+    lies outside the passage is re-formed from the notes present.  `notes`: the copied notes of one (staff, voice)
+    stream in time order.  Returns the number of groups repaired."""
+    groups = []                                               # (notes, broken)
+    cur: List[ET.Element] = []
+    broken = False
+    for el in notes:
+        b1 = _beam_level(el, 1)
+        v = (b1.text or "").strip() if b1 is not None else ""
+        if v == "begin":
+            if cur:
+                groups.append((cur, True))                    # the previous group never ended
+            cur, broken = [el], False
+        elif v in ("continue", "end"):
+            if not cur:
+                broken = True                                 # it began before the passage
+            cur.append(el)
+            if v == "end":
+                groups.append((cur, broken)); cur, broken = [], False
+        elif v in ("forward hook", "backward hook"):
+            cur.append(el) if cur else None
+        else:
+            if cur:
+                groups.append((cur, True)); cur, broken = [], False
+    if cur:
+        groups.append((cur, True))
+    n = 0
+    for g, bad in groups:
+        if bad:
+            _reform_beams(g, max(len(el.findall("beam")) for el in g))
+            n += 1
+    return n
+
+
+FLAGS_OF = {"eighth": 1, "16th": 2, "32nd": 3, "64th": 4, "128th": 5, "256th": 6}
+
+
+def approximate_value(el: ET.Element, dur: Fr) -> Fr:
+    """Write the note / rest `el` (a member of a tuplet cut by a passage edge) as the longest plain value that
+    does not exceed its sounding duration `dur` (user rule 2026-09-25: approximate values, the tuplet removed).
+    The position stays exact; the small remainder becomes an invisible gap.  Returns the written duration."""
+    v = next(((val, typ, dots) for (val, typ, dots) in NOTE_VALUES if val <= dur), NOTE_VALUES[-1])
+    val, typ, dots = v
+    for tag in ("type", "dot", "duration", "time-modification"):
+        for x in el.findall(tag):
+            el.remove(x)
+    if el.find("grace") is None:
+        ET.SubElement(el, "duration").text = str(int(val * DIV))
+    ET.SubElement(el, "type").text = typ
+    for _ in range(dots):
+        ET.SubElement(el, "dot")
+    for nt in list(el.findall("notations")):
+        for t in list(nt.findall("tuplet")):
+            nt.remove(t)
+        if len(nt) == 0:
+            el.remove(nt)
+    flags = FLAGS_OF.get(typ, 0)
+    beams = el.findall("beam")
+    if beams:
+        if flags == 0:
+            for b in beams:
+                el.remove(b)
+        else:
+            have = {int(b.get("number", "1")) for b in beams}
+            v1 = _beam_level(el, 1)
+            for level in range(2, flags + 1):
+                if level not in have and v1 is not None:
+                    nb = ET.SubElement(el, "beam", number=str(level))
+                    nb.text = v1.text
+            for b in list(el.findall("beam")):
+                if int(b.get("number", "1")) > flags:
+                    el.remove(b)
+    _reorder(el)
+    return val
+
+
+def _rest_el(dur: Fr, typ: str, staff: int, voice: str, measure_rest: bool = False, dots: int = 0) -> ET.Element:
     n = ET.Element("note")
     r = ET.SubElement(n, "rest")
     if measure_rest:
@@ -343,8 +446,85 @@ def _rest_el(dur: Fr, typ: str, staff: int, voice: str, measure_rest: bool = Fal
     ET.SubElement(n, "voice").text = voice
     if not measure_rest:
         ET.SubElement(n, "type").text = typ
+        for _ in range(dots):
+            ET.SubElement(n, "dot")
     ET.SubElement(n, "staff").text = str(staff)
     return n
+
+
+def _set_staff(el: ET.Element, staff: int):
+    """Put a copied note / direction on output staff `staff` (a moved passage: source staff 1 -> staff 2)."""
+    st = el.find("staff")
+    if st is None:
+        st = ET.Element("staff")
+        if el.tag == "note":
+            el.append(st)
+            st.text = str(staff)
+            _reorder(el)
+            return
+        kids = list(el)
+        after = [k for k, c in enumerate(kids) if c.tag in ("direction-type", "offset", "footnote", "level", "voice")]
+        el.insert((max(after) + 1) if after else len(kids), st)
+    st.text = str(staff)
+
+
+def _subtract(iv: Tuple[Fr, Fr], cuts: List[Tuple[Fr, Fr]]) -> List[Tuple[Fr, Fr]]:
+    """The parts of the interval iv outside the intervals `cuts`."""
+    segs = [iv]
+    for (c0, c1) in sorted(cuts):
+        nxt = []
+        for (s0, s1) in segs:
+            if c1 <= s0 or c0 >= s1:
+                nxt.append((s0, s1))
+            else:
+                if s0 < c0:
+                    nxt.append((s0, c0))
+                if c1 < s1:
+                    nxt.append((c1, s1))
+        segs = nxt
+    return segs
+
+
+KEY_SHARPS = "FCGDAEB"
+KEY_FLATS = "BEADGCF"
+ACCIDENTAL_OF = {2: "double-sharp", 1: "sharp", 0: "natural", -1: "flat", -2: "flat-flat"}
+
+
+def key_fifths(part: mxl.Part) -> int:
+    """The key signature of a source part (its first <key>; the sources never change key)."""
+    for e in part.elems:
+        if e.kind == "attributes":
+            k = e.el.find("key")
+            if k is not None and k.findtext("fifths"):
+                return int(k.findtext("fifths"))
+    return 0
+
+
+def key_alter(fifths: int, step: str) -> int:
+    if fifths > 0 and step in KEY_SHARPS[:fifths]:
+        return 1
+    if fifths < 0 and step in KEY_FLATS[:-fifths]:
+        return -1
+    return 0
+
+
+def key_accidental(el: ET.Element, src_fifths: int, dst_fifths: int) -> Optional[str]:
+    """The accidental a copied note needs when it moves from a staff with key `src_fifths` to one with key
+    `dst_fifths` (user decision 2026-09-25: e.g. an F sharp of papillon_violin, written without a sign under one
+    sharp, gets an explicit sharp on the luminasity staff, which has no key signature).  Only notes whose written
+    alteration came from the key signature change; notes already carrying an accidental, and tied continuations,
+    stay as they are."""
+    pt = el.find("pitch")
+    if pt is None or el.find("accidental") is not None:
+        return None
+    if any(t.get("type") == "stop" for t in el.findall("tie")):
+        return None
+    step = pt.findtext("step")
+    alter = int(float(pt.findtext("alter") or 0))
+    ks, kd = key_alter(src_fifths, step), key_alter(dst_fifths, step)
+    if ks == kd or alter != ks:
+        return None
+    return ACCIDENTAL_OF.get(alter)
 
 
 def _words(text: str, staff: int, voice: str, size: str = "7", placement: str = "above", style: str = "normal",
@@ -361,6 +541,8 @@ def _words(text: str, staff: int, voice: str, size: str = "7", placement: str = 
 
 
 NUMBERED = ("slur", "tuplet", "wedge", "octave-shift", "glissando", "slide", "wavy-line", "bracket", "dashes")
+LABEL_WINDOW = Fr(6)           # quarters: labels starting closer than this on one packed staff are stacked
+LABEL_STEP = 16                # tenths per stacking level
 
 
 def layer_voice(op: "OutPart", v: str, layer: int) -> str:
@@ -389,31 +571,44 @@ def alloc_voices(op: "OutPart", pieces: List[Placed]) -> Dict[tuple, str]:
     Returns {(id(piece), staff, source voice): voice id}; op.max_simultaneous records the densest staff."""
     part = op.part
     src_ids = {e.voice for e in part.elems if e.kind == "note"}
-    streams = []                                              # (start, end, staff, src voice, piece)
+    synthetic = getattr(op, "synthetic", False)
+    streams = []                                              # (start, end, output staff, src voice, piece, intervals)
     for pl in pieces:
         ext: Dict[tuple, List[Fr]] = {}
-        for e in part.elems:
+        ivs: Dict[tuple, List[Tuple[Fr, Fr]]] = defaultdict(list)
+        for e in pl.score.part(pl.piece.pid).elems:
             if e.kind == "note" and pl.piece.a <= e.pos < pl.piece.b:
-                k = (e.staff, e.voice)
+                k = (pl.out_staff(e.staff), e.voice)
                 lo, hi = pl.out(e.pos), pl.out(min(e.end, pl.piece.b))
                 if k in ext:
                     ext[k][0] = min(ext[k][0], lo); ext[k][1] = max(ext[k][1], hi)
                 else:
                     ext[k] = [lo, hi]
+                ivs[k].append((lo, max(hi, lo + Fr(1, 64))))
         for (st, v), (lo, hi) in ext.items():
-            streams.append((lo, max(hi, lo + Fr(1, 64)), st, v, pl))
+            # packed parts: a voice id is busy only while the stream has elements (gaps are invisible <forward>),
+            # so ids stay within the visible voices of the staff; otherwise the whole span (as in v12)
+            merged: List[Tuple[Fr, Fr]] = []
+            for a_, b_ in sorted(ivs[(st, v)]):
+                if merged and a_ <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], b_))
+                else:
+                    merged.append((a_, b_))
+            streams.append((lo, max(hi, lo + Fr(1, 64)), st, v, pl, merged if synthetic else [(lo, max(hi, lo + Fr(1, 64)))]))
     streams.sort(key=lambda x: (x[0], getattr(x[4], "layer", 0), x[2], x[3]))
     busy: Dict[str, List[Tuple[Fr, Fr]]] = defaultdict(list)  # voice id -> intervals in use
     staff_of_id: Dict[str, int] = {}
+    if synthetic:
+        staff_of_id = {str(n): st for st in range(1, op.staves + 1) for n in range(4 * (st - 1) + 1, 4 * st + 1)}
     for e in part.elems:
         if e.kind == "note":
             staff_of_id.setdefault(e.voice, e.staff)
     out: Dict[tuple, str] = {}
     most = 0
 
-    def free(vid, lo, hi):
-        return all(hi <= a or lo >= b for a, b in busy[vid])
-    for lo, hi, st, v, pl in streams:
+    def free(vid, ivs_):
+        return all(hi <= a or lo >= b for (lo, hi) in ivs_ for a, b in busy[vid])
+    for lo, hi, st, v, pl, ivs_ in streams:
         cands = [v] if staff_of_id.get(v, st) == st else []
         # further ids: first the four of this staff in the usual numbering (1-4 on staff 1, 5-8 on staff 2...),
         # then anything free
@@ -424,13 +619,14 @@ def alloc_voices(op: "OutPart", pieces: List[Placed]) -> Dict[tuple, str]:
             if vid not in src_ids and staff_of_id.get(vid, st) == st and vid not in cands:
                 cands.append(vid)
         for vid in cands:
-            if free(vid, lo, hi):
+            if free(vid, ivs_):
                 out[(id(pl), st, v)] = vid
-                busy[vid].append((lo, hi))
+                busy[vid].extend(ivs_)
                 staff_of_id.setdefault(vid, st)
                 break
-        # density check
-        same = [vid for vid, ivs in busy.items() if staff_of_id.get(vid) == st and any(a < hi and lo < b for a, b in ivs)]
+        # density check: ids of this staff in use at some instant of this stream's elements
+        same = [vid for vid, ivs in busy.items() if staff_of_id.get(vid) == st
+                and any(a < hi_ and lo_ < b for (lo_, hi_) in ivs_ for a, b in ivs)]
         most = max(most, len(same))
     op.max_simultaneous = most
     return out
@@ -496,24 +692,58 @@ def clef_events(op: "OutPart", pieces: List[Placed], valloc: Dict[tuple, str]) -
     source (at its start and at the source's own clef changes inside it).  When passages of one part overlap (voice
     layers), the most recently entered passage decides; when it ends, the clef of the passage still sounding comes
     back.  Overlaps whose passages need different clefs are recorded in op.clef_conflicts (the pitches are exact
-    either way; only the clef they are shown in differs during the overlap)."""
-    part = op.part
-    src = defaultdict(list)                                   # staff -> [(pos, idx, clef)]
-    for e in part.elems:
-        if e.kind == "attributes":
-            for c in e.el.findall("clef"):
-                src[int(c.get("number", "1"))].append((e.pos, e.idx, c))
-    for st in src:
-        src[st].sort(key=lambda x: (x[0], x[1]))
+    either way; only the clef they are shown in differs during the overlap).
 
-    def clef_at(st, q):
+    A passage moved here from another part (staff reduction) brings its own clef: while it overlaps a luminasity
+    passage (only that passage's leading or trailing rests can overlap), the clef serves the notes that sound - a
+    passage with a note sounding at that moment, else the one whose next note comes first - and when the moved
+    passage ends with nothing else sounding, the staff's own clef comes back."""
+    part = op.part
+    cache: Dict[tuple, dict] = {}
+
+    def src_clefs(pl):
+        key = (id(pl.score), pl.piece.pid)
+        if key not in cache:
+            src = defaultdict(list)                           # source staff -> [(pos, idx, clef)]
+            for e in pl.score.part(pl.piece.pid).elems:
+                if e.kind == "attributes":
+                    for c in e.el.findall("clef"):
+                        src[int(c.get("number", "1"))].append((e.pos, e.idx, c))
+            for st in src:
+                src[st].sort(key=lambda x: (x[0], x[1]))
+            cache[key] = src
+        return cache[key]
+
+    def clef_at(pl, st, q):                                   # st: output staff
         cur = None
-        for (p, i, c) in src.get(st, []):
+        for (p, i, c) in src_clefs(pl).get(st - pl.staff_shift, []):
             if p <= q:
                 cur = c
             else:
                 break
         return cur
+    ncache: Dict[tuple, list] = {}
+
+    def notes_on(pl, st):
+        key = (id(pl), st)
+        if key not in ncache:
+            spart = pl.score.part(pl.piece.pid)
+            ncache[key] = [(pl.out(e.pos), pl.out(min(e.end, pl.piece.b))) for e in spart.elems
+                           if e.kind == "note" and not e.rest and not e.chord and not e.grace and e.dur > 0
+                           and e.staff == st - pl.staff_shift and pl.piece.a <= e.pos < pl.piece.b]
+        return ncache[key]
+
+    def in_charge(act, st, t):
+        if not any(p.moved for p in act):
+            return max(act, key=lambda p: (p.x, getattr(p, "layer", 0)))
+
+        def rank(p):
+            ns = notes_on(p, st)
+            if any(s0 <= t < e0 for s0, e0 in ns):
+                return (0, Fr(0), -p.x)
+            nxt = [s0 for s0, e0 in ns if s0 >= t]
+            return (1, min(nxt), -p.x) if nxt else (2, Fr(0), -p.x)
+        return min(act, key=rank)
     out: List[Ev] = []
     ps = sorted(pieces, key=lambda p: (p.x, getattr(p, "layer", 0)))
     for st in range(1, op.staves + 1):
@@ -521,21 +751,32 @@ def clef_events(op: "OutPart", pieces: List[Placed], valloc: Dict[tuple, str]) -
         cur = _clef_key(c0) if c0 is not None else None
         times = set()
         for p in ps:
+            if st - p.staff_shift < 1:
+                continue
             times.add(p.x); times.add(p.end)
-            for (q, i, c) in src.get(st, []):
+            for (q, i, c) in src_clefs(p).get(st - p.staff_shift, []):
                 if p.piece.a < q < p.piece.b:
                     times.add(p.out(q))
         conflict_open = False
         for t in sorted(times):
-            act = [p for p in ps if p.x <= t < p.end]
+            act = [p for p in ps if p.x <= t < p.end and st - p.staff_shift >= 1]
             if not act:
                 conflict_open = False
+                if c0 is not None and cur != _clef_key(c0) and any(p.moved and p.end == t and st - p.staff_shift >= 1 for p in ps):
+                    cc = copy.deepcopy(c0); _strip_x(cc)
+                    cc.set("number", str(st))
+                    out.append(Ev(t, st, op.main_voice.get(st, "1"), "clef", cc, order=(-1, -3, st)))
+                    cur = _clef_key(c0)
                 continue
-            top = max(act, key=lambda p: (p.x, getattr(p, "layer", 0)))
-            want = clef_at(st, top.piece.a + (t - top.x))
+            top = in_charge(act, st, t)
+            want = clef_at(top, st, top.piece.a + (t - top.x))
             if want is None:
                 continue
-            keys = {_clef_key(k) for k in (clef_at(st, p.piece.a + (t - p.x)) for p in act) if k is not None}
+            if any(p.moved for p in act):
+                judged = [p for p in act if any(s0 <= t < e0 for s0, e0 in notes_on(p, st))]
+            else:
+                judged = act
+            keys = {_clef_key(k) for k in (clef_at(p, st, p.piece.a + (t - p.x)) for p in judged) if k is not None}
             if len(keys) > 1:
                 if not conflict_open:
                     op.clef_conflicts.append((float(t), st))
@@ -643,35 +884,106 @@ def short_name(material: str) -> str:
     return m.group(1) if m else material
 
 
-def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]] = None) -> Tuple[List[Ev], List[Tuple[Fr, Fr]]]:
-    """All events of one output part and the output intervals where the material sounds."""
+def part_tag(name: str) -> str:
+    """Short part name for a label: 'Violin I' -> 'Vn I', 'Violoncello II' -> 'Vc II'."""
+    words = name.split()
+    ab = {"Violin": "Vn", "Viola": "Va", "Violoncello": "Vc", "Cello": "Vc"}
+    return " ".join(ab.get(w, w) for w in words)
+
+
+def moved_labels(pieces: List[Placed], part_abbr: Dict[str, str]) -> List[tuple]:
+    """Labels of passages moved here from other parts (staff reduction): the fragment label of the source, the
+    source part named when its material has several parts, on the output staff the passage is written on."""
+    out = []
+    by_part: Dict[tuple, List[Placed]] = defaultdict(list)
+    for p in pieces:
+        by_part[(p.frag.lane, p.piece.pid)].append(p)
+    for (lane, pid), pls in sorted(by_part.items()):
+        sc = pls[0].score
+        tag = part_tag(sc.part(pid).name) if len(sc.parts) > 1 else ""
+        st = 1 + pls[0].staff_shift
+        for (x, txt, marks) in fragment_labels(pls, [], part_abbr):
+            short = short_name(pls[0].frag.material)
+            if tag and txt.startswith(short + " "):
+                txt = f"{short} {tag} " + txt[len(short) + 1:]
+            txt = txt.replace(" ⧉", "")                       # its voice layer meant nothing on this staff
+            out.append((x, txt, marks, st))
+    return out
+
+
+def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]] = None) -> Tuple[List[Ev], Dict[int, List[Tuple[Fr, Fr]]]]:
+    """All events of one output part and, per output staff, the output intervals where a passage is written.
+
+    A piece may come from another part (staff reduction, `Placed.dst`): its elements are copied from its own
+    source part, written `staff_shift` staves lower, in voices of that staff; the key-signature accidentals it
+    needs on this staff are made explicit; the rests of this part's own passages that lie under it are removed
+    (or split when it covers only part of them)."""
     evs: List[Ev] = []
     valloc = alloc_voices(op, pieces)
-    for n, (x, txt, marks) in enumerate(labels or []):
-        mv = op.main_voice.get(1, "1")
-        lay = getattr(op, "layout", None) or Layout()
-        evs.append(Ev(x, 1, mv, "dir", _words(txt, 1, mv, size=f"{lay.label_pt:g}", weight="bold", enclosure="rectangle"),
-                      order=(-1, -2, n)))
+    lay = getattr(op, "layout", None) or Layout()
+    recent: Dict[int, List[Fr]] = defaultdict(list)           # staff -> starts of the labels placed so far
+    for n, lb in enumerate(sorted(labels or [], key=lambda lb: lb[0])):
+        x, txt, marks = lb[0], lb[1], lb[2]
+        st_l = lb[3] if len(lb) > 3 else 1
+        mv = op.main_voice.get(st_l, "1")
+        w = _words(txt, st_l, mv, size=f"{lay.label_pt:g}", weight="bold", enclosure="rectangle")
+        if getattr(op, "synthetic", False):
+            # packed staves carry many passages: a label that starts within LABEL_WINDOW quarters of earlier ones
+            # is raised a step for each, so that they do not print on top of each other
+            level = sum(1 for x0 in recent[st_l] if x - x0 < LABEL_WINDOW)
+            recent[st_l].append(x)
+            if level:
+                w.find("direction-type/words").set("relative-y", str(int(level * LABEL_STEP)))
+        evs.append(Ev(x, st_l, mv, "dir", w, order=(-1, -2, n)))
         for (mx, num) in marks:
             lab = num if num == "▼" else f"|{num}"
-            evs.append(Ev(mx, 1, mv, "dir", _words(lab, 1, mv, size=f"{lay.mark_pt:g}", style="italic"), order=(-1, -1, n)))
-    active: List[Tuple[Fr, Fr]] = []
-    part = op.part
-    by_idx = {e.idx: e for e in part.elems}
+            evs.append(Ev(mx, st_l, mv, "dir", _words(lab, st_l, mv, size=f"{lay.mark_pt:g}", style="italic"), order=(-1, -1, n)))
+    active: Dict[int, List[Tuple[Fr, Fr]]] = defaultdict(list)
+    cut_ivs: Dict[int, List[Tuple[Fr, Fr]]] = defaultdict(list)    # extents of moved passages per output staff
+    for pl in pieces:
+        if pl.moved:
+            op.moved_pieces += 1
+            for st in range(1, pl.score.part(pl.piece.pid).staves + 1):
+                cut_ivs[pl.out_staff(st)].append((pl.x, pl.end))
     evs += clef_events(op, pieces, valloc)
+    dst_fifths = key_fifths(op.part)
     for n, pl in enumerate(sorted(pieces, key=lambda p: p.x)):
         a, b = pl.piece.a, pl.piece.b
         L = getattr(pl, "layer", 0)
-        mine = {(st, v): vid for (pid_, st, v), vid in valloc.items() if pid_ == id(pl)}
+        part = pl.score.part(pl.piece.pid)
+        src_pid = pl.piece.pid
+        by_idx = {e.idx: e for e in part.elems}
+        shift = pl.staff_shift
+        fscale = getattr(op, "font_scale", 1.0) if not pl.moved else lay.staff_mm / staff_mm_of(pl.score)
+        mine = {(st, v): vid for (pid_, st, v), vid in valloc.items() if pid_ == id(pl)}   # (output staff, src voice)
 
-        def vmap(v, st=None, mine=mine):
-            if st is not None and (st, v) in mine:
-                return mine[(st, v)]
+        synthetic_ = getattr(op, "synthetic", False)
+
+        def vmap(v, st=None, mine=mine, shift=shift):        # st: source staff
+            so = None if st is None else st + shift
+            if so is not None and (so, v) in mine:
+                return mine[(so, v)]
+            if synthetic_:                                    # packed staves: stay on the element's own staff
+                for (st2, v2), vid in mine.items():
+                    if st2 == so:
+                        return vid
             for (st2, v2), vid in mine.items():               # a direction of a voice without notes here
-                if v2 == v or st2 == st:
+                if v2 == v or st2 == so:
                     return vid
             return v
-        active.append((pl.x, pl.end))
+        for st in range(1, part.staves + 1):
+            active[st + shift].append((pl.x, pl.end))
+        if getattr(op, "synthetic", False):
+            # packed staves: spanner numbers follow the output voice (1-4 on staff 1, 5-8 on staff 2) instead
+            # of the source part's layer, so that passages sharing a staff never share an open number
+            def shift_of(vid: str, L0=L) -> int:
+                try:
+                    return (int(vid) - 1) % 4
+                except ValueError:
+                    return L0
+        else:
+            def shift_of(vid: str, L0=L) -> int:
+                return L0
         # copied elements
         pending_slur_start: Dict[tuple, List[str]] = defaultdict(list)
         first_note_of_voice: Dict[tuple, ET.Element] = {}
@@ -679,10 +991,12 @@ def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]
         first_pos_of_voice: Dict[tuple, Fr] = {}
         last_pos_of_voice: Dict[tuple, Fr] = {}
         copies: Dict[int, ET.Element] = {}
+        ev_of: Dict[int, Ev] = {}
+        moved_notes: List[ET.Element] = []
         # a hairpin / octave line that ends exactly where this passage starts belongs to the music before it: its
         # stop mark would dangle here without a start
         skip = {g.members[-1] for g in pl.score.groups
-                if g.part == op.src_pid and g.kind in ("wedge", "octave") and g.start < a and g.end == a}
+                if g.part == src_pid and g.kind in ("wedge", "octave") and g.start < a and g.end == a}
         for e in part.elems:
             if not (a <= e.pos < b) or e.idx in skip:
                 continue
@@ -690,24 +1004,62 @@ def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]
                 el = copy.deepcopy(e.el)
                 _strip_x(el)
                 _rescale(el, _div_at(part, e.pos))
+                so = e.staff + shift
                 r = el.find("rest")
+                if r is not None and not pl.moved and cut_ivs.get(so):
+                    # a rest of this part under a passage moved here: removed, or split around the passage
+                    r0, r1 = pl.out(e.pos), pl.out(min(e.end, b))
+                    segs = _subtract((r0, r1), cut_ivs[so])
+                    if segs != [(r0, r1)]:
+                        op.deleted_rests.append({"material": pl.frag.material, "part": src_pid, "src_pos": str(e.pos),
+                                                 "dur": str(e.dur), "x": float(r0), "end": float(r1), "staff": so,
+                                                 "kept": [(float(s0), float(s1)) for s0, s1 in segs],
+                                                 "measure_rest": r.get("measure") == "yes"})
+                        vis = el.get("print-object")
+                        k2 = 0
+                        for (s0, s1) in segs:
+                            vals = note_values(s1 - s0)
+                            parts_ = None if r.get("measure") == "yes" else split_note(el, vals, True)
+                            pos = s0
+                            for k3, (dv, typ, dots) in enumerate(vals):
+                                if parts_ is None:
+                                    rr = _rest_el(dv, typ, so, vmap(e.voice, e.staff), dots=dots)
+                                    if vis:
+                                        rr.set("print-object", vis)
+                                else:
+                                    rr = parts_[k3]
+                                    relayer(rr, op, L, vmap(e.voice, e.staff))
+                                    scale_fonts(rr, fscale)
+                                evs.append(Ev(pos, so, vmap(e.voice, e.staff), "note", rr, dv, order=(n, 0, e.idx + k2 / 100)))
+                                pos += dv
+                                k2 += 1
+                        continue
                 if r is not None and r.get("measure") == "yes":
                     # a bar rest of the source: the output bars differ, so write rests of the same length
                     vis = el.get("print-object")
                     for k2, (dv, typ, _d) in enumerate(rest_values(e.dur, Fr(0))):
-                        rr = _rest_el(dv, typ, e.staff, vmap(e.voice, e.staff))
+                        rr = _rest_el(dv, typ, so, vmap(e.voice, e.staff))
                         if vis:
                             rr.set("print-object", vis)
                         evs.append(Ev(pl.out(e.pos) + sum((x[0] for x in rest_values(e.dur, Fr(0))[:k2]), Fr(0)),
-                                      e.staff, vmap(e.voice, e.staff), "note", rr, dv, order=(n, 0, e.idx + k2 / 100)))
+                                      so, vmap(e.voice, e.staff), "note", rr, dv, order=(n, 0, e.idx + k2 / 100)))
                     continue
                 for ins in el.findall("instrument"):
-                    ins.set("id", ins.get("id").replace(op.src_pid + "-", op.pid + "-", 1))
-                relayer(el, op, L, vmap(e.voice, e.staff))
-                scale_fonts(el, getattr(op, "font_scale", 1.0))
+                    if pl.moved:
+                        ins.set("id", f"{op.pid}-{op.ins_suffix}")
+                    else:
+                        ins.set("id", ins.get("id").replace(op.src_pid + "-", op.pid + "-", 1))
+                relayer(el, op, shift_of(vmap(e.voice, e.staff)), vmap(e.voice, e.staff))
+                if shift:
+                    _set_staff(el, so)
+                scale_fonts(el, fscale)
                 dur = Fr(0) if (e.chord or e.grace) else e.dur
-                evs.append(Ev(pl.out(e.pos), e.staff, vmap(e.voice, e.staff), "note", el, dur, order=(n, 0, e.idx)))
+                ev_ = Ev(pl.out(e.pos), so, vmap(e.voice, e.staff), "note", el, dur, order=(n, 0, e.idx))
+                evs.append(ev_)
                 copies[e.idx] = el
+                ev_of[e.idx] = ev_
+                if pl.moved and not e.rest:
+                    moved_notes.append(el)
                 key = (e.staff, e.voice)
                 if not e.rest and not e.grace:
                     first_note_of_voice.setdefault(key, el)
@@ -733,9 +1085,53 @@ def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]
                     el.remove(off)
                 if el.find("direction-type/*") is None:
                     continue
-                relayer(el, op, L, vmap(e.voice, e.staff))
-                scale_fonts(el, getattr(op, "font_scale", 1.0))
-                evs.append(Ev(pl.out(e.pos), e.staff, vmap(e.voice, e.staff), "dir", el, order=(n, 0, e.idx)))
+                relayer(el, op, shift_of(vmap(e.voice, e.staff)), vmap(e.voice, e.staff))
+                if shift:
+                    _set_staff(el, e.staff + shift)
+                scale_fonts(el, fscale)
+                evs.append(Ev(pl.out(e.pos), e.staff + shift, vmap(e.voice, e.staff), "dir", el, order=(n, 0, e.idx)))
+        # passage edges inside a beam group or a tuplet (user rule 2026-09-25, only where the cut candidates allowed
+        # it): beams are re-formed from the notes present; a tuplet cut open is written with approximate plain values
+        for g in pl.score.groups:
+            if g.part != src_pid or g.kind != "beam" or not (g.start < a < g.end or g.start < b < g.end):
+                continue
+            inside = [copies[i] for i in g.members if i in copies]
+            if inside:
+                _reform_beams(inside, max(len(el.findall("beam")) for el in inside))
+                op.beams_cut_at_edges += 1
+        for g in pl.score.groups:
+            if g.part != src_pid or g.kind != "tuplet" or not (g.start < a < g.end or g.start < b < g.end):
+                continue
+            touched = 0
+            for idx_, el in copies.items():
+                src = by_idx[idx_]
+                if not (g.start <= src.pos < g.end) or el.find("time-modification") is None:
+                    continue
+                anchor = by_idx.get(src.anchor) if src.chord and src.anchor >= 0 else None
+                dur_ = anchor.dur if anchor is not None else src.dur
+                val = approximate_value(el, dur_)
+                if idx_ in ev_of and not src.chord and not src.grace:
+                    ev_of[idx_].dur = val
+                touched += 1
+                # a tie from a shortened note would span the gap left by the approximation: drop it, and the
+                # matching stop on the next note of the voice (same pitch)
+                if any(t.get("type") == "start" for t in el.findall("tie")):
+                    _drop_tie(el, "start")
+                    pk_ = _pitch_key(el)
+                    nxt = [by_idx[j] for j in copies if by_idx[j].staff == src.staff and by_idx[j].voice == src.voice
+                           and by_idx[j].pos == src.end and _pitch_key(copies[j]) == pk_
+                           and any(t.get("type") == "stop" for t in copies[j].findall("tie"))]
+                    for n_ in nxt:
+                        _drop_tie(copies[n_.idx], "stop")
+                if any(t.get("type") == "stop" for t in el.findall("tie")):
+                    prev = [by_idx[j] for j in copies if by_idx[j].staff == src.staff and by_idx[j].voice == src.voice
+                            and by_idx[j].end == src.pos and _pitch_key(copies[j]) == _pitch_key(el)
+                            and any(t.get("type") == "start" for t in copies[j].findall("tie"))
+                            and copies[j].find("time-modification") is None and copies[j] is not el]
+                    # (the previous note keeps its tie only if it still ends exactly here; an approximated one was handled above)
+            if touched:
+                op.tuplets_dissolved += 1
+                op.tuplet_notes_approximated += touched
         # ties that lead out of the passage (or into it from outside): the note on the other side is not written
         # here, so the tie mark would dangle - drop it (the note itself stays)
         def _pk(el):
@@ -761,11 +1157,23 @@ def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]
                          for f in by_end.get((src.staff, src.pos, k), []))
                 if not ok:
                     _drop_tie(el, "stop")
+        # a passage moved from a staff with another key signature: the alterations its key gave are written out
+        if pl.moved:
+            src_fifths = key_fifths(part)
+            if src_fifths != dst_fifths:
+                for el in moved_notes:
+                    acc = key_accidental(el, src_fifths, dst_fifths)
+                    if acc:
+                        ET.SubElement(el, "accidental").text = acc
+                        _reorder(el)
+                        op.accidentals_added += 1
         # soft spanners cut by the passage boundaries: close them at the boundary
         for g in pl.score.groups:
-            if g.part != op.src_pid:
+            if g.part != src_pid:
                 continue
             key = (g.staff, g.voice)
+            so_g = g.staff + shift
+            L = shift_of(vmap(g.voice, g.staff))
             cross_a = g.start < a < g.end
             cross_b = g.start < b < g.end
             if g.kind in ("wedge", "octave") and g.start < b and g.end == b and g.end > a:
@@ -814,17 +1222,19 @@ def build_events(op: OutPart, pieces: List[Placed], labels: Optional[List[tuple]
                     off = d.find("offset")
                     if off is not None:
                         d.remove(off)
-                    relayer(d, op, L, vmap(src.voice, g.staff))
-                    scale_fonts(d, getattr(op, "font_scale", 1.0))
-                    evs.append(Ev(pl.x, g.staff, vmap(src.voice, g.staff), "dir", d, order=(n, -1, g.members[0])))
+                    relayer(d, op, shift_of(vmap(src.voice, g.staff)), vmap(src.voice, g.staff))
+                    if shift:
+                        _set_staff(d, so_g)
+                    scale_fonts(d, fscale)
+                    evs.append(Ev(pl.x, so_g, vmap(src.voice, g.staff), "dir", d, order=(n, -1, g.members[0])))
                 if cross_b:
                     d = ET.Element("direction")
                     dt = ET.SubElement(d, "direction-type")
                     ET.SubElement(dt, tag, type="stop", number=str(int(orig.get("number", "1")) + 3 * L),
                                   **({"size": orig.get("size")} if tag == "octave-shift" and orig.get("size") else {}))
                     ET.SubElement(d, "voice").text = vmap(src.voice, g.staff)
-                    ET.SubElement(d, "staff").text = str(g.staff)
-                    evs.append(Ev(pl.end, g.staff, vmap(src.voice, g.staff), "dir", d, order=(n, 9, 0)))
+                    ET.SubElement(d, "staff").text = str(so_g)
+                    evs.append(Ev(pl.end, so_g, vmap(src.voice, g.staff), "dir", d, order=(n, 9, 0)))
             elif g.kind == "trill":
                 wl = {} if (L == 0 and g.number == "1") else {"number": str(int(g.number) + 3 * L)}
 
@@ -876,6 +1286,67 @@ class Layout:
     @property
     def tenth_mm(self) -> float:
         return self.staff_mm / 40.0
+
+    @classmethod
+    def for_staff(cls, staff_mm: float, packed: bool = False) -> "Layout":
+        """The layout of v12 (2.9 mm staves) scaled to another staff height: text sizes grow with the staff,
+        the page margins keep their size in mm (so the tenths shrink), the staff gaps keep their tenths.
+        `packed` (few staves, several voices each): wider gaps for labels, stems and the harmonic staves."""
+        base = cls()
+        f = staff_mm / base.staff_mm
+        gaps = dict(gap_group=140, gap_part=110, gap_staff=70, top_system=220) if packed else {}
+        return cls(staff_mm=staff_mm, margin=int(round(base.margin / f)),
+                   label_pt=round(base.label_pt * f, 2), mark_pt=round(base.mark_pt * f, 2),
+                   time_pt=round(base.time_pt * f, 2), word_pt=round(base.word_pt * f, 2), **gaps)
+
+
+def height_tenths(parts: List["OutPart"], lay: "Layout") -> int:
+    """Height of one system of all parts in tenths: staves, the gaps between them, the room above the first."""
+    h = lay.top_system
+    for k, op in enumerate(parts):
+        if k > 0:
+            h += lay.gap_group if op.first_of_material else lay.gap_part
+        h += 40 * op.staves + lay.gap_staff * (op.staves - 1)
+    return h
+
+
+def fit_staff_mm(parts: List["OutPart"], base: Optional["Layout"] = None, step: float = 0.1) -> float:
+    """The largest staff height (a multiple of `step` mm) whose system of all parts fits the page height with
+    the margins of the base layout (in mm)."""
+    base = base or Layout()
+    margin_mm = base.margin * base.tenth_mm
+    avail = base.page_h_mm - 2 * margin_mm
+    h = height_tenths(parts, base)                            # tenths do not depend on the staff height
+    mm = 40.0 * avail / h
+    return max(Layout().staff_mm, round(int(mm / step + 1e-9) * step, 2))     # never below the v12 size
+
+
+CLEF_OF = {"G2": ("G", "2"), "C3": ("C", "3"), "F4": ("F", "4")}
+
+
+def synthetic_part(pid: str, name: str, abbr: str, instrument: str, staves: int, clefs: Dict[int, str],
+                   zero_line_staff: Optional[int] = None) -> mxl.Part:
+    """A part with no source: a <score-part> and one <attributes> at position 0 with the initial clef of every
+    staff (clefs: staff -> 'G2' / 'C3' / 'F4') and, for a luminasity-capable part, the zero-line harmonic staff."""
+    sp = ET.Element("score-part", id=pid)
+    ET.SubElement(sp, "part-name").text = name
+    ET.SubElement(sp, "part-abbreviation").text = abbr
+    si = ET.SubElement(sp, "score-instrument", id=f"{pid}-I1")
+    ET.SubElement(si, "instrument-name").text = instrument
+    at = ET.Element("attributes")
+    ET.SubElement(at, "staves").text = str(staves)
+    for st in range(1, staves + 1):
+        c = ET.SubElement(at, "clef", number=str(st))
+        sign, line = CLEF_OF[clefs.get(st, "G2")]
+        ET.SubElement(c, "sign").text = sign
+        ET.SubElement(c, "line").text = line
+    if zero_line_staff:
+        sd = ET.SubElement(at, "staff-details", number=str(zero_line_staff))
+        ET.SubElement(sd, "staff-lines").text = "0"
+    part = mxl.Part(pid=pid, name=name, score_part=sp, staves=staves, first_attributes=at)
+    part.elems.append(mxl.Elem("attributes", at, pid, Fr(0), measure="1", idx=0))
+    part.divisions.append((Fr(0), DIV))
+    return part
 
 
 def staff_mm_of(score: mxl.Score) -> float:
@@ -946,7 +1417,7 @@ def systems_of(bars: List[Fr], lay: Layout, forced: Optional[set] = None) -> Lis
 
 def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bars: List[Fr], defaults: Optional[ET.Element],
           time_labels: bool = True, dropped: Optional[List[tuple]] = None, layout: Optional[Layout] = None,
-          page_breaks: Optional[List[Fr]] = None):
+          page_breaks: Optional[List[Fr]] = None, pages_only: bool = False):
     root = ET.Element("score-partwise", version="3.1")
     wk = ET.SubElement(root, "work")
     ET.SubElement(wk, "work-title").text = title
@@ -958,11 +1429,18 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
     for op in parts:
         op.font_scale = lay.staff_mm / staff_mm_of(op.score)
         op.layout = lay
-    sys_starts = set(systems_of(bars, lay, set(page_breaks or [])))
+        ins = Counter(i.get("id") for e in op.part.elems if e.kind == "note" and e.staff == op.staves
+                      for i in e.el.findall("instrument"))
+        if ins:
+            op.ins_suffix = ins.most_common(1)[0][0].split("-", 1)[-1]
+    if pages_only and page_breaks:
+        sys_starts = {0} | {bi for bi in range(len(bars) - 1) if bars[bi] in set(page_breaks)}
+    else:
+        sys_starts = set(systems_of(bars, lay, set(page_breaks or [])))
     pl = ET.SubElement(root, "part-list")
-    by_lane: Dict[tuple, List[Placed]] = defaultdict(list)
+    by_lane: Dict[tuple, List[Placed]] = defaultdict(list)     # output part (lane, source pid) -> its pieces
     for p in placed:
-        by_lane[(p.frag.lane, p.piece.pid)].append(p)
+        by_lane[p.dst or (p.frag.lane, p.piece.pid)].append(p)
     # part groups: one bracket per material
     open_group = None
     gnum = 0
@@ -979,7 +1457,7 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
         sp = copy.deepcopy(op.part.score_part)
         sp.set("id", op.pid)
         for pn in sp.findall("part-name"):
-            pn.text = f"{op.short} {op.part.name}"
+            pn.text = op.part.name if getattr(op, "synthetic", False) else f"{op.short} {op.part.name}"
         for pnd in sp.findall("part-name-display"):
             sp.remove(pnd)
         for x in sp.iter():
@@ -996,11 +1474,15 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
     for f, pid in (dropped or []):
         lane_dropped[f.lane].append((f, pid))
     for idx, op in enumerate(parts):
-        labels = None
+        labels = []
+        abbr = {p.pid: (p.score_part.findtext("part-abbreviation") or p.name).strip() for p in op.score.parts}
         if op.first_of_material:
-            abbr = {p.pid: (p.score_part.findtext("part-abbreviation") or p.name).strip() for p in op.score.parts}
-            labels = [lb for lb in fragment_labels(lane_placed[op.lane], lane_dropped[op.lane], abbr) if lb[0] is not None]
-        evs, active = build_events(op, by_lane[(op.lane, op.src_pid)], labels)
+            own = [p for p in lane_placed[op.lane] if not p.moved]
+            labels += [lb for lb in fragment_labels(own, lane_dropped[op.lane], abbr) if lb[0] is not None]
+        moved = [p for p in by_lane[(op.lane, op.src_pid)] if p.moved]
+        if moved:
+            labels += [lb for lb in moved_labels(moved, abbr) if lb[0] is not None]
+        evs, active = build_events(op, by_lane[(op.lane, op.src_pid)], labels or None)
         evs, n_cut = split_at_barlines(evs, bars)
         op.notes_cut = n_cut
         op.beams_cut = rebeam_at_barlines(evs, bars)
@@ -1082,7 +1564,7 @@ def write(path: str, title: str, parts: List[OutPart], placed: List[Placed], bar
         tree.write(f, encoding="utf-8", xml_declaration=False)
 
 
-def _emit_measure(m: ET.Element, op: OutPart, evs: List[Ev], active: List[Tuple[Fr, Fr]], b0: Fr, b1: Fr):
+def _emit_measure(m: ET.Element, op: OutPart, evs: List[Ev], active: Dict[int, List[Tuple[Fr, Fr]]], b0: Fr, b1: Fr):
     L = b1 - b0
     mine = [e for e in evs if b0 <= e.pos < b1]
     streams: Dict[Tuple[int, str], List[Ev]] = defaultdict(list)
@@ -1098,7 +1580,7 @@ def _emit_measure(m: ET.Element, op: OutPart, evs: List[Ev], active: List[Tuple[
     for st in range(1, op.staves + 1):
         mv = op.main_voice.get(st, "1")
         gaps = [(b0, b1)]
-        for (x0, x1) in active:
+        for (x0, x1) in active.get(st, []):
             nxt = []
             for g0, g1 in gaps:
                 if x1 <= g0 or x0 >= g1:

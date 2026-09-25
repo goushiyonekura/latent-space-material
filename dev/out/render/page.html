@@ -6,7 +6,8 @@
 <script>
 const q = new URLSearchParams(location.search);
 const page = +(q.get('p') || 1);
-const k = 9 / 3.625;   // A2 portrait with a 2.9 mm staff, expressed at Verovio's default unit
+const mm = +(q.get('mm') || 2.9);   // staff height of the score (mm); Verovio's default staff is 7.2 mm
+const k = 7.2 / mm;   // A2 portrait expressed at Verovio's default unit
 verovio.module.onRuntimeInitialized = async () => {
   const tk = new verovio.toolkit();
   const xml = await (await fetch('score.musicxml')).text();

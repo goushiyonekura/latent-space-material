@@ -251,10 +251,18 @@ def cost_matrix(a_chroma, a_flux, a_db, s_chroma, s_onset, s_active, w_onset=0.5
     return C.astype(np.float32)
 
 
+# stronger penalties on the non-diagonal steps (2026-09-25, prism): where the cost is flat (sustained notes) the
+# default steps let the path race through the score and wait elsewhere almost for free; these make a steady
+# tempo the cheapest path and fit the audio evidence better (pitch / onset z-scores up, see HANDOFF §12.5)
+STEPS_STEADY = [(1, 1, 0.0), (2, 1, 0.80), (1, 2, 0.80), (3, 1, 2.40), (1, 3, 2.40), (1, 0, 0.20)]
+
+
 def dtw(C: np.ndarray, jumps: Sequence[Tuple[int, int]] = (), jump_pen: float = 0.5,
-        stay_pen: Optional[np.ndarray] = None):
+        stay_pen: Optional[np.ndarray] = None, steps: Optional[Sequence[Tuple[int, int, float]]] = None):
     """Symmetric slope-limited DTW from (0,0) to (N-1,M-1).  `jumps`: (from_col, to_col) pairs meaning that after
-    score frame from_col the path may continue at to_col (repeat back)."""
+    score frame from_col the path may continue at to_col (repeat back).  `steps`: (audio frames, score frames,
+    penalty) step patterns (default STEPS)."""
+    STEPS = list(steps) if steps is not None else globals()["STEPS"]
     N, M = C.shape
     INF = np.float32(1e30)
     D = np.full((N, M), INF, dtype=np.float32)
@@ -386,7 +394,7 @@ class Alignment:
 def align(scores: Sequence[mxl.Score], audios: Sequence[str], ref_tempo: Optional[float] = None,
           repeats: Sequence[Tuple[float, float]] = (), jump_pen: float = 0.5,
           anchors: Sequence[Tuple[float, float]] = (), w_onset: float = 0.5, w_pons: float = 1.5,
-          w_chroma: float = 1.0) -> Alignment:
+          w_chroma: float = 1.0, steps: Optional[Sequence[Tuple[int, int, float]]] = None) -> Alignment:
     """Align one or more synchronous audio stems to their scores (same notation positions).  `repeats`: score
     sections (start_q, end_q) that may be played more than once.  `ref_tempo` (quarters per minute) sets the score
     frame size; default = the average tempo implied by the notated length (no repeats)."""
@@ -433,14 +441,14 @@ def align(scores: Sequence[mxl.Score], audios: Sequence[str], ref_tempo: Optiona
                 ie = i0
             sub = C[i0:ie + 1, j0:je + 1]
             sj = [(a - j0, b - j0) for a, b in jumps if j0 <= a <= je and j0 <= b <= je]
-            pth, c = dtw(sub, sj, jump_pen, stay_pen[j0:je + 1])
+            pth, c = dtw(sub, sj, jump_pen, stay_pen[j0:je + 1], steps=steps)
             pth = pth + np.array([i0, j0])
             pieces.append(pth)
             tot += c * (sub.shape[0] + sub.shape[1])
         path = np.concatenate(pieces)
         cost = tot / (N + C.shape[1])
     else:
-        path, cost = dtw(C, jumps, jump_pen, stay_pen)
+        path, cost = dtw(C, jumps, jump_pen, stay_pen, steps=steps)
     t = path[:, 0] * HOP / feats[0]["fs"]
     q = (path[:, 1] - PAD) * q_per_frame
     q = np.where(q < 0, -1e-3, np.minimum(q, length))      # leading padding just below 0: t_at(0) = entry of frame 0

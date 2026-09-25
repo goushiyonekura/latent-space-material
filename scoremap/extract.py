@@ -14,7 +14,8 @@ from typing import Dict, List, Optional, Tuple
 from . import mxl
 from .align import Alignment
 
-SOFT_WEIGHT = {"tie": 0.12, "slur": 0.35, "wedge": 0.15, "trill": 0.35, "octave": 0.3}
+SOFT_WEIGHT = {"tie": 0.12, "slur": 0.35, "wedge": 0.15, "trill": 0.35, "octave": 0.3,
+               "beam": 0.2, "tuplet": 0.5}          # beam / tuplet: only when cutting them is allowed (2026-09-25)
 
 
 @dataclass
@@ -28,9 +29,12 @@ class CleanPoints:
         return self.pos[i:j]
 
 
-def clean_points(score: mxl.Score, pid: Optional[str] = None) -> CleanPoints:
-    """Clean positions of the whole material (pid None) or of one part (all its staves)."""
+def clean_points(score: mxl.Score, pid: Optional[str] = None, cut_beams: bool = False, cut_tuplets: bool = False) -> CleanPoints:
+    """Clean positions of the whole material (pid None) or of one part (all its staves).  With `cut_beams` /
+    `cut_tuplets` (user rule 2026-09-25) a cut may fall inside a beam group (the notes are re-beamed) or inside a
+    tuplet (the written notes get approximate plain values); both then count as soft penalties."""
     length = score.length
+    cuttable = {k for k, ok in (("beam", cut_beams), ("tuplet", cut_tuplets)) if ok}
     cand = {Fr(0), length}
     spans = []                                       # open intervals that must not be cut
     for part in score.parts:
@@ -44,7 +48,7 @@ def clean_points(score: mxl.Score, pid: Optional[str] = None) -> CleanPoints:
                 if e.dur > 0 and not e.chord:
                     spans.append((e.pos, e.end))
     for g in score.groups:
-        if g.hard and (pid is None or g.part == pid):
+        if g.hard and g.kind not in cuttable and (pid is None or g.part == pid):
             spans.append((g.start, g.end))
     spans.sort()
     # a position p is blocked if some span has start < p < end
@@ -58,7 +62,7 @@ def clean_points(score: mxl.Score, pid: Optional[str] = None) -> CleanPoints:
     pos = [p for p in cands if p not in blocked and Fr(0) <= p <= length and (p * 64).denominator == 1]
     pen = {p: 0.0 for p in pos}
     for g in score.groups:
-        if g.hard or (pid is not None and g.part != pid):
+        if (g.hard and g.kind not in cuttable) or (pid is not None and g.part != pid):
             continue
         w = SOFT_WEIGHT.get(g.kind, 0.2)
         i = bisect.bisect_right(pos, g.start)
@@ -85,6 +89,9 @@ class Option:
     cost: float
     cut_from: Optional[Fr] = None     # the end the heard audio asked for, when this option ends earlier
     head_from: Optional[Fr] = None    # the start the heard audio asked for, when this option starts later
+    t_start: float = 0.0              # audio time (file seconds) of the notated start
+    t_end: float = 0.0                # audio time of the notated end
+    penalty: float = 0.0              # soft-spanner penalty of both cuts
 
 
 @dataclass
@@ -233,7 +240,8 @@ def options(score: mxl.Score, cps: Dict[str, CleanPoints], acts: Dict[str, Activ
                     st, en = off0 + (a - qa_f), offL + (b - qa_l)
                 out.append(Option(pcs, st, en, ca + cb,
                                   cut_from=(best_t if b < best_t else None),
-                                  head_from=(best_h if a > best_h else None)))
+                                  head_from=(best_h if a > best_h else None),
+                                  t_start=ta, t_end=tb, penalty=cp.penalty.get(a, 0.0) + cp.penalty.get(b, 0.0)))
         out.sort(key=lambda o: o.cost)
         if out:
             opts[pid] = out
