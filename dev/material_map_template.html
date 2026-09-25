@@ -1,0 +1,449 @@
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+JP:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#EEF1EF; --panel:#FFFFFF; --lane-a:#F8FAF9; --lane-b:#F0F3F1; --rule:#D3DAD6; --rule-2:#E2E7E4;
+  --ink:#16201B; --ink-2:#4B5852; --ink-3:#77837E;
+  --lumin:#2A77AD; --papillon:#B5770F; --prism:#7150C2; --goal:#C0394D; --other:#77837E;
+  --focus:#0B6E5A; --playhead:#16201B;
+  --chip-bg:#16201B; --chip-ink:#EEF3F0; --chip-ink-2:#A6B3AD; --chip-rule:#2E3A34;
+  --band:#E3EAE6; --band-hold:#F1DADF; --band-ink:#4B5852;
+  --font-ui:"IBM Plex Sans JP",system-ui,-apple-system,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+  --lane-h:32px; --ruler-h:50px; --label-w:196px;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --ground:#0E1211; --panel:#151A18; --lane-a:#131816; --lane-b:#181E1B; --rule:#2A332F; --rule-2:#202825;
+    --ink:#E3E9E6; --ink-2:#A2ADA8; --ink-3:#6E7A75;
+    --lumin:#5BA8DD; --papillon:#E2A33E; --prism:#A58BEF; --goal:#F0707F; --other:#6E7A75;
+    --focus:#4FC7A8; --playhead:#E3E9E6;
+    --chip-bg:#E6ECE9; --chip-ink:#121816; --chip-ink-2:#4F5C56; --chip-rule:#C9D2CE;
+    --band:#1C2421; --band-hold:#3A2027; --band-ink:#A2ADA8;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --ground:#0E1211; --panel:#151A18; --lane-a:#131816; --lane-b:#181E1B; --rule:#2A332F; --rule-2:#202825;
+  --ink:#E3E9E6; --ink-2:#A2ADA8; --ink-3:#6E7A75;
+  --lumin:#5BA8DD; --papillon:#E2A33E; --prism:#A58BEF; --goal:#F0707F; --other:#6E7A75;
+  --focus:#4FC7A8; --playhead:#E3E9E6;
+  --chip-bg:#E6ECE9; --chip-ink:#121816; --chip-ink-2:#4F5C56; --chip-rule:#C9D2CE;
+  --band:#1C2421; --band-hold:#3A2027; --band-ink:#A2ADA8;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--font-ui);font-size:14px;line-height:1.55}
+.page{padding-inline:clamp(16px,3vw,36px);padding-block:28px 40px;display:flex;flex-direction:column;gap:18px}
+header{display:flex;flex-direction:column;gap:6px}
+h1{margin:0;font-size:24px;font-weight:600;letter-spacing:.01em;text-wrap:balance}
+.run{font-family:var(--font-mono);font-size:12.5px;color:var(--ink-2);word-break:break-all}
+.facts{display:flex;flex-wrap:wrap;gap:4px 14px;color:var(--ink-2);font-size:13px}
+.facts b{font-weight:500;color:var(--ink)}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px 18px}
+.btn-play{display:inline-flex;align-items:center;gap:8px;font:inherit;font-weight:500;font-size:14px;color:var(--panel);background:var(--ink);border:0;border-radius:6px;padding:8px 14px 8px 12px;cursor:pointer}
+.btn-play svg{width:14px;height:14px;fill:currentColor}
+.btn-play:focus-visible,.seg button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.clock{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:13.5px;color:var(--ink-2)}
+.clock output{color:var(--ink);font-weight:500}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:6px;overflow:hidden;background:var(--panel)}
+.seg button{font:inherit;font-size:13px;color:var(--ink-2);background:transparent;border:0;padding:6px 11px;cursor:pointer}
+.seg button+button{border-left:1px solid var(--rule)}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--panel)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--ink-2);margin:0;padding:0;list-style:none}
+.legend li{display:inline-flex;align-items:center;gap:6px}
+.sw{width:12px;height:12px;border-radius:3px;background:var(--c);display:inline-block}
+.help{margin:0;font-size:13px;color:var(--ink-2);max-width:78ch}
+.help kbd{font-family:var(--font-mono);font-size:12px;border:1px solid var(--rule);border-bottom-width:2px;border-radius:4px;padding:0 4px;background:var(--panel);color:var(--ink)}
+.map{display:grid;grid-template-columns:var(--label-w) minmax(0,1fr);background:var(--panel);border:1px solid var(--rule);border-radius:8px;overflow:hidden}
+.labels{border-right:1px solid var(--rule);background:var(--panel)}
+.labels-head{height:var(--ruler-h);display:flex;flex-direction:column;justify-content:flex-end;padding:0 12px 6px;font-size:12px;line-height:1.3;color:var(--ink-2);border-bottom:1px solid var(--rule)}
+.labels-head small{font-size:11px;color:var(--ink-3)}
+.label{height:var(--lane-h);display:grid;grid-template-columns:auto minmax(0,1fr);align-content:center;column-gap:8px;padding:0 10px 0 12px;overflow:hidden}
+.label:nth-child(even){background:var(--lane-b)}
+.label .dot{grid-row:1 / span 2;align-self:center;width:8px;height:8px;border-radius:2px;background:var(--c)}
+.label .nm{font-size:12.5px;font-weight:500;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.label .nm .abbr{display:none}
+.label .rg{font-family:var(--font-mono);font-size:10.5px;line-height:1.25;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+.label.is-goal .nm{color:var(--goal)}
+.scroller{overflow-x:auto;overflow-y:hidden;position:relative;scrollbar-gutter:stable}
+.area{position:relative}
+.ruler{position:relative;height:var(--ruler-h);border-bottom:1px solid var(--rule);cursor:pointer;user-select:none}
+.band{position:absolute;top:6px;height:17px;border-radius:3px;background:var(--band);color:var(--band-ink);font-size:10.5px;letter-spacing:.06em;line-height:17px;padding:0 6px;overflow:hidden;white-space:nowrap;text-overflow:clip}
+.band.hold{background:var(--band-hold)}
+.tick{position:absolute;bottom:0;width:1px;background:var(--rule);height:6px}
+.tick.major{height:11px;background:var(--ink-3)}
+.tlabel{position:absolute;bottom:12px;font-family:var(--font-mono);font-size:11px;color:var(--ink-2);transform:translateX(-50%);white-space:nowrap;font-variant-numeric:tabular-nums}
+.lanes{position:relative}
+.grid{position:absolute;top:0;bottom:0;width:1px;background:var(--rule-2);pointer-events:none}
+.lane{position:relative;height:var(--lane-h)}
+.lane:nth-child(odd){background:var(--lane-b)}
+.lane:nth-child(even){background:var(--lane-a)}
+.bar{position:absolute;top:4px;height:calc(var(--lane-h) - 8px);min-width:2px;padding:0;border:0;border-top:2px solid var(--c);border-radius:2px;cursor:pointer;
+  background:var(--c);background:color-mix(in srgb,var(--c) calc(var(--o) * 100%),transparent);overflow:hidden}
+.bar:hover{outline:1.5px solid var(--ink);outline-offset:0;z-index:2}
+.bar:focus-visible{outline:2px solid var(--focus);outline-offset:1px;z-index:3}
+.bar.is-live{outline:2px solid var(--playhead);outline-offset:0;z-index:2}
+.bar.is-playing{background:var(--c);z-index:3}
+.bar.is-loading{background-image:repeating-linear-gradient(45deg,transparent 0 4px,rgba(255,255,255,.35) 4px 8px)}
+.bar .prog{position:absolute;top:0;bottom:0;left:0;width:2px;background:var(--panel);box-shadow:0 0 0 1px var(--ink)}
+.playhead{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:var(--playhead);pointer-events:none;z-index:4}
+.chip{position:fixed;z-index:20;max-width:min(360px,calc(100vw - 24px));background:var(--chip-bg);color:var(--chip-ink);border-radius:8px;padding:10px 12px 9px;pointer-events:none;box-shadow:0 6px 24px rgba(0,0,0,.18);font-size:12.5px;line-height:1.5}
+.chip .who{display:flex;align-items:center;gap:7px;font-weight:500}
+.chip .who .dot{width:9px;height:9px;border-radius:2px;background:var(--c)}
+.chip .range{font-family:var(--font-mono);font-size:17px;font-weight:500;letter-spacing:.01em;margin:3px 0 4px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip .sub{font-family:var(--font-mono);font-size:11.5px;color:var(--chip-ink-2);font-variant-numeric:tabular-nums}
+.chip .hint{margin-top:6px;padding-top:5px;border-top:1px solid var(--chip-rule);font-size:11.5px;color:var(--chip-ink-2)}
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:30;background:var(--ink);color:var(--panel);border-radius:8px;padding:9px 14px;font-size:13px;max-width:calc(100vw - 32px);box-shadow:0 6px 24px rgba(0,0,0,.2)}
+.toast code{font-family:var(--font-mono);font-size:13px;user-select:all}
+.note{margin:0;font-size:12.5px;color:var(--ink-3);max-width:90ch}
+@media (max-width:640px){
+  :root{--label-w:124px}
+  .label{column-gap:6px;padding:0 6px 0 8px}
+  .label .nm{font-size:11.5px}
+  .label .nm .full{display:none}
+  .label .nm .abbr{display:inline}
+  .label .rg{font-size:9.5px}
+  h1{font-size:21px}
+}
+@media (prefers-reduced-motion:reduce){ .scroller{scroll-behavior:auto} }
+</style>
+
+<div class="page">
+  <header>
+    <h1>素材マップ</h1>
+    <div class="run" id="run"></div>
+    <div class="facts" id="facts"></div>
+  </header>
+
+  <div class="toolbar">
+    <button class="btn-play" id="playAll" type="button" aria-pressed="false">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path id="playIcon" d="M3 1.5v13l11-6.5z"/></svg>
+      <span id="playLabel">全体を再生</span>
+    </button>
+    <div class="clock"><output id="clock">0:00.000</output> / <span id="total">0:00.000</span></div>
+    <div class="seg" role="group" aria-label="時間方向の拡大">
+      <button type="button" id="z1" data-z="1" aria-pressed="true">全体</button>
+      <button type="button" id="z2" data-z="2" aria-pressed="false">×2</button>
+      <button type="button" id="z4" data-z="4" aria-pressed="false">×4</button>
+      <button type="button" id="z8" data-z="8" aria-pressed="false">×8</button>
+    </div>
+    <ul class="legend" id="legend"></ul>
+  </div>
+
+  <p class="help">バーに<b>マウスを乗せる</b>と、元の音源での位置（分.秒.ミリ秒）が出ます。<b>クリック</b>でその箇所の素材を単独で試聴、<b>右クリック</b>でその秒数をクリップボードへコピーします（キーボードではバーを選んで <kbd>Enter</kbd> で試聴、<kbd>C</kbd> でコピー）。上の目盛りをクリックすると、その位置から全体を再生します。</p>
+
+  <section class="map" aria-label="素材の配置">
+    <div class="labels" id="labels"><div class="labels-head">素材<small>元の音源での範囲</small></div></div>
+    <div class="scroller" id="scroller">
+      <div class="area" id="area">
+        <div class="ruler" id="ruler" title="クリックでこの位置から全体を再生"></div>
+        <div class="lanes" id="lanes"></div>
+        <div class="playhead" id="playhead" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <p class="note" id="note"></p>
+</div>
+
+<div class="chip" id="chip" role="tooltip" hidden></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const FAMILY = {
+  luminasity: {v: "--lumin", label: "luminasity"},
+  papillon: {v: "--papillon", label: "papillon"},
+  prism: {v: "--prism", label: "prism"},
+  goal: {v: "--goal", label: "ゴール"},
+  other: {v: "--other", label: "その他"}
+};
+const $ = (id) => document.getElementById(id);
+const pad = (n, w) => String(n).padStart(w, "0");
+function fmtOrig(ms) {                       // MM.SS.mmm in the original recording
+  ms = Math.max(0, Math.round(ms));
+  return pad(Math.floor(ms / 60000), 2) + "." + pad(Math.floor(ms / 1000) % 60, 2) + "." + pad(ms % 1000, 3);
+}
+function fmtPiece(ms) {                      // M:SS.mmm inside the piece
+  ms = Math.max(0, Math.round(ms));
+  return Math.floor(ms / 60000) + ":" + pad(Math.floor(ms / 1000) % 60, 2) + "." + pad(ms % 1000, 3);
+}
+function fmtSec(ms) { return (ms / 1000).toFixed(3); }
+
+const lanes = DATA.lanes;
+const bars = DATA.bars.map((b, k) => {
+  const L = lanes[b[0]];
+  const o0 = L.file_start_ms + b[3], o1 = L.file_start_ms + b[4];
+  return {k, lane: b[0], t0: b[1], t1: b[2], s0: b[3], s1: b[4], peak: b[5], mean: b[6], o0, o1,
+          copy: fmtOrig(o0) + " to " + fmtOrig(o1)};
+});
+const byLane = lanes.map(() => []);
+bars.forEach((b) => byLane[b.lane].push(b));
+byLane.forEach((arr) => arr.sort((a, b) => a.t0 - b.t0));
+const TOTAL = DATA.total_ms;
+
+// ---------- header ----------
+$("run").textContent = DATA.run;
+const famCount = {};
+lanes.forEach((L, i) => { if (i) famCount[L.family] = (famCount[L.family] || 0) + 1; });
+$("facts").innerHTML =
+  `<span>曲の長さ <b>${fmtPiece(TOTAL)}</b></span><span>seed <b>${DATA.seed}</b></span>` +
+  `<span>素材 <b>${lanes.length - 1}</b> 本＋ゴール</span><span>配置 <b>${bars.length}</b> 箇所</span>`;
+$("total").textContent = fmtPiece(TOTAL);
+$("legend").innerHTML = ["luminasity", "papillon", "prism", "goal"].filter((f) => f === "goal" || famCount[f])
+  .map((f) => `<li><span class="sw" style="--c:var(${FAMILY[f].v})"></span>${FAMILY[f].label}${f === "goal" ? "" : ` ${famCount[f]} 本`}</li>`).join("");
+$("note").textContent = "時刻はすべて実際に生成されたゲイン曲線と再生位置の記録（state_trace.json）から計算しています。" +
+  "元の音源での位置 ＝ ファイル名の開始時刻 ＋ ファイル内の位置。試聴は素材を素の音量で鳴らします（曲の中での音量は、バーの濃さ）。";
+
+// ---------- lanes, labels, bars ----------
+const labelsEl = $("labels"), lanesEl = $("lanes");
+lanes.forEach((L, i) => {
+  const fam = FAMILY[L.family] || FAMILY.other;
+  const lab = document.createElement("div");
+  lab.className = "label" + (i === 0 ? " is-goal" : "");
+  lab.style.setProperty("--c", `var(${fam.v})`);
+  const rng = L.file_end_ms != null ? `${fmtOrig(L.file_start_ms)}–${fmtOrig(L.file_end_ms)}` : `${fmtOrig(0)}–${fmtOrig(L.file_ms)}`;
+  const abbr = L.short.replace(/^papillon/, "pap").replace(/^lumin[au]sity/, "lum");
+  lab.innerHTML = `<span class="dot"></span><span class="nm" title="${L.name}"><span class="full">${L.short}</span><span class="abbr">${abbr}</span></span><span class="rg">${rng}</span>`;
+  labelsEl.appendChild(lab);
+  const lane = document.createElement("div");
+  lane.className = "lane";
+  lane.dataset.lane = i;
+  lanesEl.appendChild(lane);
+  byLane[i].forEach((b) => {
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "bar";
+    el.style.setProperty("--c", `var(${fam.v})`);
+    el.style.setProperty("--o", (0.26 + 0.74 * Math.sqrt(Math.max(0, b.peak) / 100)).toFixed(3));
+    el.dataset.k = b.k;
+    el.setAttribute("aria-label", `${L.short}、元の音源 ${b.copy}、曲の中 ${fmtPiece(b.t0)} から`);
+    b.el = el;
+    lane.appendChild(el);
+  });
+});
+
+// ---------- zoom / layout ----------
+const scroller = $("scroller"), area = $("area"), ruler = $("ruler");
+let zoom = 1, pps = 1;                        // pixels per second
+function layout() {
+  const w = scroller.clientWidth;
+  pps = Math.max(0.5, (w - 2) / (TOTAL / 1000)) * zoom;
+  const width = Math.ceil(pps * TOTAL / 1000);
+  area.style.width = width + "px";
+  bars.forEach((b) => {
+    b.el.style.left = (b.t0 / 1000 * pps).toFixed(2) + "px";
+    b.el.style.width = Math.max(2, (b.t1 - b.t0) / 1000 * pps).toFixed(2) + "px";
+  });
+  drawRuler();
+  placePlayhead();
+}
+function drawRuler() {
+  ruler.textContent = "";
+  lanesEl.querySelectorAll(".grid").forEach((g) => g.remove());
+  (DATA.phases || []).forEach((p) => {
+    const d = document.createElement("div");
+    d.className = "band" + (p.name === "GOAL_HOLD" ? " hold" : "");
+    const x = p.a / 1000 * pps, w = (p.b - p.a) / 1000 * pps;
+    d.style.left = (x + 1).toFixed(1) + "px";
+    d.style.width = Math.max(1, w - 2).toFixed(1) + "px";
+    d.textContent = w > 64 ? p.name : "";
+    d.title = `${p.name}  ${fmtPiece(p.a)} – ${fmtPiece(p.b)}`;
+    ruler.appendChild(d);
+  });
+  const steps = [1, 2, 5, 10, 15, 30, 60];
+  const major = steps.find((s) => s * pps >= 64) || 60;
+  const minor = [major / 5, major / 3, major / 2].find((s) => Number.isInteger(s) && s * pps >= 8) || major;
+  for (let s = 0; s <= TOTAL / 1000 + 1e-9; s += minor) {
+    const isMajor = Math.abs(s / major - Math.round(s / major)) < 1e-9;
+    const t = document.createElement("div");
+    t.className = "tick" + (isMajor ? " major" : "");
+    t.style.left = (s * pps).toFixed(1) + "px";
+    ruler.appendChild(t);
+    if (isMajor) {
+      const l = document.createElement("div");
+      l.className = "tlabel";
+      l.style.left = (s * pps).toFixed(1) + "px";
+      l.textContent = Math.floor(s / 60) + ":" + pad(Math.round(s % 60), 2);
+      if (s * pps > 12) ruler.appendChild(l);
+      const g = document.createElement("div");
+      g.className = "grid";
+      g.style.left = (s * pps).toFixed(1) + "px";
+      lanesEl.appendChild(g);
+    }
+  }
+}
+document.querySelectorAll(".seg button").forEach((btn) => btn.addEventListener("click", () => {
+  const center = (scroller.scrollLeft + scroller.clientWidth / 2) / pps;
+  zoom = Number(btn.dataset.z);
+  document.querySelectorAll(".seg button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+  layout();
+  scroller.scrollLeft = Math.max(0, center * pps - scroller.clientWidth / 2);
+}));
+new ResizeObserver(() => layout()).observe(scroller);
+
+// ---------- chip (tooltip) ----------
+const chip = $("chip");
+function chipHtml(b) {
+  const L = lanes[b.lane];
+  const fam = FAMILY[L.family] || FAMILY.other;
+  return `<div class="who"><span class="dot" style="--c:var(${fam.v})"></span>${L.short}</div>` +
+    `<div class="range">${b.copy}</div>` +
+    `<div class="sub">ファイル内 ${fmtOrig(b.s0)} → ${fmtOrig(b.s1)}（${fmtSec(b.t1 - b.t0)} 秒）</div>` +
+    `<div class="sub">曲の中　 ${fmtPiece(b.t0)} → ${fmtPiece(b.t1)}・最大音量 ${b.peak}%</div>` +
+    `<div class="hint">クリックで試聴　右クリックでこの秒数をコピー</div>`;
+}
+function showChip(b, x, y) {
+  chip.innerHTML = chipHtml(b);
+  chip.hidden = false;
+  const r = chip.getBoundingClientRect();
+  let left = x + 14, top = y + 16;
+  if (left + r.width > window.innerWidth - 8) left = Math.max(8, x - r.width - 14);
+  if (top + r.height > window.innerHeight - 8) top = Math.max(8, y - r.height - 12);
+  chip.style.left = left + "px";
+  chip.style.top = top + "px";
+}
+function hideChip() { chip.hidden = true; }
+const barOf = (el) => (el && el.classList && el.classList.contains("bar")) ? bars[Number(el.dataset.k)] : null;
+lanesEl.addEventListener("mousemove", (e) => { const b = barOf(e.target); if (b) showChip(b, e.clientX, e.clientY); else hideChip(); });
+lanesEl.addEventListener("mouseleave", hideChip);
+lanesEl.addEventListener("focusin", (e) => {
+  const b = barOf(e.target); if (!b) return;
+  const r = e.target.getBoundingClientRect(); showChip(b, r.left + Math.min(r.width, 40), r.bottom);
+});
+lanesEl.addEventListener("focusout", hideChip);
+scroller.addEventListener("scroll", hideChip, {passive: true});
+
+// ---------- copy ----------
+const toast = $("toast");
+let toastTimer = 0;
+function showToast(html, ms) {
+  toast.innerHTML = html; toast.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.hidden = true; }, ms || 2200);
+}
+function fallbackCopy(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  let ok = false; try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+  ta.remove(); return ok;
+}
+function copyBar(b) {
+  const text = b.copy;
+  const done = () => showToast(`コピーしました　<code>${text}</code>`);
+  const fail = () => showToast(`コピーできませんでした。選択してコピーしてください　<code>${text}</code>`, 6000);
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => (fallbackCopy(text) ? done() : fail()));
+  } else if (fallbackCopy(text)) done(); else fail();
+}
+lanesEl.addEventListener("contextmenu", (e) => { const b = barOf(e.target); if (!b) return; e.preventDefault(); copyBar(b); });
+lanesEl.addEventListener("keydown", (e) => {
+  const b = barOf(e.target); if (!b) return;
+  if (e.key === "c" || e.key === "C") { e.preventDefault(); copyBar(b); }
+});
+
+// ---------- audio: the whole piece ----------
+const mix = new Audio("audio/mix.mp4");
+mix.preload = "metadata";
+const playBtn = $("playAll"), playIcon = $("playIcon"), playLabel = $("playLabel"), clock = $("clock"), playhead = $("playhead");
+function setPlayUi(on) {
+  playBtn.setAttribute("aria-pressed", String(on));
+  playIcon.setAttribute("d", on ? "M3 1.5h3.6v13H3zM9.4 1.5H13v13H9.4z" : "M3 1.5v13l11-6.5z");
+  playLabel.textContent = on ? "一時停止" : "全体を再生";
+}
+function placePlayhead() {
+  const t = mix.currentTime || 0;
+  if (t <= 0 && mix.paused) { playhead.hidden = true; return; }
+  playhead.hidden = false;
+  playhead.style.left = (t * pps).toFixed(1) + "px";
+}
+function playMix(fromSec) {
+  stopSnippet();
+  if (typeof fromSec === "number") mix.currentTime = Math.min(Math.max(0, fromSec), TOTAL / 1000 - 0.05);
+  mix.play().then(() => setPlayUi(true)).catch(() => showToast("全体の音声を再生できませんでした（audio/mix.mp4）", 4000));
+}
+playBtn.addEventListener("click", () => { if (mix.paused) playMix(); else mix.pause(); });
+mix.addEventListener("pause", () => setPlayUi(false));
+mix.addEventListener("ended", () => setPlayUi(false));
+ruler.addEventListener("click", (e) => {
+  const r = area.getBoundingClientRect();
+  playMix((e.clientX - r.left) / pps);
+});
+let live = new Set();
+function liveBarsAt(ms) {
+  const out = new Set();
+  byLane.forEach((arr) => {
+    let lo = 0, hi = arr.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].t1 <= ms) lo = mid + 1; else if (arr[mid].t0 > ms) hi = mid - 1; else { out.add(arr[mid].k); break; }
+    }
+  });
+  return out;
+}
+function tick() {
+  const t = mix.currentTime || 0;
+  clock.textContent = fmtPiece(t * 1000);
+  placePlayhead();
+  const now = mix.paused ? new Set() : liveBarsAt(t * 1000);
+  live.forEach((k) => { if (!now.has(k)) bars[k].el.classList.remove("is-live"); });
+  now.forEach((k) => { if (!live.has(k)) bars[k].el.classList.add("is-live"); });
+  live = now;
+  if (!mix.paused) {
+    const x = t * pps, v0 = scroller.scrollLeft, v1 = v0 + scroller.clientWidth;
+    if (x < v0 + 24 || x > v1 - 48) scroller.scrollLeft = Math.max(0, x - scroller.clientWidth * 0.2);
+  }
+  if (snippet) stepSnippet();
+  requestAnimationFrame(tick);
+}
+
+// ---------- audio: one bar of one material ----------
+const srcAudio = {};
+function audioFor(i) {
+  if (!srcAudio[i]) { const a = new Audio(`audio/${lanes[i].id}.mp4`); a.preload = "auto"; srcAudio[i] = a; }
+  return srcAudio[i];
+}
+let snippet = null;
+function stopSnippet() {
+  if (!snippet) return;
+  snippet.audio.pause();
+  snippet.b.el.classList.remove("is-playing", "is-loading");
+  if (snippet.prog) snippet.prog.remove();
+  snippet = null;
+}
+function stepSnippet() {
+  const s = snippet, a = s.audio;
+  if (!s.started) return;
+  const pos = a.currentTime * 1000;
+  const f = (pos - s.b.s0) / Math.max(1, s.b.s1 - s.b.s0);
+  if (s.prog) s.prog.style.left = (Math.min(1, Math.max(0, f)) * 100).toFixed(2) + "%";
+  if (pos >= s.b.s1 - 4 || a.ended) stopSnippet();
+}
+function playBar(b) {
+  const same = snippet && snippet.b === b;
+  stopSnippet();
+  if (same) return;
+  if (!mix.paused) mix.pause();
+  const a = audioFor(b.lane);
+  const prog = document.createElement("span"); prog.className = "prog";
+  b.el.appendChild(prog);
+  b.el.classList.add("is-playing", "is-loading");
+  const s = snippet = {b, audio: a, prog, started: false};
+  const go = () => {
+    if (snippet !== s) return;
+    a.currentTime = b.s0 / 1000;
+    a.play().then(() => { if (snippet === s) { s.started = true; b.el.classList.remove("is-loading"); } })
+      .catch(() => { if (snippet === s) { stopSnippet(); showToast(`素材の音声を再生できませんでした（audio/${lanes[b.lane].id}.mp4）`, 4000); } });
+  };
+  if (a.readyState >= 1) go(); else a.addEventListener("loadedmetadata", go, {once: true});
+  a.addEventListener("error", () => { if (snippet === s) { stopSnippet(); showToast(`素材の音声を読み込めませんでした（audio/${lanes[b.lane].id}.mp4）`, 4000); } }, {once: true});
+  a.load && a.readyState === 0 && a.load();
+}
+lanesEl.addEventListener("click", (e) => { const b = barOf(e.target); if (b) { playBar(b); showChip(b, e.clientX || 0, e.clientY || 0); } });
+
+layout();
+requestAnimationFrame(tick);
+</script>

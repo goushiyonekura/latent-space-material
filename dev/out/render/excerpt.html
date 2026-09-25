@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>render check</title>
+<style>body{margin:0;background:#fff;font-family:sans-serif} #info{padding:6px;font-size:12px} svg{display:block}</style>
+</head><body>
+<div id="info">loading…</div><div id="out"></div>
+<script src="https://cdn.jsdelivr.net/npm/verovio@4.3.1/dist/verovio-toolkit-wasm.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const range = q.get('m') || '1-3';
+const scale = +(q.get('s') || 22);
+verovio.module.onRuntimeInitialized = async () => {
+  const tk = new verovio.toolkit();
+  const xml = await (await fetch('excerpt.musicxml')).text();
+  tk.setOptions({ pageWidth: +(q.get('w') || 6000), pageHeight: 60000, scale: scale, adjustPageHeight: true,
+                  breaks: 'none', header: 'none', footer: 'none', mdivAll: false });
+  tk.loadData(xml);
+  tk.select({ measureRange: range });
+  tk.redoLayout();
+  const svg = tk.renderToSVG(1);
+  document.getElementById('out').innerHTML = svg;
+  document.getElementById('info').textContent = 'measures ' + range + ' pages ' + tk.getPageCount() + ' log: ' + (tk.getLog() || '').slice(0, 400);
+};
+</script></body></html>

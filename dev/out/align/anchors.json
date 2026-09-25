@@ -1,0 +1,272 @@
+{
+ "pap1": [
+  [
+   2.0,
+   0,
+   "m1 first sound (level re-entry 1.9; C#6 from 3.2)"
+  ],
+  [
+   6.2,
+   4,
+   "m2 D5 appears (all stems)"
+  ],
+  [
+   12.58,
+   8,
+   "m3 arpeggio E4 (f0)"
+  ],
+  [
+   15.2,
+   11,
+   "m4 D5 re-attack"
+  ],
+  [
+   17.5,
+   15,
+   "m5 C#6"
+  ],
+  [
+   31.6,
+   23,
+   "m7 arpeggio E4"
+  ],
+  [
+   35.6,
+   27,
+   "m8 F#5"
+  ],
+  [
+   42.62,
+   31,
+   "m9 arpeggio E4"
+  ],
+  [
+   46.4,
+   34,
+   "m9 B4+F#5 (B4 onset)"
+  ],
+  [
+   48.9,
+   37,
+   "m10 B4 re-attack"
+  ],
+  [
+   57.68,
+   45,
+   "m12 fast arpeggio E4"
+  ],
+  [
+   63.2,
+   49,
+   "m13 Lento C#6"
+  ],
+  [
+   66.86,
+   53,
+   "m14 C#5 mf"
+  ],
+  [
+   73.1,
+   57,
+   "m15 C#5 re-attack, C#4 at 74.08 = q58"
+  ]
+ ],
+ "lum7": [
+  [
+   4.876,
+   4.0,
+   "m31 full entry after the m30 rest"
+  ]
+ ],
+ "pap4": [
+  [
+   1.9,
+   0,
+   "m1 first sound (f0 D5/D6/A6 = 3rd partial of G, all stems)"
+  ],
+  [
+   4.8,
+   4,
+   "m2 F#3+G2 (f0 F#3 / F#4 / C#5)"
+  ],
+  [
+   8.85,
+   8,
+   "m3 sfz tremolo G2+G4 (f0 G2 / G3 / D4)"
+  ],
+  [
+   10.2,
+   9.5,
+   "m3 rest: G2 ends, decay"
+  ],
+  [
+   15.45,
+   12,
+   "m4 S.T. harmonic (f0 D5 / D6 / A6)"
+  ],
+  [
+   17.6,
+   16,
+   "m5 F#3+G2 (f0 F#4 / F#5 / C#6)"
+  ],
+  [
+   21.2,
+   20,
+   "m6 sfz tremolo (f0 G2 loud)"
+  ],
+  [
+   23.3,
+   22,
+   "m6 rest: decay starts"
+  ],
+  [
+   28.3,
+   24,
+   "m7 (f0 D5 / D6 / A6)"
+  ],
+  [
+   30.5,
+   28,
+   "m8 sfz tremolo D3+D5 (f0 C#5 / C#6 / G#6)"
+  ],
+  [
+   33.5,
+   31,
+   "m8 rest"
+  ],
+  [
+   37.3,
+   32,
+   "m9 harmonics (f0 F#5 / F#6 / C#7)"
+  ],
+  [
+   41.2,
+   36,
+   "m10 C2+E3 after m9 F#5 ends"
+  ],
+  [
+   45.65,
+   40,
+   "m11 sfz S.P. (f0 B4 loud)"
+  ],
+  [
+   50.4,
+   44,
+   "m12 16ths start after silence"
+  ],
+  [
+   101.2,
+   84,
+   "m22 f C2 G2 B3 (f0 G2 C3 G2 B3)"
+  ],
+  [
+   109.25,
+   92,
+   "m24 f C2 G2 (re-entry after silence)"
+  ],
+  [
+   118.4,
+   100,
+   "m26 F#3 loud"
+  ],
+  [
+   122.2,
+   104,
+   "m27 G2 tremolo"
+  ]
+ ],
+ "pap5": [
+  [
+   1.5,
+   0,
+   "m1 first sound (A4/A5/E6 all stems)"
+  ],
+  [
+   10.0,
+   6,
+   "m4 A5 (viola f0 10.10)"
+  ],
+  [
+   13.0,
+   8,
+   "m5 artificial harmonic Bb (A#6 viola 13.96)"
+  ],
+  [
+   15.2,
+   10,
+   "m6 A+F# (A4 viola 15.34, A3 cello 15.26)"
+  ],
+  [
+   19.4,
+   12,
+   "m7 alternation (A4 viola 19.48)"
+  ],
+  [
+   25.5,
+   17,
+   "m9 mp Bb harmonic (B6 violin -14 dB, A#5 cello)"
+  ],
+  [
+   29.5,
+   19,
+   "m10 D6/A6/D5"
+  ],
+  [
+   35.1,
+   24,
+   "m12 piu mosso burst"
+  ],
+  [
+   39.0,
+   30,
+   "m15 A5 tremolo rit."
+  ],
+  [
+   47.6,
+   32,
+   "m16 Bb (end of the slide)"
+  ],
+  [
+   52.0,
+   34,
+   "m17 C#"
+  ],
+  [
+   56.5,
+   36,
+   "m18 F"
+  ],
+  [
+   59.4,
+   38,
+   "m19 C# re-attack"
+  ],
+  [
+   62.3,
+   40,
+   "m20 A/D alternation"
+  ],
+  [
+   65.2,
+   42,
+   "m21 A repeated"
+  ],
+  [
+   69.6,
+   47,
+   "m23 rising harmonic gliss starts"
+  ]
+ ],
+ "prism2": [
+  [
+   12.76,
+   18.0,
+   "entry after the rest (q17.75-18): the burst with the fast descending run"
+  ],
+  [
+   14.6,
+   20.0,
+   "m6 F#5+G#5 after the ascending f run (run visible 12.75-14.5)"
+  ]
+ ]
+}
